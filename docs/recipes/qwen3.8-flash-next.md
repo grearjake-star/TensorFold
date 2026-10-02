@@ -260,7 +260,7 @@ tensorfold serve TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP --tp 2 --rank 0 --ma
 
 ### Serving
 
-The default CUDA cap is six MTP drafts, with chains stopping below the configured confidence threshold.
+The default CUDA cap is ten MTP drafts, with chains stopping below the configured confidence threshold.
 `--mtp-drafts N` changes the cap; `--no-drafts` or `"draft": false` selects serial decoding.
 Single-request serving uses CUDA graphs for verify windows and draft steps. Two-rank reductions add
 gathered partials in rank order.
@@ -336,7 +336,7 @@ A quantized cache changes the output, so its replies differ from bf16's. Drafted
 families refuse `--kv-dtype` before any download.
 
 `--mtp-confidence P`, from 0 to 1, sets the probability under which a chain stops before a later draft; the CUDA
-default is 0.70, for one stream and for concurrent rounds. Only Flash Next's CUDA engine has this rule, so the MLX path and the other families refuse it.
+default is 0.50, for one stream and for concurrent rounds. Only Flash Next's CUDA engine has this rule, so the MLX path and the other families refuse it.
 
 ## Draft vocabulary provenance
 

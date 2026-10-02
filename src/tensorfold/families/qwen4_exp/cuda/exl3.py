@@ -121,8 +121,43 @@ def requant_rows(head, ids: torch.Tensor, device) -> tuple[torch.Tensor, torch.T
     return words.contiguous(), scale.contiguous(), bias.contiguous()
 
 
+# MTP tensors a trained head (TF_MTP_HEAD) may replace on an EXL3 pack: trellis linears become fp16 matrices of the
+# head's values, the rest stay tensors. The shared and routed experts (one grouped EXL3 table) and the indexer stay the
+# pack's own.
+HEAD_LINEARS = ("mtp.fc_embedding", "mtp.fc_hidden", "mtp.layers.0.self_attn.q_proj", "mtp.layers.0.self_attn.k_proj",
+                "mtp.layers.0.self_attn.v_proj", "mtp.layers.0.self_attn.o_proj")
+
+
+def exl3_head(pk: Pack, path) -> dict[str, torch.Tensor]:
+    """A trained MTP head for an EXL3 pack (``TF_MTP_HEAD``), in the bf16 format (``mtp.*`` names; linears as
+    ``.weight`` [out, in], norms stored centred: scale = 1 + w). Each tensor is checked against the pack: a trellis
+    linear by its input/output sizes (suh/svh), any other tensor by its shape; both floating. Anything else (an MLX
+    triple, an expert, the indexer, a non-MTP name) is refused. Drafts change speed only, never the output."""
+
+    from .weights import is_mlx_head, mtp_head_override
+
+    head = mtp_head_override(path)
+    if is_mlx_head(head):
+        raise ValueError(f"{path}: an MLX-format head (4-bit triples); an EXL3 pack takes the bf16 head format")
+    for name, t in head.items():
+        if not t.dtype.is_floating_point:
+            raise ValueError(f"{path}: {name} is {t.dtype}; an EXL3 pack takes floating tensors")
+        stem = name[:-len(".weight")] if name.endswith(".weight") else None
+        if stem in HEAD_LINEARS and pk.has(stem + ".trellis"):
+            k = pk.entry(stem + ".suh" if pk.has(stem + ".suh") else stem + ".su")[4]
+            n = pk.entry(stem + ".svh" if pk.has(stem + ".svh") else stem + ".sv")[4]
+            want = [n[0], k[0]]
+        elif ".experts." in name or ".shared_expert." in name or ".indexer." in name or not pk.has(name):
+            raise ValueError(f"{path}: {name} is not an MTP tensor an EXL3 pack's head can replace")
+        else:
+            want = list(pk.entry(name)[4])
+        if list(t.shape) != want:
+            raise ValueError(f"{path}: {name} is {list(t.shape)}, the pack's is {want}")
+    return head
+
+
 def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: tuple[int, int] | None = None,
-         draft_vocab: int | str | None = None, table_reads: list | None = None):
+         draft_vocab: int | str | None = None, table_reads: list | None = None, mtp_head=None):
     from .qmm import make_q4
     from tensorfold.cuda.direct_read import in_background
 
@@ -137,31 +172,48 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     T = "model.language_model."
     t0 = time.time()
     offset = centred_offset(pk, [f"{T}layers.{i}.attn_hyper_connection.hc_norm.weight" for i in range(cfg.layers)])
+    override = exl3_head(pk, mtp_head) if mtp and mtp_head else {}
+    used: set[str] = set()
+
+    def get(name: str) -> torch.Tensor:               # a pack tensor, or the trained head's (MTP names only)
+        if name in override:
+            used.add(name)
+            return override[name]
+        return pk.get(name)
+
+    def lin(name: str):                               # a trellis linear, or the trained head's values as fp16
+        if name + ".weight" in override:
+            used.add(name + ".weight")
+            return f16(sc, [override[name + ".weight"]], device)
+        return x3(sc, pk, name, device)
 
     def plain(name: str) -> torch.Tensor:
         return pk.get(name).to(device)
 
     def centred(name: str) -> torch.Tensor:
+        if name in override:                          # the head file stores centred norms (scale = 1 + w)
+            used.add(name)
+            return (override[name].float() + 1.0).to(device).contiguous()
         return (pk.get(name).float() + offset).to(device).contiguous()
 
     def hc(name: str, inject: bool) -> HC:
-        rows = [pk.get(name + ".input_mix_weight_down.weight")]
+        rows = [get(name + ".input_mix_weight_down.weight")]
         if inject:
-            rows.append(pk.get(name + ".block_inject_weight.weight"))
-        down, up = f16(sc, rows, device), f16(sc, [pk.get(name + ".input_mix_weight_up.weight")], device)
+            rows.append(get(name + ".block_inject_weight.weight"))
+        down, up = f16(sc, rows, device), f16(sc, [get(name + ".input_mix_weight_up.weight")], device)
         return HC(down, up, centred(name + ".hc_norm.weight"), inject, down, up)
 
     def moe(name: str) -> MoEW:
-        router = torch.cat([pk.get(name + ".gate.weight").to(torch.bfloat16),
-                            pk.get(name + ".shared_expert_gate.weight").to(torch.bfloat16)]).to(device).contiguous()
+        router = torch.cat([get(name + ".gate.weight").to(torch.bfloat16),
+                            get(name + ".shared_expert_gate.weight").to(torch.bfloat16)]).to(device).contiguous()
         return MoEW(router, expert_table(pk, name + ".experts", cfg.experts, name + ".shared_expert", device))
 
     def attention(name: str) -> AttnW:
-        proj = stack(sc, [x3(sc, pk, name + p, device) for p in (".q_proj", ".k_proj", ".v_proj",
-                                                                  ".indexer.index_qk_proj")])
+        proj = stack(sc, [lin(name + p) for p in (".q_proj", ".k_proj", ".v_proj")]
+                     + [x3(sc, pk, name + ".indexer.index_qk_proj", device)])
         return AttnW(proj, centred(name + ".q_norm.weight"), centred(name + ".k_norm.weight"),
                      centred(name + ".indexer.q_layernorm.weight"), centred(name + ".indexer.k_layernorm.weight"),
-                     x3(sc, pk, name + ".o_proj", device))
+                     lin(name + ".o_proj"))
 
     def gdn(name: str) -> GDNW:
         proj = stack(sc, [x3(sc, pk, name + ".in_proj_qkv", device), x3(sc, pk, name + ".in_proj_z", device),
@@ -212,8 +264,14 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     w.meta.update(rank=0, world=1, vocab_offset=0, full=cfg, centred_offset=offset)
     if mtp and pk.has("mtp.fc_embedding.trellis"):
         w.mtp = MTPW(centred("mtp.pre_fc_norm_embedding.weight"), centred("mtp.pre_fc_norm_hidden.weight"),
-                     x3(sc, pk, "mtp.fc_embedding", device), x3(sc, pk, "mtp.fc_hidden", device),
+                     lin("mtp.fc_embedding"), lin("mtp.fc_hidden"),
                      layer(-1, "mtp.layers.0", "attention", False), hc("mtp.hyper_connection_mixer", False))
+        if override:
+            unused = sorted(set(override) - used)
+            if unused:
+                raise ValueError(f"{mtp_head}: tensors the MTP head does not read: {unused[:5]}")
+            w.meta["mtp_head"] = str(mtp_head)
+            print(f"[tensorfold] MTP head: {len(used)} tensors from {mtp_head} (EXL3 pack: linears as fp16)", flush=True)
     ple = next((lay.ple for lay in loaded if lay.ple is not None), None)
     sc.allocate(device, experts=loaded[0].moe.experts, rows=PREFILL_ROWS,
                 ple_words=ple.table.words_per_row if ple else 0, ple_heads=ple.ngram.heads if ple else 0,

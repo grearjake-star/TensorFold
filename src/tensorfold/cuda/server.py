@@ -375,7 +375,15 @@ class App:
         return prepared
 
     def sampling_for(self, body: dict[str, Any], prompt: list[int]):
-        """Keyed sampling (the seed, else one drawn from the prompt), or None for greedy; RequestError if malformed."""
+        """Keyed sampling (the request's seed, else a fresh random one), or None for greedy; RequestError if malformed.
+
+        Without a ``seed`` every request draws a new seed, as OpenAI-compatible servers do, so repeated identical
+        requests are independent samples. The old prompt-derived seed (the same conversation always samples the
+        same reply) collapsed a benchmark's sampled repeats into one draw; ``TF_PROMPT_SEED=1`` restores it. The seed
+        is drawn once, in ``prepare``, so a gated request's continuation runs keep it."""
+
+        import os
+        import secrets
 
         from tensorfold.engine.exact_sampling import Sampling, seed_for
 
@@ -387,8 +395,10 @@ class App:
         top_k = fields.get("top_k", self.sampling["top_k"])
         top_p = fields.get("top_p", self.sampling["top_p"])
         min_p = fields.get("min_p", self.sampling.get("min_p", 0.0))
-        return Sampling(int(seed) if seed is not None else seed_for(prompt), temp, int(top_k), float(top_p),
-                        float(min_p))
+        if seed is None:
+            prompt_seed = os.environ.get("TF_PROMPT_SEED", "").strip().lower() in ("1", "true", "yes", "on")
+            seed = seed_for(prompt) if prompt_seed else secrets.randbits(63)
+        return Sampling(int(seed), temp, int(top_k), float(top_p), float(min_p))
 
     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool], *,
             prepared: PreparedRequest | None = None, cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
@@ -538,6 +548,8 @@ class App:
         if stopped["client"]:                                        # as the Mac server: nothing more is written
             raise RequestCancelled("the client left during the reply")
         stats = {**(stats or {}), "token_sha": token_sha(out)}
+        if sampling is not None:                      # the seed drawn, so a sampled reply can be reproduced
+            stats["seed"] = int(sampling.seed)
         reasoning, answer = visible(True)
         final: dict[str, Any] = {}
         if len(reasoning) > sent["reasoning"]:

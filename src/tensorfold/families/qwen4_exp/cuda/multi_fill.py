@@ -216,8 +216,11 @@ class PromptPasses:
                 s.constraint.advance([first])
             head += 1
             s.context = list(s.prompt)
+            more = {"cost": self.cost} if self.cost > 0 else {}
+            if self.cost > 0 and self.timing is not None:
+                e.timing = self.timing
             s.drafts = draft(e, last, [first], st.pos + 1, min(self.depth, s.count - 1), s.sampling,
-                             self.confidence) if mtp and s.count > 1 else []
+                             self.confidence, **more) if mtp and s.count > 1 else []
             s.started = time.perf_counter()
             self.streams[s.sid] = s
             s.take([first], self._ends(s))

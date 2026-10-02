@@ -381,7 +381,7 @@ def test_a_point_kept_one_token_early_resumes_the_same_prompt_and_a_next_turn(tm
 
 @pytest.mark.parametrize("sampling", [None, Sampling(seed=21, top_k=20, top_p=0.95)])
 def test_the_family_hook_serves_the_recipe(tmp_path, sampling):
-    """``cuda_engine``, what ``tensorfold serve`` calls, builds the measured recipe (up to 6 drafts, the 30% stop,
+    """``cuda_engine``, what ``tensorfold serve`` calls, builds the measured recipe (up to 10 drafts, the 50% stop,
     the packaged draft vocabulary, an 8,192-token context) and streams serial decoding's tokens; with drafts off
     it decodes one token a round and streams the same tokens."""
 
@@ -390,10 +390,10 @@ def test_the_family_hook_serves_the_recipe(tmp_path, sampling):
 
     from test_flashnext_tp import _checkpoint
 
-    assert (DEPTH, CONFIDENCE, CONTEXT) == (6, 0.7, 8192)
+    assert (DEPTH, CONFIDENCE, CONTEXT) == (10, 0.5, 8192)
     _checkpoint(tmp_path)
     eng = cuda_engine(tmp_path, context=8185)                  # the synthetic checkpoint names no native window
-    assert (eng.depth, eng.confidence, eng.max_len, eng.tp) == (6, 0.7, 8192, 1)
+    assert (eng.depth, eng.confidence, eng.max_len, eng.tp) == (10, 0.5, 8185 + 10 + 1, 1)   # window + a verify window
     assert eng.w.draft_ids is not None
     prompt = [5, 17, 99, 250, 1023, 7, 64, 300, 11, 12, 13]
     first = prefill(eng.e, prompt, sampling)

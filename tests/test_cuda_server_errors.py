@@ -290,9 +290,10 @@ SERVER_DEFAULTS = [DEFAULTS, {"temperature": 0.0, "top_k": 50, "top_p": 1.0},
 
 @pytest.mark.parametrize("defaults", SERVER_DEFAULTS)
 @pytest.mark.parametrize("fields", VALID, ids=[json.dumps(v) for v in VALID])
-def test_valid_requests_reach_the_engine_with_the_same_sampling(tmp_path, fields, defaults):
+def test_valid_requests_reach_the_engine_with_the_same_sampling(tmp_path, fields, defaults, monkeypatch):
     """Passes before and after the change: every request valid before generates with the Sampling it had."""
 
+    monkeypatch.setenv("TF_PROMPT_SEED", "1")     # the reference seeds unseeded requests from the prompt
     app = app_for(tmp_path)
     app.sampling = dict(defaults)
     body = {"messages": HI, **fields}
@@ -308,7 +309,8 @@ def test_valid_requests_reach_the_engine_with_the_same_sampling(tmp_path, fields
 
 @pytest.mark.parametrize("defaults", SERVER_DEFAULTS)
 @pytest.mark.parametrize("fields", VALID, ids=[json.dumps(v) for v in VALID])
-def test_prepare_resolves_the_same_sampling(tmp_path, fields, defaults):
+def test_prepare_resolves_the_same_sampling(tmp_path, fields, defaults, monkeypatch):
+    monkeypatch.setenv("TF_PROMPT_SEED", "1")     # the reference seeds unseeded requests from the prompt
     app = app_for(tmp_path)
     app.sampling = dict(defaults)
     body = {"messages": HI, **fields}

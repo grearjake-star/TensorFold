@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -262,8 +263,15 @@ class Weights:
 
 
 def draft_token_ids(draft_vocab: int | str | None) -> np.ndarray | None:
-    """The MTP drafts' scored ids, sorted: "default" (draft_vocab.txt), a file of ids, N (ids below N) or None (all)."""
+    """The MTP drafts' scored ids, sorted: "default" (draft_vocab.txt), a file of ids, N (ids below N) or None (all).
 
+    TF_DRAFT_VOCAB replaces "default": a file of ids (e.g. draft_vocab_freq40k.txt, a name beside draft_vocab.txt or a
+    path), or N. Drafts are verified, so the list changes speed only, never output."""
+
+    if draft_vocab == "default" and os.environ.get("TF_DRAFT_VOCAB"):
+        env = os.environ["TF_DRAFT_VOCAB"]
+        local = Path(env) if "/" in env else Path(__file__).with_name(env)
+        draft_vocab = int(env) if env.isdigit() else str(local)
     if not draft_vocab:
         return None
     if isinstance(draft_vocab, int):

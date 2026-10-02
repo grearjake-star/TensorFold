@@ -17,7 +17,7 @@ from tensorfold.cuda.streams import Stream, accept
 from tensorfold.engine.exact_sampling import MARGIN, choose_rows
 from tensorfold.engine.grammar import GrammarError
 
-from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _gathered_fits, choose_gathered_streams,
+from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _gathered_fits, cost_bars, choose_gathered_streams,
                      entry_end, prefill_begin, tp_sample_rows)
 from . import attn_multi, gdn_multi, image_rows, prefixes
 from .forward import commit, compute, compute_mixed, converges, stage
@@ -49,13 +49,15 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
 
     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
-                 share: float = SHARE, points=None, graphs: bool = True, vision=None, workspace_bytes: int = 0) -> None:
+                 share: float = SHARE, points=None, graphs: bool = True, vision=None, workspace_bytes: int = 0,
+                 cost: float = 0.0, timing=None) -> None:
         self.link = self.follower = None
         self.planning, self.pass_plan, self.mixed_plan = False, None, None
         self.pass_index, self.pass_width = 0, prefill_rows
         self.w, self.depth, self.confidence, self.capacity = w, depth, confidence, capacity
         self.points = points                         # a prompt's message starts to keep states at, or None
         self.vision = vision
+        self.cost, self.timing = cost, timing            # the expected-time stop (decode.cost_bars), as one stream's
         self.eos = tuple(w.cfg.eos) if stop_eos else ()
         rows = slots * (depth + 1)
         # a round's window and a prompt pass share each layer's expert launch: the pass's buffers hold both
@@ -434,15 +436,18 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         for (s, _, keep), (st, a0, a1) in zip(todo, segs):
             st.set_mtp_len(st.mtp_len + len(keep))
         active = [(s, a1 - 1) for s, (_, _, a1) in zip([t[0] for t in todo], segs)]
+        bars = cost_bars(self.cost, self.depth, self.timing) if self.cost > 0 else None
+        chain = {s.sid: 1.0 for s, _, _ in todo}
         for j in range(self.depth):
             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
             nxt = []
             for (s, row), (d, p) in zip(active, picks):
-                low = self.confidence > 0 and p < self.confidence
+                chain[s.sid] *= p
+                low = (self.confidence > 0 and p < self.confidence) or (bars is not None and chain[s.sid] < bars[j])
                 if low and j > 0:
                     continue
                 s.drafts.append(d)
-                if not low and j + 1 < room[s.sid]:
+                if not low and j + 1 < room[s.sid] and not (bars is not None and chain[s.sid] < bars[j + 1]):
                     nxt.append((s, row, d))
             if not nxt:
                 return

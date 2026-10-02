@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Sequence
@@ -15,6 +16,7 @@ from tensorfold.cuda.sampling import comm_gather, nucleus_rows, sample_rows
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
 from . import CONFIDENCE, DEPTH
+from .draft_cost import DRAFT_MS, VERIFY_MS, cost_bars, timing_table  # noqa: F401 (decode.* names)
 from .forward import Cut, commit, cut_snapshot, forward
 from . import image_rows
 from .state import CAND, Buffers, State
@@ -263,23 +265,31 @@ def absorb(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int]) -> torc
 
 
 def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position: int, count: int,
-          sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
-    """Absorb kept rows and chain drafts, always retaining the first even below ``confidence``, then stopping before later drafts below it or after a low-confidence first draft."""
+          sampling: Sampling | None, confidence: float = 0.0, cost: float = 0.0) -> list[int]:
+    """Absorb kept rows and chain drafts, always retaining the first even below ``confidence``, then stopping before later drafts below it or after a low-confidence first draft.
+
+    ``cost`` > 0 (tokens per ms) also stops before a later draft whose chance of being reached and kept, the product
+    of the head's probabilities of drafts 1..j, is under its bar (``cost_bars``): a long chain of middling drafts
+    costs verify rows it rarely repays. The MTP step of a draft the product already fails is skipped (products only
+    fall). Speed only: drafts never change the output."""
 
     st = e.st
     logits = absorb(e, streams, next_tokens)
     drafts: list[int] = []
+    bars = cost_bars(cost, count, getattr(e, "timing", None)) if cost > 0 else None
+    chain = 1.0
     for j in range(count):
         low = False
-        if confidence > 0:
+        if confidence > 0 or bars is not None:
             d, p = e.sample_draft(logits, position + j, sampling)
-            low = p < confidence
+            chain *= p
+            low = p < confidence or (bars is not None and chain < bars[j])
             if low and j > 0:
                 break
         else:
             d = e.sample(logits[:1], [position + j], sampling, draft=True)[0]
         drafts.append(d)
-        if low:
+        if low or (bars is not None and chain < bars[j + 1]):
             break
         if j + 1 < count:
             prev = e.mbuf.streams[len(next_tokens) - 1:len(next_tokens)] if j == 0 else e.mbuf.streams[:1]
@@ -443,7 +453,7 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
 @torch.no_grad()
 def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, depth: int = DEPTH,
                confidence: float = CONFIDENCE, stop_eos: bool = False, on_tokens=None, constraint=None,
-               probabilities=None) -> DecodeResult:
+               probabilities=None, cost: float = 0.0) -> DecodeResult:
     """Verify pending and drafted tokens from the prefill state, commit rows before the first mismatched draft, and call ``on_tokens(new)`` with kept tokens after pending, stopping on True."""
 
     w, st, b = e.w, e.st, e.buf
@@ -455,7 +465,11 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
     unabsorbed = None                                  # the last round's kept rows, not yet in the MTP cache
     torch.cuda.synchronize()
     start = time.perf_counter()
-    drafts = draft(e, e.last_streams, [pending], st.pos + 1, min(depth, count - len(out)), sampling, confidence)
+    # ``cost``: the expected-time stop (``draft``); the engine passes its ``COST``, the function's default is the plain
+    # rule. Only as a keyword when on: tools and tests replace ``draft`` with the plain signature
+    more = {"cost": cost} if cost > 0 else {}
+    drafts = draft(e, e.last_streams, [pending], st.pos + 1, min(depth, count - len(out)), sampling, confidence,
+                   **more)
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         tokens = [out[-1]] + drafts
         window = constraint.window(tokens, list(range(-1, len(tokens) - 1))) if constraint is not None else None
@@ -492,7 +506,7 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         n = min(depth, count - len(out))
         drafts = []
         if n > 0:
-            drafts = draft(e, b.streams[:keep], sampled[:keep], st.pos + 1, n, sampling, confidence)
+            drafts = draft(e, b.streams[:keep], sampled[:keep], st.pos + 1, n, sampling, confidence, **more)
             unabsorbed = None
     torch.cuda.synchronize()
     seconds = time.perf_counter() - start

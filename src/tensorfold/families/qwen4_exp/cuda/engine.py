@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
 
 from tensorfold.cuda import prompt_precision
-from . import CONFIDENCE, DEPTH
+from . import CONFIDENCE, COST, DEPTH
 
 MAX_DEPTH = 15           # a verify window of at most 16 rows
 KEEP_SERIAL = 4          # prompt states the serial engine keeps (they share its attention rows)
@@ -57,6 +58,8 @@ def build_kernels(*, exl3: bool = False, nvfp4: bool = False, solo: bool = True)
 class FlashNextEngine:
     """``eos``, ``generate`` (rank 0 or one GPU) and ``follow`` (rank 1), as ``tensorfold.cuda.server`` expects."""
 
+    cost: float = COST       # the expected-time draft stop (``__init__`` reads TF_DRAFT_COST)
+
     def __init__(self, model_dir: Path, *, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  draft_vocab: str | int | None = "default", max_len: int | None = None,
                  context_explicit: bool | None = None, tp: int = 1, rank: int = 0, master: str = "", port: int = 29551,
@@ -97,6 +100,13 @@ class FlashNextEngine:
         torch.cuda.set_device(0)
         self.tp, self.rank, self.depth, self.confidence = tp, rank, int(depth), float(confidence)
         self.streams, self.master, self.graphs_enabled = int(streams), master, bool(graphs)
+        # the expected-time stop (decode.cost_bars, tokens per ms); TF_DRAFT_COST overrides it, 0 turns it off
+        self.cost = float(os.environ.get("TF_DRAFT_COST", COST) or 0)
+        from .draft_cost import timing_table
+
+        self.timing = timing_table(os.environ)            # TF_VERIFY_MS / TF_DRAFT_MS: the checkpoint's own table
+        if self.cost < 0:
+            raise ValueError(f"TF_DRAFT_COST: tokens per ms, 0 or more, not {self.cost}")
         self.kv_dtype = check_kv(kv_dtype)
         self.comm = None
         self.vision = None                   # the image tower (``QwenCudaVision``) with --vision
@@ -190,11 +200,14 @@ class FlashNextEngine:
             self.multi = MultiDecoder(w, slots=streams, capacity=self.max_len, depth=self.depth,
                                       confidence=self.confidence, keep=KEEP, points=self.points,
                                       kv_dtype=self.kv_dtype, share=share, vision=self.vision,
-                                      prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=graphs)
+                                      prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=graphs,
+                                      cost=self.cost, timing=self.timing)
             self.scheduler = Scheduler(self.multi, max_streams=streams)
         else:
             self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
                             kv_dtype=self.kv_dtype, prefill_rows=self.prefill_rows)
+            if os.environ.get("TF_VERIFY_MS", "").strip() or os.environ.get("TF_DRAFT_MS", "").strip():
+                self.e.timing = self.timing               # decode.draft's cost bars read it (default: the MLX table)
         started = time.perf_counter()
         locked = False
         pinned, locks = 0, {}
@@ -245,7 +258,10 @@ class FlashNextEngine:
         self.cache: list[tuple[list[int], dict]] = []    # (committed ids, what resuming from them needs)
         self.serial = None                                # the serial requests' engine, made on first use
         rule = (f"1 to {self.depth} MTP drafts a round, a chain stops before a later draft under "
-                f"{self.confidence:.0%}" if self.depth else "no drafts: the serial reference, one token a round")
+                f"{self.confidence:.0%}"
+                + (f" or under the expected-time bar at {self.cost} tokens/ms" if self.cost > 0 and not self.concurrent
+                   else "")
+                if self.depth else "no drafts: the serial reference, one token a round")
         where = (f"up to {streams} streams, each growing to {self.context_window} prompt/reply tokens while memory "
                  f"lasts ({self.multi.memory_gate.room / 2**30:.1f} GiB free for their caches, "
                  f"{self.multi.window_bytes / 2**30:.2f} GiB for one at the full window), eager" if self.concurrent else
@@ -270,7 +286,8 @@ class FlashNextEngine:
         from .kvcache import BITS_OF
 
         total = int(ids.sum()) if ids is not None else -1
-        mine = torch.tensor([self.depth, round(self.confidence * 1e6), self.max_len, self.streams,
+        cost = getattr(self, "cost", 0.0)
+        mine = torch.tensor([self.depth, round(self.confidence * 1e6), round(cost * 1e6), self.max_len, self.streams,
                              int(self.graphs_enabled),
                              len(ids) if ids is not None else -1, total, BITS_OF[self.kv_dtype],
                              self.prefill_rows, int(prompt_precision.fp8())], dtype=torch.int64, device="cuda")
@@ -279,8 +296,8 @@ class FlashNextEngine:
         both = both.view(2, -1).cpu()
         prompt_precision.same_on_ranks(int(both[0, -1]), int(both[1, -1]))
         if not torch.equal(both[0], both[1]):
-            raise RuntimeError(f"the two ranks were started with different settings (drafts, confidence, context, "
-                               f"parallel streams, graphs, draft vocabulary, KV cache, prompt rows): "
+            raise RuntimeError(f"the two ranks were started with different settings (drafts, confidence, cost, "
+                               f"context, parallel streams, graphs, draft vocabulary, KV cache, prompt rows): "
                                f"rank 0 {both[0].tolist()}, rank 1 {both[1].tolist()}")
 
     def _key(self, n: int) -> str:
@@ -426,7 +443,8 @@ class FlashNextEngine:
             return stats
         if self.depth > 0:
             res = mtp_decode(self.e, first, max_tokens, sampling, depth=self.depth, confidence=self.confidence,
-                             stop_eos=stop_eos, on_tokens=on_tokens, constraint=constraint, probabilities=probabilities)
+                             stop_eos=stop_eos, on_tokens=on_tokens, constraint=constraint, probabilities=probabilities,
+                             cost=self.cost)
             stats.update(drafted=res.drafted, accepted=res.accepted, min_rows=min(res.widths, default=0))
         else:
             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens,

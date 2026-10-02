@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -29,9 +30,33 @@ def _plain(name: str, w: torch.Tensor) -> torch.Tensor:
     return w
 
 
+def mtp_head_override(path: str | Path | None) -> dict[str, torch.Tensor]:
+    """A trained MTP head (``TF_MTP_HEAD``): a safetensors file of ``[language_model.]mtp.*`` tensors in the
+    checkpoint's own format (4-bit words, scales and biases; norms; the router) that replace the checkpoint's
+    tensors of the same names at load. Anything else in the file is refused, so it can never touch the main model.
+    The model directory is never written. Drafts change speed only, never the output."""
+
+    if not path:
+        return {}
+    from safetensors.torch import load_file
+
+    got = load_file(str(path), device="cpu")
+    bad = [k for k in got if not (k.startswith("mtp.") or k.startswith("language_model.mtp."))]
+    if bad:
+        raise ValueError(f"{path}: an MTP head file holds only mtp.* tensors, not {bad[:3]}")
+    return {k[len("language_model."):] if k.startswith("language_model.") else k: v for k, v in got.items()}
+
+
+def is_mlx_head(head: dict[str, torch.Tensor]) -> bool:
+    """A head file in the MLX format (4-bit triples, norms around one), which an EXL3 pack refuses."""
+
+    return any(name.endswith((".scales", ".biases")) for name in head)
+
+
 def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: tuple[int, int] | None = None,
-         draft_vocab: int | str | None = None, ple_on_ssd: bool = False, table_reads: list | None = None) -> Weights:
-    """Load rank ``tp``'s shares; ``draft_vocab`` selects default/file ids or ids below N, None scores all ids."""
+         draft_vocab: int | str | None = None, ple_on_ssd: bool = False, table_reads: list | None = None,
+         mtp_head: str | Path | None = None) -> Weights:
+    """Load rank ``tp``'s shares; ``draft_vocab`` selects default/file ids or ids below N, None scores all ids; ``mtp_head`` (default ``TF_MTP_HEAD``) replaces the checkpoint's MTP tensors."""
 
     import time
     from dataclasses import replace
@@ -39,8 +64,11 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     from . import exl3
 
     model_dir = Path(model_dir)
+    if mtp_head is None:
+        mtp_head = os.environ.get("TF_MTP_HEAD") or None
     if exl3.is_exl3(model_dir):                       # an EXL3 pack: its own loader, the same dataclasses
-        return exl3.load(model_dir, device, mtp=mtp, tp=tp, draft_vocab=draft_vocab, table_reads=table_reads)
+        return exl3.load(model_dir, device, mtp=mtp, tp=tp, draft_vocab=draft_vocab, table_reads=table_reads,
+                         mtp_head=mtp_head)
     full = Config.read(model_dir)
     rank, world = tp if tp is not None else (0, 1)
     cfg = full if world == 1 else replace(full, heads=full.heads // world, kv_heads=full.kv_heads // world,
@@ -53,7 +81,26 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     chosen = list(range(cfg.layers))
     around_one = norms_around_one(rd, prefix + mbase, chosen)
 
+    try:
+        override = mtp_head_override(mtp_head) if mtp else {}
+        for name, t in override.items():  # the checkpoint's own format, name by name: its shape, and codes stay codes
+            if prefix + name not in rd.where:
+                raise ValueError(f"{mtp_head}: {name} is not a checkpoint tensor")
+            _, header = rd._header(rd.where[prefix + name])
+            want = header[prefix + name]
+            if (_DT[want["dtype"]].is_floating_point != t.dtype.is_floating_point
+                    or list(want["shape"]) != list(t.shape)):
+                raise ValueError(f"{mtp_head}: {name} is {t.dtype} {list(t.shape)}, the checkpoint's is "
+                                 f"{want['dtype']} {want['shape']}")
+    except BaseException:
+        rd.close()
+        raise
+    used: set[str] = set()
+
     def raw(name: str) -> torch.Tensor:
+        if name in override:
+            used.add(name)
+            return override[name].to(device)
         return rd.get(prefix + name)
 
     def table_scale(base: str, field: str) -> float:
@@ -388,6 +435,8 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
                  else triple("model.embed_tokens"))
         loaded = []
         ahead = rd.layer_names(prefix, mbase, chosen, mtp)   # read ahead of the layer that takes them
+        if override:                                      # the head file's tensors are never read from the checkpoint
+            ahead = [[n for n in names if n[len(prefix):] not in override] for names in ahead]
         layer_events: list = []                           # each layer's event, recorded once its work is queued
         for k, i in enumerate(chosen):
             if len(layer_events) >= 2:                    # at most two layers queued ahead of the GPU
@@ -437,6 +486,12 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
                          fc("mtp.fc_embedding"), fc("mtp.fc_hidden"),
                          layer(-1, "mtp.layers.0", "attention", False),
                          (hc_nvfp4 if cfg.quant == "modelopt" else hc)("mtp.hyper_connection_mixer", False))
+            if override:
+                unused = sorted(set(override) - used)
+                if unused:
+                    raise ValueError(f"{mtp_head}: tensors the MTP head does not read: {unused[:5]}")
+                w.meta["mtp_head"] = str(mtp_head)
+                print(f"[tensorfold] MTP head: {len(used)} tensors from {mtp_head}", flush=True)
     except BaseException:
         rd.close()
         raise
