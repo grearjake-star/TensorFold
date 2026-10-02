@@ -51,9 +51,10 @@ def test_the_done_line_appends_the_counts(capsys) -> None:
     from tensorfold.cuda.server import print_done
 
     request = SimpleNamespace(first=1.0, started=0.5)
-    print_done(10, 0, False, [1, 2, 3], "stop", {"prefill_s": 0.25, "rounds": 2, "accepted": 1, "drafted": 3},
-               request, graphs="main=5/1/1/0 mtp=9/2/2/0 kept=3")
+    print_done("chatcmpl-x", 10, 0, False, "none", [1, 2, 3], "stop",
+               {"prefill_s": 0.25, "rounds": 2, "accepted": 1, "drafted": 3}, request, None,
+               graphs="main=5/1/1/0 mtp=9/2/2/0 kept=3")
     line = capsys.readouterr().out.strip()
     assert line.endswith("accepted=1/3 graphs main=5/1/1/0 mtp=9/2/2/0 kept=3"), line
-    print_done(10, 0, False, [1, 2, 3], "stop", {}, request)
+    print_done("chatcmpl-x", 10, 0, False, "none", [1, 2, 3], "stop", {}, request, None)
     assert "graphs" not in capsys.readouterr().out
