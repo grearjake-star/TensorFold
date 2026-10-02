@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 
+from tensorfold.families.qwen4_exp.host_residency import _Residency, _advise
 from tensorfold.families.qwen4_exp.ssd_table import SSDTable
 
 _PARTS = ("weight", "scales", "biases")
@@ -56,8 +57,10 @@ def windows_lock_pages(arrays, kernel32=None):
         return False
 
 
-class HostTable:
+class HostTable(_Residency):
     """Keep n-gram shards memory-mapped on the host; gather copies only requested rows, never whole tables to the GPU."""
+
+    DENSE = ("scales", "biases")      # 10-byte rows: 409 a page, against the words' 51 (80-byte rows)
 
     def __init__(self, files: list[tuple[Path, dict, dict, dict]]) -> None:
         self.words, self.scales, self.biases, starts = [], [], [], [0]
@@ -149,8 +152,16 @@ class HostTable:
 
         return _prefetch(self.words + self.scales + self.biases, workers)
 
+    def parts(self) -> dict[str, list[np.ndarray]]:
+        return {"scales": self.scales, "biases": self.biases, "words": self.words}
 
-class BF16Table:
+    def advise(self, advice: str) -> int:
+        """``TF_NGRAM_ADVICE``: madvise the whole-file maps ``gather`` reads (bytes advised); same bytes, same rows."""
+
+        return _advise(self.files, advice)
+
+
+class BF16Table(_Residency):
     """bf16 n-gram shards (the NVFP4 checkpoint's): memory-mapped, gathered a lookup at a time as bf16 bits."""
 
     bits = 16
@@ -215,6 +226,14 @@ class BF16Table:
         """Read every shard once so the lookups hit the page cache (seconds taken); the pages stay evictable."""
 
         return _prefetch(self.values, workers)
+
+    def advise(self, advice: str) -> int:
+        """``TF_NGRAM_ADVICE``: madvise the maps ``gather`` reads (bytes advised); same bytes, same rows."""
+
+        return _advise(self.values + list(getattr(self, "scales", [])), advice)
+
+    def parts(self) -> dict[str, list[np.ndarray]]:
+        return {"values": self.values}
 
 
 class FP8Table(BF16Table):
@@ -287,11 +306,16 @@ class NVFP4Table(BF16Table):
         f32 = v.astype(np.float32).view(np.uint32).astype(np.uint64)
         return ((f32 + 0x7FFF + ((f32 >> 16) & 1)) >> 16).astype(np.uint16)
 
+    DENSE = ("scales",)               # one e4m3 byte a 16 values: 8x denser than the codes
+
     def lock(self) -> bool:
         return False
 
     def prefetch(self, workers: int = 8) -> float:
         return _prefetch(self.values + self.scales, workers)
+
+    def parts(self) -> dict[str, list[np.ndarray]]:
+        return {"scales": self.scales, "values": self.values}
 
 
 def shard_keys(name: str, count: int, names) -> list[str]:

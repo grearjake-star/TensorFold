@@ -275,7 +275,7 @@ def ple_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int
     if w.x3 is not None:                              # an EXL3 pack: the rows' codec, fp16 key/value weights
         from .exl3_mm import ple_rows
 
-        emb = ple_rows(R, w.x3.ple_dev, p.table.head_bias, p.ngram.heads, p.ngram.dims, p.table.bits,
+        emb = ple_rows(R, _x3_ple(w, b).ple_dev, p.table.head_bias, p.ngram.heads, p.ngram.dims, p.table.bits,
                        w.x3.ple_emb[:R])
         _mm(emb, p.key, None, b.ple_keys[:R], b)
         _mm(emb, p.value, None, b.ple_vals[:R], b)
@@ -294,6 +294,24 @@ def ple_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int
     for st, a0, a1 in segs:
         glue.ple_conv(b.ple_gated[a0:a1], b.ple_pss[a0:a1], p.norm_conv, st.ple_tail, p.conv, b.h[a0:a1],
                       b.h[a0:a1], b.ple_nrow[a0:a1], c.eps, c.streams, c.ngram_size)
+
+
+class _X3Ple:
+    """A buffer set's own staging for an EXL3 pack's packed n-gram rows (pinned host and device), so a decode window
+    and a prompt pass staged for one forward (compute_mixed) keep their own rows."""
+
+    def __init__(self, rows: int, words: int, device) -> None:
+        pin = torch.cuda.is_available()
+        self.ple_host = torch.zeros((rows, words), dtype=torch.int16, pin_memory=pin)
+        self.ple_dev = torch.zeros((rows, words), dtype=torch.int16, device=device)
+
+
+def _x3_ple(w: Weights, b: Buffers) -> _X3Ple:
+    got = getattr(b, "x3_ple", None)
+    if got is None:
+        heads = w.x3.ple_dev.shape[0] // max(1, w.x3.ple_emb.shape[0])
+        got = b.x3_ple = _X3Ple(b.rows * heads, w.x3.ple_dev.shape[1], w.x3.ple_dev.device)
+    return got
 
 
 def stage_ple_rows(p, b: Buffers, ids: np.ndarray, at: int = 0, got=None) -> None:
@@ -480,7 +498,7 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
         if w.x3 is not None:
             from .exl3_pack import stage_ple
 
-            stage_ple(p.table, w.x3, ids, at=at)
+            stage_ple(p.table, _x3_ple(w, b), ids, at=at)
         else:
             stage_ple_rows(p, b, ids, at=at, got=None if ahead is None else ahead[i])
     b.staged.record()

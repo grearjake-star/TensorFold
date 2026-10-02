@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import functools
 import json
+import mmap
 import os
 import struct
 from pathlib import Path
@@ -10,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from ..host_residency import _Residency
 from tensorfold.cuda.exl3.format import is_exl3  # noqa: F401  (exl3.py and engine.py import it from here)
 
 EXTRA_FILES = ("ngram_embedding.safetensors", "mtp_hyper_connection_mixer_patch.safetensors")
@@ -104,8 +107,29 @@ class Pack:
         return torch.from_numpy(fmt.unpack_signs(self.get(f"{prefix}.{packed}").numpy()))
 
 
-class NgramTable:
+@functools.lru_cache(maxsize=1)
+def _libc():
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    return libc
+
+
+class NgramTable(_Residency):
     """The n-gram table in ExLlamaV3's row codec (one tensor or shards), memory-mapped; reads as ``HostTable``'s."""
+
+    DENSE = ("words",)
+    PART_BYTES = 1 << 30      # TF_NGRAM_LOCK's granule: a 39 GB single-tensor table pins in 1 GiB row runs
+
+    def parts(self) -> dict:
+        """The packed rows as ~1 GiB row runs (views), so TF_NGRAM_LOCK=auto pins what its budget holds."""
+
+        runs = []
+        for arr in self.words:
+            step = max(1, self.PART_BYTES // max(1, arr.strides[0]))
+            runs += [arr[i:i + step] for i in range(0, arr.shape[0], step)]
+        return {"words": runs}
 
     def __init__(self, pk: Pack, base: str, shards: int, device) -> None:
         starts, offsets, fidx, files, words = [0], [], [], [], None
@@ -172,6 +196,26 @@ class NgramTable:
             out[sel] = self.maps[f][at[sel, None] + cols]
         return out.view(np.int16)
 
+    def willneed(self, ids: np.ndarray) -> int:
+        """Ask the kernel to read rows ``ids``' pages ahead (MADV_WILLNEED, asynchronous; ctypes drops the GIL)."""
+
+        flat = np.unique(np.asarray(ids, dtype=np.int64).reshape(-1))
+        flat = flat[(flat >= 0) & (flat < self.rows)]
+        if not flat.size:
+            return 0
+        shard = np.searchsorted(self.starts, flat, side="right") - 1
+        at = self.offsets[shard] + (flat - self.starts[shard]) * self.row_bytes
+        where, page, libc, n = self.fidx[shard], mmap.PAGESIZE, _libc(), 0
+        for f in np.unique(where):
+            sel = at[where == f]
+            pages = np.unique(np.concatenate([sel // page, (sel + self.row_bytes - 1) // page]))
+            breaks = np.nonzero(np.diff(pages) != 1)[0] + 1              # runs of consecutive pages, one call each
+            base = self.maps[f].ctypes.data
+            for run in np.split(pages, breaks):
+                libc.madvise(base + int(run[0]) * page, len(run) * page, mmap.MADV_WILLNEED)
+            n += len(pages)
+        return n
+
     def lock(self) -> bool:
         if os.name == "nt":
             from ..host_table import HostTable
@@ -193,6 +237,18 @@ class NgramTable:
     @property
     def pinned_bytes(self) -> int:
         return self._pins.nbytes
+
+    def random_access(self) -> int:
+        """An unlocked table: MADV_RANDOM on its maps, so a fault reads its own page, not a read-around window.
+
+        Lookups touch scattered rows; the default read-around pulls whole windows into the page cache that no lookup
+        reads. Ahead-of-time reads (``willneed``) are explicit and unaffected. Returns the maps advised."""
+
+        libc, n = _libc(), 0
+        for m in self.maps:
+            if m.size:
+                n += libc.madvise(m.ctypes.data, m.size, mmap.MADV_RANDOM) == 0
+        return n
 
     def prefetch(self, workers: int = 8) -> float:
         from ..host_table import HostTable

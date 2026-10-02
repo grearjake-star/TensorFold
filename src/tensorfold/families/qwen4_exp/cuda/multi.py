@@ -82,6 +82,10 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         live = free
         self.memory_gate = MemoryGate(
             live() if live is not None else 1 << 62, reserve=max(2 * GIB, workspace_bytes), live=live)
+        # pinned n-gram pages a growing cache may take back (TF_NGRAM_LOCK): ``release(bytes) -> bytes`` munlocks
+        # table runs (the engine sets it); a stream never waits or ends while pinned pages could be released
+        self.release = None
+        self.released = 0
         self.streams: dict[int, Stream] = {}
         self.filling: list[Stream] = []                  # admitted, prompts still prefilling (oldest first)
         self.fills: dict[int, list] = {}                 # stream id -> [its engine, drafts?, next row, kept state]
@@ -110,6 +114,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         before = st.cache_bytes()
         grow = st.cache_bytes(size) - before
         while not self.memory_gate.fits(grow + st.layer_bytes(size)):     # a layer's old buffers stay until its copy
+            if self._release_pinned(grow + st.layer_bytes(size)):
+                continue
             if not self._evict_kept(st, protect=protect):
                 if alone:
                     limit = cuda_limit_bytes() if torch.cuda.is_available() else None
@@ -144,6 +150,33 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             return False
         solo = self.solo.st                      # while planning both are Shadows of the real slots: compare those
         return getattr(st, "source", st) is getattr(solo, "source", solo)
+
+    def planned_growth(self) -> int:
+        """What the slots' caches take from their first rows to one growth step each (TF_NGRAM_LOCK=auto leaves it)."""
+
+        st = self.free[0] if self.free else None
+        if st is None:
+            return 0
+        size = min(st.limit, STEP)
+        return len(self.free) * max(0, st.cache_bytes(size) - st.cache_bytes(min(st.limit, FIRST))) + st.layer_bytes(size)
+
+    def _release_pinned(self, extra: int) -> bool:
+        """Unpin n-gram table memory so ``extra`` cache bytes fit the host check; False when nothing was released or
+        when the gate's own room or the explicit cap (not the host) is what refuses."""
+
+        gate = self.memory_gate
+        if self.release is None or gate.held + int(extra) > gate.room - gate.reserve:
+            return False
+        limit = cuda_limit_bytes() if torch.cuda.is_available() else None
+        if limit is not None and limit - int(torch.cuda.memory_allocated()) < int(extra) + gate.reserve:
+            return False
+        short = int(extra) + gate.reserve - (gate.live() if gate.live is not None else 0)
+        freed = self.release(max(short, 1))
+        if freed > 0:
+            self.released += freed
+            print(f"[tensorfold] memory: unpinned {freed / GIB:.2f} GiB of the n-gram table for stream caches "
+                  f"({self.released / GIB:.2f} GiB so far)", flush=True)
+        return freed > 0
 
     def _shrink(self, st: State, *, release: bool = False, force: bool = False) -> None:
         """Return idle caches to the gate, retaining the graph slot unless memory or cleanup requires its release."""

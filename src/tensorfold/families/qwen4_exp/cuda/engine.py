@@ -59,6 +59,7 @@ class FlashNextEngine:
     """``eos``, ``generate`` (rank 0 or one GPU) and ``follow`` (rank 1), as ``tensorfold.cuda.server`` expects."""
 
     cost: float = COST       # the expected-time draft stop (``__init__`` reads TF_DRAFT_COST)
+    ngram = None             # the n-gram residency hooks (``__init__`` builds them)
 
     def __init__(self, model_dir: Path, *, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  draft_vocab: str | int | None = "default", max_len: int | None = None,
@@ -97,6 +98,9 @@ class FlashNextEngine:
             raise ValueError(f"MTP drafts a round: 0 to {MAX_DEPTH}, not {depth}")
         if not 0.0 <= float(confidence) <= 1.0:
             raise ValueError(f"MTP draft confidence: a probability from 0 to 1, not {confidence}")
+        from .ngram_residency import Residency
+
+        self.ngram = Residency(os.environ)             # TF_NGRAM_ADVICE / LOCK / REFRESH, refused before the load
         torch.cuda.set_device(0)
         self.tp, self.rank, self.depth, self.confidence = tp, rank, int(depth), float(confidence)
         self.streams, self.master, self.graphs_enabled = int(streams), master, bool(graphs)
@@ -225,6 +229,12 @@ class FlashNextEngine:
                 locks[id(table)] = got
                 pinned += getattr(table, "pinned_bytes", lock_bytes(table) if got else 0)
             locked = all(locks.values())
+        if not locked:                                # unlocked tables fault on demand: one page a fault, no read-around
+            for layer in w.layers:
+                table = layer.ple.table if layer.ple is not None else None
+                if hasattr(table, "random_access"):
+                    table.random_access()
+        advised = self.ngram.advise(w, ple_on_ssd)
         read_s = time.perf_counter() - started
         captured = self.e.graphs.warm(self.depth + 1) if self.e is not None and self.e.graphs is not None else 0
         started = time.perf_counter()
@@ -239,7 +249,7 @@ class FlashNextEngine:
             torch.cuda.empty_cache()
         warm_s = time.perf_counter() - started
         reread_s = 0.0
-        if prefetch and not ple_on_ssd and not locked:
+        if prefetch and not ple_on_ssd and not locked and not self.ngram.owns_startup:
             started = time.perf_counter()
             for table in tables.values():
                 if locks[id(table)]:
@@ -248,6 +258,7 @@ class FlashNextEngine:
                 if hasattr(table, "lock_runs"):
                     pinned += table.lock_runs(max(0, room - pinned))
             reread_s = time.perf_counter() - started
+        residency = self.ngram.start(w, ple_on_ssd, self.multi)
         if self.concurrent and tp == 2 and rank == 0:
             from .multi import Link
 
@@ -266,6 +277,8 @@ class FlashNextEngine:
                  f"lasts ({self.multi.memory_gate.room / 2**30:.1f} GiB free for their caches, "
                  f"{self.multi.window_bytes / 2**30:.2f} GiB for one at the full window), eager" if self.concurrent else
                  f"{self.context_window}-token prompt/reply window; {self.max_len}-token cache")
+        again = (f", read again after warm-up in {reread_s:.1f}s" + (f" ({pinned / 2**30:.1f} GiB of it locked)"
+                                                                     if pinned else "")) if reread_s else ""
         if ple_on_ssd:
             how = "read from SSD at each lookup"
         elif tables_read:                             # read during the load: the wait after it, then any lock
@@ -273,8 +286,7 @@ class FlashNextEngine:
                 f", locked in memory in {read_s:.1f}s" if locked else "")
         else:
             how = f"{'locked in memory' if locked else 'read'} in {read_s:.1f}s"
-        if reread_s:
-            how += f", read again after warm-up in {reread_s:.1f}s ({pinned / 2**30:.2f} GiB of pages locked)"
+        how += advised + again + residency
         kv = "" if self.kv_dtype == "bf16" else f"; {self.kv_dtype} KV cache (fp16 scale per 32 values)"
         print(f"[tensorfold] Flash Next on CUDA: {rule}; {where}{kv}; n-gram tables {how}; {captured} "
               f"decode graphs captured; idle prompt pieces {self.prefill_rows} rows; "
@@ -488,9 +500,14 @@ class FlashNextEngine:
             emit = on_tokens
             on_tokens = lambda new: (emit(new), False)[1]       # noqa: E731  both ranks decode to the end
         if not draft:
-            return self._serial(prompt, max_tokens, sampling, on_tokens, constraint, stop_eos, probabilities=probabilities)
-        return self._decode(prompt, max_tokens, sampling, on_tokens, hit, constraint, stop_eos,
-                            probabilities=probabilities, points=points)
+            stats = self._serial(prompt, max_tokens, sampling, on_tokens, constraint, stop_eos,
+                                 probabilities=probabilities)
+        else:
+            stats = self._decode(prompt, max_tokens, sampling, on_tokens, hit, constraint, stop_eos,
+                                 probabilities=probabilities, points=points)
+        if self.ngram is not None:
+            self.ngram.after_request()                    # TF_NGRAM_REFRESH=1: evicted table pages back, on a thread
+        return stats
 
     def score_labels(self, prompt_ids, label_ids) -> tuple[list[float], float]:
         """Score the prompt's final row in a fresh state without adding a kept decision prefix."""
