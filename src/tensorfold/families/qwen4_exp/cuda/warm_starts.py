@@ -4,8 +4,8 @@ A kept message-start state (the end of a shared system block, ``prefixes.remembe
 so the first chat after every restart prefills its whole system block again. With ``TF_WARM_STARTS=<file>`` the
 server records the token ids of those system blocks (only prompts that open with a system message, cut at the second
 message's start: system and tool text, never a user or assistant message) in a local file it creates with mode 0600,
-and after its next start queues each of the ``TF_WARM_REPLAY`` (default 2) most recently used blocks as a background
-request: the block plus an empty user turn's opening, one greedy token. The replay is an ordinary request through the
+and at its next start, before it takes traffic, prefills each of the ``TF_WARM_REPLAY`` (default 2) most recently used
+blocks as a request of its own: the block plus a user turn's opening, one greedy token. The replay is an ordinary request through the
 ordinary prefill, so the state it keeps is the one a first chat would have kept (exact by construction), and a later
 chat resumes from it as a second chat does. Nothing is restored from disk: a new build, settings or weights recompute
 it; a recorded block whose tokenizer changed is ignored.
@@ -50,6 +50,7 @@ class WarmStarts:
         self.fingerprint, self.vocab, self.limit = fingerprint, int(vocab), limit
         self.lock = threading.Lock()
         self.wake = threading.Condition(self.lock)
+        self.saving = threading.Lock()                # one write at a time (the writer thread, or ``save``)
         self.dirty = False
         self.writer: threading.Thread | None = None
         self.entries: list[dict] = self._load()      # most recently used first: {"ids", "last", "uses"}
@@ -139,9 +140,8 @@ class WarmStarts:
                 while not self.dirty:
                     self.wake.wait()
                 self.dirty = False
-                data = {"version": VERSION, "tokenizer": self.fingerprint, "entries": list(self.entries)}
             try:
-                self.save(data)
+                self.save()                               # the newest entries, taken under the write lock
             except OSError as exc:
                 print(f"[tensorfold] warm starts: could not write {self.path} ({type(exc).__name__})", flush=True)
             time.sleep(1.0)                               # a burst of chats: one write a second at most
@@ -149,9 +149,13 @@ class WarmStarts:
     def save(self, data: dict | None = None) -> None:
         """Write the file atomically, created 0600 in a 0700 directory it makes."""
 
-        if data is None:
-            with self.lock:
-                data = {"version": VERSION, "tokenizer": self.fingerprint, "entries": list(self.entries)}
+        with self.saving:
+            if data is None:
+                with self.lock:
+                    data = {"version": VERSION, "tokenizer": self.fingerprint, "entries": list(self.entries)}
+            self._save(data)
+
+    def _save(self, data: dict) -> None:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + f".{os.getpid()}.tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -179,25 +183,22 @@ def replay_count() -> int:
     return int(value)
 
 
-def replay(warm: WarmStarts, submit: Callable[[list[int]], object], n: int) -> threading.Thread | None:
-    """Queue the recorded blocks as background requests, one after another, on a thread; logs lengths only."""
+def replay(warm: WarmStarts, submit: Callable[[list[int]], object], n: int) -> int:
+    """Prefill the recorded blocks one after another and return how many were kept; logs lengths only.
+
+    Run before the server takes traffic: a block prefilled alone is cut into the same passes as a cold first chat on
+    an idle server. Beside another prompt its passes would be cut differently and its state need not match that."""
 
     prompts = warm.replays(n)
-    if not prompts:
-        return None
-
-    def run() -> None:
-        t0, done = time.perf_counter(), []
-        for prompt in prompts:
-            try:
-                submit(prompt)
-                done.append(len(prompt) - len(warm.user))
-            except Exception as exc:                      # noqa: BLE001  (a replay is an optimization only)
-                print(f"[tensorfold] warm starts: a replay failed ({type(exc).__name__}: {exc})", flush=True)
-        if done:
-            print(f"[tensorfold] warm starts: {len(done)} system block(s) prefilled again "
-                  f"({', '.join(str(n) for n in done)} tokens) in {time.perf_counter() - t0:.1f}s", flush=True)
-
-    thread = threading.Thread(target=run, name="tf-warm-replay", daemon=True)
-    thread.start()
-    return thread
+    t0, done = time.perf_counter(), []
+    for prompt in prompts:
+        try:
+            submit(prompt)
+            done.append(len(prompt) - len(warm.user))
+        except Exception as exc:                          # noqa: BLE001  (a replay is an optimization only)
+            print(f"[tensorfold] warm starts: a replay failed ({type(exc).__name__}: {exc})", flush=True)
+    if done:
+        print(f"[tensorfold] warm starts: {len(done)} system block(s) prefilled again "
+              f"({', '.join(str(k) for k in done)} tokens) in {time.perf_counter() - t0:.1f}s, before serving",
+              flush=True)
+    return len(done)

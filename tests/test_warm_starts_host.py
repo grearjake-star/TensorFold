@@ -25,9 +25,27 @@ def system(n=1200, seed=5):
     return HEAD + [1000 + (seed * 7 + i) % 5000 for i in range(n)]
 
 
+MADE = []
+
+
+def settle():
+    """Wait until every recorder's writer thread is idle (nothing dirty, no write in progress)."""
+
+    import time
+    for w in MADE:
+        for _ in range(200):
+            with w.saving:
+                if not w.dirty:
+                    break
+            time.sleep(0.01)
+    MADE.clear()
+
+
 def make(path, limit=ws.LIMIT, fingerprint="tok-a"):
-    return ws.WarmStarts(path, head=HEAD, opener=OPENER, user=TAIL, fingerprint=fingerprint, vocab=250000,
+    MADE.append(None)
+    MADE[-1] = ws.WarmStarts(path, head=HEAD, opener=OPENER, user=TAIL, fingerprint=fingerprint, vocab=250000,
                          limit=limit)
+    return MADE[-1]
 
 
 class Slot:
@@ -62,6 +80,7 @@ class WarmStartTests(unittest.TestCase):
         self.path = Path(self.dir.name) / "state" / "warm-starts.json"
 
     def tearDown(self):
+        settle()
         self.dir.cleanup()
 
     def test_only_system_blocks_are_recorded(self):
@@ -147,9 +166,9 @@ class WarmStartTests(unittest.TestCase):
             if len(seen) == 1:
                 raise RuntimeError("no free stream slot")
 
-        ws.replay(w, submit, 2).join(5)
+        self.assertEqual(ws.replay(w, submit, 2), 1)                      # synchronous: done before serving
         self.assertEqual(seen, [a + TAIL, b + TAIL])
-        self.assertIsNone(ws.replay(make(Path(self.dir.name) / "none.json"), submit, 2))
+        self.assertEqual(ws.replay(make(Path(self.dir.name) / "none.json"), submit, 2), 0)
 
     def test_replay_count_env(self):
         os.environ.pop(ws.REPLAY_ENV, None)

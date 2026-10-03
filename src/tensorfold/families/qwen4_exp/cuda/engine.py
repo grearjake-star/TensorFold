@@ -302,7 +302,7 @@ class FlashNextEngine:
             self._warm_starts(model_dir, w.cfg.vocab)
 
     def _warm_starts(self, model_dir, vocab: int) -> None:
-        """TF_WARM_STARTS: record kept system blocks; prefill the most recent again now, as background requests."""
+        """TF_WARM_STARTS: record kept system blocks; prefill the most recent again now, before the server takes traffic."""
 
         from tensorfold.engine.exact_sampling import Sampling
 
@@ -316,8 +316,8 @@ class FlashNextEngine:
         greedy = Sampling(seed=0, temperature=0.0)
         print(f"[tensorfold] warm starts: recording system blocks (mode 0600); {min(n, len(warm.entries))} of "
               f"{len(warm.entries)} recorded to prefill again", flush=True)
-        self.warm_replay = replay(warm, lambda prompt: self.scheduler.submit(
-            prompt, 1, greedy, True, lambda new: None, background=True), n)
+        # alone, before serving: a replay cut into other passes beside a live prompt could keep a different state
+        self.warm_replay = replay(warm, lambda prompt: self.scheduler.submit(prompt, 1, greedy, True, lambda new: None), n)
 
     def _same_settings(self, torch, ids) -> None:
         """Both ranks must decode with the same rule, context, draft vocabulary and KV cache, or they would fall out of step: refuse to start otherwise."""
