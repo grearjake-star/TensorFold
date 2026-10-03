@@ -30,6 +30,15 @@ def _touch(owner, entry) -> None:
 
     if _is_start(owner, entry):
         owner.kept = [k for k in owner.kept if k is not entry] + [entry]
+        _note(owner, entry[0])
+
+
+def _note(owner, ids) -> None:
+    """TF_WARM_STARTS: a kept or resumed message-start state's system block is recorded for the next start."""
+
+    warm = getattr(owner, "warm_starts", None)
+    if warm is not None:
+        warm.note(ids)
 
 
 def _middle(kept, entry) -> bool:
@@ -102,6 +111,7 @@ def remember(owner, ids, st, snap, tail, start: bool = False) -> None:
     starts = _starts(owner)
     if start:
         starts.add(tuple(ids))
+        _note(owner, ids)
     gone = [k[1] for k in owner.kept if k[0] == ids]
     owner.kept = [k for k in owner.kept if k[0] != ids] + [(ids, st, snap, tail)]
     while len(owner.kept) > owner.keep:

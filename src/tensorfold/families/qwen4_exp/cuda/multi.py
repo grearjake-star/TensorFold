@@ -48,6 +48,10 @@ def _slot(w, st: State, buf: Buffers, mbuf: Buffers, pbuf: Buffers, capacity: in
 class MultiDecoder(TwoRanks, Alone, PromptPasses):
     """Rounds over the live streams; ``slots`` streams at most, each with ``capacity`` tokens of context."""
 
+    warm_starts = None               # TF_WARM_STARTS: records kept system blocks (the engine sets it)
+    release = None                   # TF_NGRAM_LOCK: munlocks table runs for growing caches (the engine sets it)
+    released = 0
+
     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
                  share: float = SHARE, points=None, graphs: bool = True, vision=None, workspace_bytes: int = 0,
