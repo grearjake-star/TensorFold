@@ -53,9 +53,13 @@ class Residency:
         self.pinned = pinned
         if multi is not None and policy["lock"]:
             multi.release = self.release          # a growing stream cache unpins table runs before the gate refuses
-        asked = sum(t.refresh(policy["reserve"]) for t in self.tables) if policy["refresh"] else 0
+        # a budget also reads the unpinned rest back once (unless TF_NGRAM_REFRESH=0): what survived the load's reads
+        # in the page cache varied 29.6-36.4 GiB between loads, and decode with it (59.8 vs 66.1 tok/s at 27 pinned)
+        once = policy["lock"] == "budget" and policy["startup"] and not policy["refresh"]
+        asked = sum(t.refresh(policy["reserve"]) for t in self.tables) if policy["refresh"] or once else 0
         return (_lock_note(policy, pinned, before, self.tables) if policy["lock"] else "") + (
-            f", {asked / 2**30:.1f} GiB re-read, refreshed after each request" if policy["refresh"] else "")
+            f", {asked / 2**30:.1f} GiB re-read, refreshed after each request" if policy["refresh"] else
+            f", the rest read back ({asked / 2**30:.1f} GiB asked)" if once else "")
 
     def release(self, nbytes: int) -> int:
         """Unpin table runs until ``nbytes`` are released (or none is left); bytes released."""

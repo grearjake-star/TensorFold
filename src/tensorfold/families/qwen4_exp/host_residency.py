@@ -18,7 +18,8 @@ def residency_policy(env) -> dict:
     TF_NGRAM_LOCK=all         every table page, whatever the admission's room (a memory-budget decision)
     TF_NGRAM_LOCK=<GiB>       a fixed budget: the same leading runs (dense first) on every load, so speed does not
                               follow MemAvailable at start-up; clipped (and the startup line says so) only where
-                              pinning it would leave MemAvailable under the floor auto stops at
+                              pinning it would leave MemAvailable under the floor auto stops at; the unpinned
+                              rest is read back once after it (TF_NGRAM_REFRESH=0: not)
     TF_NGRAM_REFRESH=1        after start-up and after each request, read evicted pages back (MADV_WILLNEED) while
                               MemAvailable stays above the reserve
     (unset)                   the engine's own read-back after warm-up (and its run pins within the startup room)

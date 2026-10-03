@@ -242,3 +242,31 @@ def test_budget_under_parallel_keeps_the_gate_floor_and_installs_the_release(tmp
     note = ngram_residency.Residency({"TF_NGRAM_LOCK": repr(budget / GIB)}).start(None, False, _decoder([0], None))
     assert "CLIPPED" in note and table.locked_bytes() == sum(spans[:2])
     table.unlock()
+
+
+def test_budget_reads_the_unpinned_rest_back_once_unless_refresh_is_off(tmp_path, monkeypatch):
+    from tensorfold.families.qwen4_exp.cuda import ngram_residency
+
+    table, ids = _table(tmp_path, BIG)
+    before = table.gather(ids)
+    spans = _words(table)
+    calls = []
+    monkeypatch.setattr(type(table), "refresh", lambda self, reserve, chunk=512: calls.append(reserve) or 7)
+    monkeypatch.setattr(ngram_residency, "_unique", lambda w: {1: table})
+    monkeypatch.setattr(host_residency, "mem_available", lambda: 50 * GIB)
+    monkeypatch.setattr(ngram_residency, "mem_available", lambda: 50 * GIB)
+    res = ngram_residency.Residency({"TF_NGRAM_LOCK": repr(sum(spans[:3]) / GIB)})
+    note = res.start(None, False, None)
+    assert calls == [10 * GIB] and "the rest read back" in note
+    res.after_request()                                         # once: no refresh thread after requests
+    assert res._refreshing is None
+    table.unlock()
+    calls.clear()
+    note = ngram_residency.Residency({"TF_NGRAM_LOCK": repr(sum(spans[:3]) / GIB), "TF_NGRAM_REFRESH": "0"}).start(
+        None, False, None)
+    assert calls == [] and "read back" not in note
+    table.unlock()
+    note = ngram_residency.Residency({"TF_NGRAM_LOCK": "auto"}).start(None, False, None)
+    assert calls == [] and "read back" not in note               # auto unchanged
+    table.unlock()
+    assert _same(before, table.gather(ids))
