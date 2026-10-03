@@ -63,13 +63,14 @@ class Alone:
         counts = gdn.to_device([len(rows)], torch.int32, self.w.device)
         gdn.replay(table, sc.lin, 1, kept, counts, k[0], v[0], in_place=True)
 
-    def _relocate_kept(self, target, avoid) -> bool:
+    def _relocate_kept(self, target, avoid, evict: bool = False) -> bool:
         """Move all graph-slot keeps into spare rows without eviction; plans record the same copy and ownership move."""
 
         spare = next((f for f in self.free if f is not target and f is not avoid), None)
-        if spare is None and not self.planning and self.w.comm is None:
-            # house (speed-v8.1): every slot kept, so the oldest other kept end goes (LRU), not the graphs; 0.6.4 moves
-            # the graphs instead and each resumed lone turn recaptures them
+        if spare is None and evict and not self.planning and self.w.comm is None:
+            # house (speed-v8.1): a resumed lone turn with every slot kept drops the oldest other kept end (LRU), not
+            # the graphs; 0.6.4 moves the graphs instead and each turn recaptures them. A fresh stream left alone
+            # keeps 0.6.4's rule (no kept end is lost for it; fresh prompts take the graph slot at admission)
             busy = self._busy()
             spare = next((k[1] for k in self.kept if k[1] is not target and k[1] is not avoid
                           and id(k[1]) not in busy), None)
@@ -132,7 +133,8 @@ class Alone:
 
         target, old = self.solo.st, s.st
         self._flush(s)
-        if any(k[1] is target for k in self.kept) and not self._relocate_kept(target, old):
+        resumed = getattr(s, "cached", 0) > 0          # house: only a resumed turn may evict another kept end
+        if any(k[1] is target for k in self.kept) and not self._relocate_kept(target, old, evict=resumed):
             self.solo.st = old                   # preserve both prefix chains instead of evicting a kept slot
             if self.planning:
                 self.actions.append(["solo", self._index(old)])
