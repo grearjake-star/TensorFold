@@ -47,7 +47,8 @@ def test_a_spare_slot_reuses_the_shared_point_without_consuming_the_source_chain
     assert st is spare and cached == len(prefix)
     assert resume == {"state": snap, "tail": "tail"}
     assert spare.copied == (source, len(prefix), 299)
-    assert dec.kept == kept and dec.free == []
+    assert sorted(map(id, dec.kept)) == sorted(map(id, kept)) and dec.free == []
+    assert dec.kept[-1][0] == prefix                 # the resumed point becomes the newest kept entry
     assert growth[0][2].get("protect") is source
 
 
