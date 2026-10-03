@@ -11,7 +11,7 @@ import torch
 from tensorfold.cuda.exl3 import experts as x3experts
 from tensorfold.cuda.exl3 import format as fmt
 
-from .exl3_mm import Scratch, f16, stack, x3
+from .exl3_mm import F8, Scratch, f16, hc_fp8, stack, x3
 from .exl3_pack import _DT, NgramTable, Pack, is_exl3
 
 def _prefill_rows() -> int:
@@ -209,6 +209,8 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
         if inject:
             rows.append(get(name + ".block_inject_weight.weight"))
         down, up = f16(sc, rows, device), f16(sc, [get(name + ".input_mix_weight_up.weight")], device)
+        if hc_fp8():                    # opt-in, numerics-changing: decode reads MXFP8 copies, prompts the fp16 rows
+            return HC(F8(down), F8(up), centred(name + ".hc_norm.weight"), inject, down, up)
         return HC(down, up, centred(name + ".hc_norm.weight"), inject, down, up)
 
     def moe(name: str) -> MoEW:

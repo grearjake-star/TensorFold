@@ -124,7 +124,7 @@ def _down_act(hc: HC, b: Buffers, R: int, streams: int, low: int, inject) -> Non
     if isinstance(hc.down, qmm.Q4):
         got = _mm(b.normed[:R], hc.prefill_down if b.prefill else hc.down, b.xs_normed[:R], out, b, reduce=False)
     elif b.prefill:                                   # an EXL3 pack's fp16 matrix: summed slices, any row count
-        got = hc.down(b.normed[:R], out)
+        got = (hc.prefill_down if hc.prefill_down is not None else hc.down)(b.normed[:R], out)
     else:
         got = hc.down.partials(b.normed[:R])          # fp32 slices [SK, R, N] that the activation sums in order
     if got.dim() == 3:

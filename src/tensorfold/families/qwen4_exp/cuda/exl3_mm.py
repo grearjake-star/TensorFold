@@ -203,6 +203,43 @@ class F16:
     prefill = __call__
 
 
+def hc_fp8() -> bool:
+    """``TF_EXL3_HC_FP8=1``: decode reads MXFP8 copies of the pack's fp16 hyper-connection faces (half the bytes;
+    prompts keep the fp16 rows). It CHANGES NUMERICS (opt-in, off by default; SPEED-PLAN tier E gate)."""
+
+    import os
+
+    return os.environ.get("TF_EXL3_HC_FP8", "").strip() == "1"
+
+
+class F8:
+    """An fp16 face's MXFP8 copy for decode: e4m3 codes, a power-of-two scale per 32 inputs rounded up (PR #104's
+    recipe) on the lane matmul, which keeps a row's bits independent of its window (drafted == serial)."""
+
+    def __init__(self, face: "F16") -> None:
+        from tensorfold.cuda.nvfp4.linear import Mx8Linear
+
+        w = face.w.float()
+        n, k = w.shape
+        g = w.view(n, k // 32, 32)
+        top = g.abs().amax(-1)
+        e = torch.ceil(torch.log2(torch.where(top > 0, top / 448.0, torch.ones_like(top)))).clamp(-127.0, 127.0)
+        codes = (g / torch.ldexp(torch.ones_like(e), e.to(torch.int32))[..., None]).reshape(n, k)
+        self.lin = Mx8Linear.from_checkpoint(codes.to(torch.float8_e4m3fn), (e.to(torch.int32) + 127).to(torch.uint8))
+        self.n, self.k = n, k
+
+    def nbytes(self) -> int:
+        return self.lin.nbytes()
+
+    def partials(self, x: torch.Tensor) -> torch.Tensor:
+        """The down projection for the read-out's activation: [M, n] bf16 (``hc_act`` takes it as one slice)."""
+
+        return self.lin(x)
+
+    def __call__(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        return self.lin(x, out)
+
+
 @dataclass
 class X3:
     """A trellis projection: the row-invariant EXL3 linear in 128-row calls, or the prompt GEMM (``prefill``)."""
