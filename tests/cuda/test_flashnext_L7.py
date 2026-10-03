@@ -37,7 +37,7 @@ def _run(dec, prompt, count, sampling, draft=True):
 def test_a_lone_stream_replays_the_graphs_with_its_eager_bits(kv_dtype):
     w = _model()
     dec = MultiDecoder(w, slots=4, capacity=1024, depth=3, confidence=0.3, kv_dtype=kv_dtype, graphs=True)
-    eager = MultiDecoder(w, slots=4, capacity=1024, depth=3, confidence=0.3, kv_dtype=kv_dtype)
+    eager = MultiDecoder(w, slots=4, capacity=1024, depth=3, confidence=0.3, kv_dtype=kv_dtype, graphs=False)
     assert dec.solo is not None and eager.solo is None
     for prompt, sampling in zip(PROMPTS, SAMPLINGS):
         before = dec.solo_rounds
