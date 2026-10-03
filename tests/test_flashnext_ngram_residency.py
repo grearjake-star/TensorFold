@@ -128,11 +128,16 @@ def test_refresh_asks_for_missing_runs_within_the_reserve(tmp_path, monkeypatch)
 
 def test_policy_values_and_refusals():
     p = host_residency.residency_policy({})
-    assert p == {"lock": None, "lock_reserve": 10 * GIB, "refresh": False, "reserve": 10 * GIB, "startup": True}
+    assert p == {"lock": None, "lock_reserve": 10 * GIB, "budget": None, "refresh": False, "reserve": 10 * GIB,
+                 "startup": True}
     p = host_residency.residency_policy({"TF_NGRAM_LOCK": "auto:6.5", "TF_NGRAM_REFRESH": "1", "TF_NGRAM_RESERVE_GIB": "12"})
-    assert p == {"lock": "auto", "lock_reserve": int(6.5 * GIB), "refresh": True, "reserve": 12 * GIB, "startup": True}
+    assert p == {"lock": "auto", "lock_reserve": int(6.5 * GIB), "budget": None, "refresh": True, "reserve": 12 * GIB,
+                 "startup": True}
+    p = host_residency.residency_policy({"TF_NGRAM_LOCK": "27.5"})
+    assert p["lock"] == "budget" and p["budget"] == int(27.5 * GIB) and p["lock_reserve"] == 10 * GIB
     assert host_residency.residency_policy({"TF_NGRAM_REFRESH": "0"})["startup"] is False
     for bad in ({"TF_NGRAM_LOCK": "yes"}, {"TF_NGRAM_LOCK": "auto:x"}, {"TF_NGRAM_REFRESH": "on"},
+                {"TF_NGRAM_LOCK": "0"}, {"TF_NGRAM_LOCK": "-3"}, {"TF_NGRAM_LOCK": "nan"}, {"TF_NGRAM_LOCK": "inf"},
                 {"TF_NGRAM_RESERVE_GIB": "-1"}, {"TF_NGRAM_RESERVE_GIB": "ten"}):
         with pytest.raises(ValueError, match="TF_NGRAM"):
             host_residency.residency_policy(bad)

@@ -16,6 +16,9 @@ def residency_policy(env) -> dict:
                               of the pages a lookup reads; NVFP4: the block scales)
     TF_NGRAM_LOCK=auto[:GiB]  dense first, then whole shards of the rest while MemAvailable stays above the reserve
     TF_NGRAM_LOCK=all         every table page, whatever the admission's room (a memory-budget decision)
+    TF_NGRAM_LOCK=<GiB>       a fixed budget: the same leading runs (dense first) on every load, so speed does not
+                              follow MemAvailable at start-up; clipped (and the startup line says so) only where
+                              pinning it would leave MemAvailable under the floor auto stops at
     TF_NGRAM_REFRESH=1        after start-up and after each request, read evicted pages back (MADV_WILLNEED) while
                               MemAvailable stays above the reserve
     (unset)                   the engine's own read-back after warm-up (and its run pins within the startup room)
@@ -28,25 +31,35 @@ def residency_policy(env) -> dict:
         reserve = float(env.get("TF_NGRAM_RESERVE_GIB", "") or 10)
     except ValueError:
         raise ValueError(f"TF_NGRAM_RESERVE_GIB: GiB, not {env.get('TF_NGRAM_RESERVE_GIB')!r}") from None
-    lock_reserve = reserve
+    lock_reserve, budget = reserve, None
+    if lock is not None and lock not in ("dense", "auto", "all") and not lock.startswith("auto:"):
+        try:
+            budget = float(lock)
+        except ValueError:
+            raise ValueError(f"TF_NGRAM_LOCK: dense, auto, auto:<GiB>, all or <GiB>, not {lock!r}") from None
+        if not budget > 0 or budget != budget or budget == float("inf"):
+            raise ValueError(f"TF_NGRAM_LOCK: a budget is a positive number of GiB, not {lock!r}")
+        lock = "budget"
     if lock is not None and lock.startswith("auto:"):
         try:
             lock_reserve = float(lock[5:])
         except ValueError:
-            raise ValueError(f"TF_NGRAM_LOCK: dense, auto, auto:<GiB> or all, not {lock!r}") from None
+            raise ValueError(f"TF_NGRAM_LOCK: dense, auto, auto:<GiB>, all or <GiB>, not {lock!r}") from None
         lock = "auto"
-    if lock not in (None, "dense", "auto", "all"):
-        raise ValueError(f"TF_NGRAM_LOCK: dense, auto, auto:<GiB> or all, not {lock!r}")
+    if lock not in (None, "dense", "auto", "all", "budget"):
+        raise ValueError(f"TF_NGRAM_LOCK: dense, auto, auto:<GiB>, all or <GiB>, not {lock!r}")
     if refresh not in (None, "0", "1"):
         raise ValueError(f"TF_NGRAM_REFRESH: 0 or 1, not {refresh!r}")
     if reserve < 0 or lock_reserve < 0:
         raise ValueError("TF_NGRAM_RESERVE_GIB: not negative")
-    return {"lock": lock, "lock_reserve": int(lock_reserve * GIB), "refresh": refresh == "1",
+    return {"lock": lock, "lock_reserve": int(lock_reserve * GIB), "budget": None if budget is None else int(budget * GIB),
+            "refresh": refresh == "1",
             "reserve": int(reserve * GIB), "startup": refresh != "0"}
 
 
-def apply_lock(table: _Residency, policy: dict) -> int:
-    """TF_NGRAM_LOCK on one table: bytes locked."""
+def apply_lock(table: _Residency, policy: dict, budget: int | None = None) -> int:
+    """TF_NGRAM_LOCK on one table: bytes locked. A budget lock pins ``budget`` bytes (default: the policy's) of whole
+    runs in ``parts()`` order, the same runs on every load, unless MemAvailable less ``lock_reserve`` is smaller."""
 
     mode = policy["lock"]
     if mode == "dense":
@@ -56,7 +69,26 @@ def apply_lock(table: _Residency, policy: dict) -> int:
     if mode == "auto":
         already = sum(n for _, n in getattr(table, "_locked", []))
         return table.lock_parts(tuple(table.parts()), already + max(0, mem_available() - policy["lock_reserve"]))
+    if mode == "budget":
+        already = sum(n for _, n in getattr(table, "_locked", []))
+        want = policy["budget"] if budget is None else budget
+        return table.lock_parts(tuple(table.parts()), min(want, already + max(0, mem_available() - policy["lock_reserve"])))
     return 0
+
+
+def planned_lock(tables, budget: int) -> int:
+    """Bytes a ``budget`` lock pins on ``tables`` with room to spare (``lock_parts``' walk: whole runs in ``parts()``
+    order, stopping at the first that does not fit): a fixed quantity of the checkpoint and the budget."""
+
+    total = 0
+    for table in tables:
+        for name in table.parts():
+            for arr in table.parts()[name]:
+                size = _span(arr)[1]
+                if total + size > budget:
+                    return total
+                total += size
+    return total
 
 
 def _libc():

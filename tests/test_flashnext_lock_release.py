@@ -137,3 +137,94 @@ def test_auto_lock_under_parallel_leaves_the_gate_floor(monkeypatch):
     # the floor is what the gate's host check subtracts: at MemAvailable == floor, every slot's first step fits
     host = floor - capacity.reserve_bytes(120 * GIB)
     assert MemoryGate(1 << 50, reserve=2 * GIB, live=lambda: host).fits(multi.planned_growth())
+
+
+# NB: TF_NGRAM_LOCK=<GiB>, a fixed pin budget. auto pins whatever MemAvailable leaves above its floor at start-up, so
+# two loads of one build pinned 26-33 GiB and decoded at different speeds; a budget pins the same runs every load.
+
+def _budget_policy(gib, **extra):
+    return host_residency.residency_policy({"TF_NGRAM_LOCK": str(gib), **extra})
+
+
+def _words(table):
+    """Every array's span in lock order (dense components first)."""
+    return [host_residency._span(a)[1] for v in table.parts().values() for a in v]
+
+
+def _same(a, b) -> bool:
+    return all(np.array_equal(x, y) for x, y in zip(a, b))
+
+
+def test_budget_lock_pins_the_same_runs_whatever_memavailable(tmp_path, monkeypatch):
+    table, ids = _table(tmp_path)
+    before = table.gather(ids)
+    spans = _words(table)
+    budget = sum(spans[:5]) + spans[5] // 2                     # five arrays and half of the sixth
+    policy = host_residency.residency_policy({"TF_NGRAM_LOCK": repr(budget / GIB)})
+    got = []
+    for avail in (40 * GIB, 60 * GIB, 10 * GIB + budget + 1):   # three "loads" with different MemAvailable
+        monkeypatch.setattr(host_residency, "mem_available", lambda a=avail: a)
+        n = host_residency.apply_lock(table, policy)
+        got.append((n, list(table._locked)))
+        table.unlock()
+    assert got[0] == got[1] == got[2]
+    assert got[0][0] == sum(spans[:5]) == host_residency.planned_lock([table], policy["budget"])
+    assert _same(before, table.gather(ids))
+
+
+def test_budget_lock_is_clipped_only_below_the_floor(tmp_path, monkeypatch):
+    table, _ = _table(tmp_path)
+    spans = _words(table)
+    policy = host_residency.residency_policy({"TF_NGRAM_LOCK": repr(sum(spans) / GIB)})     # the whole table
+    monkeypatch.setattr(host_residency, "mem_available", lambda: 10 * GIB + sum(spans[:2]))  # floor 10 GiB
+    assert host_residency.apply_lock(table, policy) == sum(spans[:2])
+    table.unlock()
+
+
+def test_budget_over_several_tables_and_the_startup_note(tmp_path, monkeypatch):
+    from tensorfold.families.qwen4_exp.cuda import ngram_residency
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    a, _ = _table(tmp_path / "a")
+    b, _ = _table(tmp_path / "b", counts=(700, 2000))
+    first = sum(_words(a))
+    budget = first + _words(b)[0]                               # all of a, the first array of b
+    res = ngram_residency.Residency({"TF_NGRAM_LOCK": repr(budget / GIB)})
+    monkeypatch.setattr(ngram_residency, "_unique", lambda w: {1: a, 2: b})
+    monkeypatch.setattr(ngram_residency, "mem_available", lambda: 50 * GIB)
+    monkeypatch.setattr(host_residency, "mem_available", lambda: 50 * GIB)
+    note = res.start(None, False, None)
+    assert res.pinned == budget == a.locked_bytes() + b.locked_bytes() and b.locked_bytes() == _words(b)[0]
+    assert "(budget" in note and "met;" in note and "floor 10.0 GiB" in note
+    a.unlock(), b.unlock()
+    monkeypatch.setattr(host_residency, "mem_available", lambda: 10 * GIB + first // 2)
+    note = res.start(None, False, None)
+    assert res.pinned < budget and "CLIPPED" in note
+    a.unlock(), b.unlock()
+
+
+def test_budget_under_parallel_keeps_the_gate_floor_and_installs_the_release(tmp_path, monkeypatch):
+    from tensorfold.families.qwen4_exp.cuda import ngram_residency
+
+    table, ids = _table(tmp_path)
+    before = table.gather(ids)
+    spans = _words(table)
+    multi = _decoder([0], None)
+    monkeypatch.setattr(ngram_residency, "mem_total", lambda: 120 * GIB)
+    floor = ngram_residency.gate_floor(multi)
+    res = ngram_residency.Residency({"TF_NGRAM_LOCK": repr(sum(spans[:4]) / GIB)})
+    monkeypatch.setattr(ngram_residency, "_unique", lambda w: {1: table})
+    monkeypatch.setattr(ngram_residency, "mem_available", lambda: floor + sum(spans))
+    monkeypatch.setattr(host_residency, "mem_available", lambda: floor + sum(spans))
+    note = res.start(None, False, multi)
+    assert res.pinned == sum(spans[:4]) and "met;" in note and f"floor {floor / GIB:.1f} GiB" in note
+    assert multi.release == res.release                         # elastic: growth still unpins, last run first
+    assert res.release(1) == spans[3] and table.locked_bytes() == sum(spans[:3])
+    assert _same(before, table.gather(ids))
+    table.unlock()
+    # MemAvailable under the gate floor + budget: clipped down to the floor, never past it
+    monkeypatch.setattr(host_residency, "mem_available", lambda: floor + sum(spans[:2]))
+    note = ngram_residency.Residency({"TF_NGRAM_LOCK": repr(sum(spans[:4]) / GIB)}).start(None, False, _decoder([0], None))
+    assert "CLIPPED" in note and table.locked_bytes() == sum(spans[:2])
+    table.unlock()

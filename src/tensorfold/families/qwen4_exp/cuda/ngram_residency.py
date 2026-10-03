@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 
-from ..host_residency import apply_lock, mem_total, residency_policy
+from ..host_residency import GIB, apply_lock, mem_available, mem_total, planned_lock, residency_policy
 
 
 class Residency:
@@ -41,13 +41,20 @@ class Residency:
         policy = self.policy
         if not self.tables or not (policy["lock"] or policy["refresh"]):
             return ""
-        if multi is not None and policy["lock"] == "auto":
+        if multi is not None and policy["lock"] in ("auto", "budget"):
             policy = dict(policy, lock_reserve=max(policy["lock_reserve"], gate_floor(multi)))
-        pinned = sum(apply_lock(t, policy) for t in self.tables)
+        before = mem_available()
+        if policy["lock"] == "budget":           # one budget across the tables, in the same order every load
+            pinned = 0
+            for t in self.tables:
+                pinned += apply_lock(t, policy, policy["budget"] - pinned)
+        else:
+            pinned = sum(apply_lock(t, policy) for t in self.tables)
+        self.pinned = pinned
         if multi is not None and policy["lock"]:
             multi.release = self.release          # a growing stream cache unpins table runs before the gate refuses
         asked = sum(t.refresh(policy["reserve"]) for t in self.tables) if policy["refresh"] else 0
-        return (f", {pinned / 2**30:.1f} GiB locked ({policy['lock']})" if policy["lock"] else "") + (
+        return (_lock_note(policy, pinned, before, self.tables) if policy["lock"] else "") + (
             f", {asked / 2**30:.1f} GiB re-read, refreshed after each request" if policy["refresh"] else "")
 
     def release(self, nbytes: int) -> int:
@@ -72,6 +79,19 @@ class Residency:
         self._refreshing = threading.Thread(target=lambda: [t.refresh(reserve) for t in self.tables],
                                             name="ngram-refresh", daemon=True)
         self._refreshing.start()
+
+
+def _lock_note(policy: dict, pinned: int, before: int, tables) -> str:
+    """The startup line's lock note. A budget says whether it was met (exactly the runs the budget alone pins); where
+    MemAvailable less the floor was too small (or mlock refused) it says CLIPPED: that load's speed follows the host
+    again and is not comparable with others."""
+
+    note = f", {pinned / GIB:.1f} GiB locked ({policy['lock']}"
+    if policy["lock"] != "budget":
+        return note + ")"
+    met = "met" if pinned == planned_lock(tables, policy["budget"]) else "CLIPPED"
+    return (note + f" {policy['budget'] / GIB:g} GiB, {met}; MemAvailable {before / GIB:.1f} GiB before it, "
+            f"floor {policy['lock_reserve'] / GIB:.1f} GiB)")
 
 
 def gate_floor(multi) -> int:
