@@ -256,7 +256,10 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
 
         if self.solo is not None and any(st is self.solo.st for st in self.free):
             self.free = [st for st in self.free if st is not self.solo.st] + [self.solo.st]
-        return prefixes.slot_for(self, prompt, reuse)
+        st, resume, n = prefixes.slot_for(self, prompt, reuse)
+        if resume is None and self.solo is not None and self.w.comm is None and not self.planning:
+            st = self._fresh_slot(st)            # house: a fresh prompt decodes in the graph slot when it can take it
+        return st, resume, n
 
     def _remember(self, ids: list[int], st: State, snap: dict, tail, start: bool = False) -> None:
         prefixes.remember(self, ids, st, snap, tail, start=start)

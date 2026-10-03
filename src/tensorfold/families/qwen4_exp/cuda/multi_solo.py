@@ -83,6 +83,40 @@ class Alone:
             self.actions.append(["kept", self._index(target), self._index(spare)])
         return True
 
+    def _hand_over(self, st) -> bool:
+        """Admission of a fresh prompt: the idle graph slot's kept ends move into ``st`` (the slot the prompt would
+        take), and the prompt takes the graph slot, so the stream decodes there without a later copy or recapture.
+        (House, from speed-v8.1: 0.6.4 otherwise moves the graphs, and every new lone request on a full pool
+        recaptures them.)"""
+
+        slot = self.solo.st
+        if st is slot or id(slot) in self._busy() or any(f is slot for f in self.free):
+            return False
+        if not any(k[1] is slot for k in self.kept):
+            return False
+        size = slot.capacity
+        if st.capacity < size:
+            need = st.cache_bytes(size) - st.cache_bytes() + st.layer_bytes(size)
+            if not self.memory_gate.fits(need):
+                return False
+            self._state_changed(st)
+            self.memory_gate.take(st.resize(size))
+        st.copy_from(slot)
+        self.kept = [(ids, st if k is slot else k, snap, tail) for ids, k, snap, tail in self.kept]
+        self.solo_moves = getattr(self, "solo_moves", 0) + 1
+        return True
+
+    def _fresh_slot(self, st):
+        """The slot a fresh prompt decodes in: the graph slot when it is free or its kept ends can move into ``st``."""
+
+        slot = self.solo.st
+        if st is slot:
+            return st
+        if any(f is slot for f in self.free):
+            self.free = [f for f in self.free if f is not slot] + [st]
+            return slot
+        return slot if self._hand_over(st) else st
+
     def _move_to_solo(self, s) -> None:
         """Copy a lone stream into the graph slot after committing its pending rows and matching cache sizes."""
 
