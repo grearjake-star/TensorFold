@@ -8,6 +8,7 @@ import torch
 
 from tensorfold.cuda.kernels import gdn
 from tensorfold.cuda.logprobs import capture
+from tensorfold.cuda.memory_gate import NoRoom
 from tensorfold.cuda.streams import Stream, accept
 
 from .decode import Engine, draft
@@ -94,11 +95,23 @@ class Alone:
             else:
                 self._state_changed(old)
             return
+        self.solo_moves = getattr(self, "solo_moves", 0) + 1
         self._drop_kept(target)
         self.free = [f for f in self.free if f is not target]
         self._shrink(target)
-        if not self._grow(target, old.capacity, alone=True):
-            raise RuntimeError("the lone stream's graph slot cannot hold its existing cache")
+        try:
+            grown = self._grow(target, old.capacity, alone=True)
+        except NoRoom:
+            grown = False
+        if not grown:                            # house: no room for the copy's peak, the graphs move to this slot
+            self.solo.st = old                   # instead (0.6.4 raised here and failed the round)
+            if self.planning:
+                self.actions.append(["solo", self._index(old)])
+            else:
+                self._state_changed(old)
+            self._shrink(target)
+            self.free.append(target)
+            return
         target.copy_from(old)
         s.st = target
         if not any(k[1] is old for k in self.kept) and all(f is not old for f in self.free):
@@ -109,6 +122,7 @@ class Alone:
         """Verify a lone stream through its graphs, commit accepted rows and draft the next chain."""
 
         e, st = self.solo, s.st
+        self.solo_rounds = getattr(self, "solo_rounds", 0) + 1      # house: tests count graph-slot rounds
         t0 = time.perf_counter()
         tokens = [s.out[-1]] + list(s.drafts)
         R = len(tokens)

@@ -18,7 +18,7 @@ from . import attention as attn_mod
 from . import gdn as gdn_mod
 from . import attn_multi, gdn_io, gdn_multi, glue, nvfp4_moe, qmm
 from . import image_rows
-from .hc_readout import _readout, hc_block
+from .hc_readout import _readout, _readout_fused, hc_block  # noqa: F401 (_readout_fused: forward._readout_fused in tests)
 from .matmul import mm as _mm
 from .state import ATT_ROWS, CAND, Buffers, State, _MoECfg
 from .weights import HC, LayerW, Weights

@@ -80,6 +80,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         self.solo = (solo(w, self.free[0], capacity, depth, self.pbuf, timing)
                      if graphs and depth > 0 and self.mbuf is not None else None)
         self.solo_on = self.solo is not None
+        self.solo_rounds = self.solo_moves = 0          # house: graph-slot rounds and moves (tests count them)
         # ``round_graphs``: shared rounds (any streams, nothing filling beside them) and draft steps replay CUDA graphs
         self.rounds = (RoundGraphs(w, depth) if round_graphs and w.comm is None and torch.cuda.is_available() and
                        all(getattr(layer.moe.experts, "capturable", True) is not False for layer in w.layers)
