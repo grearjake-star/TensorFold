@@ -195,8 +195,9 @@ class PromptPasses:
             e, mtp, _, kept = self.fills[s.sid]
             self.fills[s.sid][2] = a + n
             if kept is not None and a < kept[0]["pos"] <= a + n:
-                self._remember(list(s.prompt[:kept[0]["pos"]]), s.st, *kept)
-            self.fills[s.sid][3] = None
+                self._remember(list(s.prompt[:kept[0]["pos"]]), s.st, *kept,
+                               start=kept[0]["pos"] != self._keep_at(s))      # a message start, not the end
+            self.fills[s.sid][3] = None                    # only the bounded cache owns a stored snapshot
             if a + n < len(s.prompt):
                 continue
             self.filling.remove(s)

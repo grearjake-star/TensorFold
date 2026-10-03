@@ -10,10 +10,26 @@ def _longer(kept, entry):
     return any(k[1] is entry[1] and len(k[0]) > len(entry[0]) for k in kept)
 
 
-def _touch(owner, entry) -> None:
-    """A resumed entry becomes the newest, so a shared system block outlives the conversations that fork from it."""
+def _starts(owner) -> set:
+    """The ids of kept message-start states (a shared system block), as tuples; created on first use."""
 
-    owner.kept = [k for k in owner.kept if k is not entry] + [entry]
+    starts = getattr(owner, "starts", None)
+    if starts is None:
+        starts = owner.starts = set()
+    return starts
+
+
+def _is_start(owner, entry) -> bool:
+    starts = _starts(owner)
+    return bool(starts) and any(len(t) == len(entry[0]) for t in starts) and tuple(entry[0]) in starts
+
+
+def _touch(owner, entry) -> None:
+    """A resumed message-start state becomes the newest, so a shared system block outlives the conversations
+    that fork from it. Prompt ends keep their place: a resend must not age the ends nobody has resent yet."""
+
+    if _is_start(owner, entry):
+        owner.kept = [k for k in owner.kept if k is not entry] + [entry]
 
 
 def _middle(kept, entry) -> bool:
@@ -25,11 +41,21 @@ def _middle(kept, entry) -> bool:
     return any(m < n for m in sizes) and any(m > n for m in sizes)
 
 
-def _victim(kept) -> int:
-    """The entry to drop past ``keep``: the oldest middle turn (never the newest entry), else the oldest. A
-    slot's chain root (a message-start state: the shared system block) and its newest end stay longest."""
+def _victim(owner) -> int:
+    """The entry to drop past ``keep`` (never the newest), oldest first within the first class that has one:
+    a superseded middle turn, a prompt end its own slot has continued, any prompt end, then any entry. Message-start
+    states (the shared system block) go last; every prompt's own newest end outlasts the ends it superseded."""
 
-    return next((i for i, k in enumerate(kept[:-1]) if _middle(kept, k)), 0)
+    kept = owner.kept
+    older = [(i, k, _is_start(owner, k)) for i, k in enumerate(kept[:-1])]
+    for rule in (lambda k, start: not start and _middle(kept, k),
+                 lambda k, start: not start and _longer(kept, k),
+                 lambda k, start: not start,
+                 lambda k, start: True):
+        i = next((i for i, k, start in older if rule(k, start)), None)
+        if i is not None:
+            return i
+    return 0
 
 
 def slot_for(owner, prompt: list[int], reuse: bool):
@@ -69,13 +95,21 @@ def slot_for(owner, prompt: list[int], reuse: bool):
     return owner.free.pop(), None, 0
 
 
-def remember(owner, ids, st, snap, tail) -> None:
-    """Keep each slot's prefix chain, returning displaced idle slots to the free list."""
+def remember(owner, ids, st, snap, tail, start: bool = False) -> None:
+    """Keep each slot's prefix chain, returning displaced idle slots to the free list. ``start``: a message-start
+    state (the end of a shared system block), which eviction keeps longest."""
 
+    starts = _starts(owner)
+    if start:
+        starts.add(tuple(ids))
     gone = [k[1] for k in owner.kept if k[0] == ids]
     owner.kept = [k for k in owner.kept if k[0] != ids] + [(ids, st, snap, tail)]
     while len(owner.kept) > owner.keep:
-        gone.append(owner.kept.pop(_victim(owner.kept))[1])
+        gone.append(owner.kept.pop(_victim(owner))[1])
+    if starts:
+        lengths = {len(k[0]) for k in owner.kept}
+        owner.starts = {t for t in starts if len(t) in lengths and any(len(k[0]) == len(t) and tuple(k[0]) == t
+                                                                       for k in owner.kept)}
     busy = owner._busy()
     for old in gone:
         if old is not st and id(old) not in busy and all(k[1] is not old for k in owner.kept) and \

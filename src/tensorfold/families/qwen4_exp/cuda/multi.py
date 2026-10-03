@@ -248,8 +248,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             self.free = [st for st in self.free if st is not self.solo.st] + [self.solo.st]
         return prefixes.slot_for(self, prompt, reuse)
 
-    def _remember(self, ids: list[int], st: State, snap: dict, tail) -> None:
-        prefixes.remember(self, ids, st, snap, tail)
+    def _remember(self, ids: list[int], st: State, snap: dict, tail, start: bool = False) -> None:
+        prefixes.remember(self, ids, st, snap, tail, start=start)
 
     def live(self) -> int:
         return len(self.streams) + len(self.filling)

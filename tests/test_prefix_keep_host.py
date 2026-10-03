@@ -66,9 +66,10 @@ class Owner:
         self.busy.add(id(st))
         for p in points:
             if cached + MIN_GAP <= p < len(prompt) - 1:
-                prefixes.remember(self, list(prompt[:p]), st, {'pos': p, 'mtp_len': p - 1}, None)
+                prefixes.remember(self, list(prompt[:p]), st, {'pos': p, 'mtp_len': p - 1}, None, start=True)
         end = len(prompt) - 1
-        prefixes.remember(self, list(prompt[:end]), st, {'pos': end, 'mtp_len': end - 1}, None)
+        if cached < end:                                  # a resend resumes at its own end: nothing new to keep
+            prefixes.remember(self, list(prompt[:end]), st, {'pos': end, 'mtp_len': end - 1}, None)
         self.busy.discard(id(st))
         if all(k[1] is not st for k in self.kept) and all(f is not st for f in self.free):
             self.free.append(st)
@@ -119,6 +120,26 @@ class PrefixKeepTest(unittest.TestCase):
         system = next(k for k in owner.kept if len(k[0]) == len(SYSTEM))
         position = owner.kept.index(system)
         self.assertGreater(position, 0)
+
+    def test_resends_and_next_turns_keep_every_prompts_end(self):
+        """tests/cuda/test_flashnext_multi.py's packed-passes case on the host: five prompts on five slots, then
+        each resent and continued; every resend and next turn resumes one token early, none restarts from 0."""
+
+        owner = Owner(slots=5, keep=8)
+        prompts = [[p] * n for p, n in ((1, 20), (2, 30), (3, 4), (4, 70), (5, 12))]
+        for p in prompts:
+            owner.request(p)
+        for p in prompts:
+            for q in (p, p[:-1] + [271, 77]):
+                self.assertEqual(owner.request(q), len(p) - 1, (p[0], q[-2:]))
+
+    def test_resending_an_end_does_not_age_the_others(self):
+        owner = Owner(slots=4, keep=8)
+        for tag in (1, 2, 3):
+            owner.request([tag] * 300)
+        before = [k[0][0] for k in owner.kept]
+        owner.request([1] * 300)
+        self.assertEqual([k[0][0] for k in owner.kept], before)
 
     def test_without_middles_the_oldest_goes(self):
         owner = Owner(slots=8, keep=3)
