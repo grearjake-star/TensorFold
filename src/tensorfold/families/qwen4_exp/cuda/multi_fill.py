@@ -15,9 +15,11 @@ from .forward import Cut, commit, compute, cut_snapshot, stage
 from .mtp import mtp_compute, mtp_stage
 from .state import CAND, ENDS
 from .multi_tp import OutOfStep
+from .decode import PREFILL_ROWS
 from .prompt_plan import pass_limit
 
 PASS_MIN = 512
+FIRST_PASS = 256                 # a round's first pass beside decoding streams, before a row's time is known
 FILL_GUARD = 8
 
 
@@ -36,6 +38,8 @@ class PromptPasses:
         """A round's prompt rows: its decode (a round alone) takes ``share`` of the pass's time, by the last rounds."""
 
         live = any(not s.done for s in self.streams.values())
+        if live and self.share > 0 and not self.row_s:
+            return min(self.prefill_rows, PREFILL_ROWS, FIRST_PASS)   # a short first pass times a row (whole: ~1-2 s)
         return pass_limit(self.prefill_rows, live, self.share, self.round_s, self.row_s, PASS_MIN)
 
     def _waiting_request(self) -> bool:

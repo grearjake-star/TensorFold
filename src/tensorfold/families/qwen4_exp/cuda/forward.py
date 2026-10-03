@@ -375,6 +375,35 @@ def _exl3_moe(m, w: Weights, b: Buffers, R: int) -> tuple:
     return 2, buf.y[:R], buf.wts[:R]
 
 
+def _exl3_moe_mixed(m, w: Weights, b: Buffers, Rp: int, Rd: int) -> tuple:
+    """A prompt pass's rows [0, Rp) and a decode window's [Rp, Rp + Rd) of ``b`` in one routing and one expert launch a
+    window: the pass's slots in bf16 (b.moe.y), the window's in fp32, each as its own call gives them."""
+
+    from tensorfold.cuda.exl3.experts import routed
+
+    from .exl3_pack import MOE_WINDOW
+
+    buf, R, slots = b.moe, Rp + Rd, b.moe.slots
+    moe_mod.router(b.mixed[:R], m.router, buf.logits[:R])
+    moe_mod.select_rows(buf.logits[:R], buf, w.cfg.top_k, w.cfg.experts)
+    dy = w.x3.window_y(Rd, b.mixed.device)
+    for r0 in range(0, R, MOE_WINDOW):
+        n = min(MOE_WINDOW, R - r0)
+        if r0 + n <= Rp:                                 # prompt rows only: bf16 slots in place
+            dst = buf.y[r0:r0 + n]
+            y = routed(b.mixed[r0:r0 + n], buf.pick[r0:r0 + n], None, m.experts, w.x3.moe, None, n,
+                       y_out=dst.view(n * slots, -1))
+            if y.data_ptr() != dst.data_ptr():
+                dst.copy_(y.view(n, slots, -1))
+            continue
+        y = routed(b.mixed[r0:r0 + n], buf.pick[r0:r0 + n], None, m.experts, w.x3.moe, None, n).view(n, slots, -1)
+        k = max(0, Rp - r0)                              # the window's first k rows are the pass's
+        if k:
+            buf.y[r0:r0 + k].copy_(y[:k])
+        dy[r0 + k - Rp:r0 + n - Rp].copy_(y[k:])
+    return (2, buf.y[:Rp], buf.wts[:Rp]), (2, dy[:Rd], buf.wts[Rp:R])
+
+
 def _writeback(h: torch.Tensor, b: Buffers, R: int, c, pending) -> None:
     """Apply a pending branch to the streams (in place), no read-out."""
 
@@ -527,9 +556,9 @@ def compute(w: Weights, segs: Sequence[Seg], b: Buffers, *, logits: bool = True,
 
 
 def converges(w: Weights) -> bool:
-    """Whether a decode window and a prompt pass can share each layer's expert launch (grouped 4-bit experts, one GPU)."""
+    """Whether a decode window and a prompt pass can share each layer's expert launch (grouped 4-bit or EXL3, one GPU)."""
 
-    return w.comm is None and getattr(w, "x3", None) is None and all(
+    return w.comm is None and all(
         getattr(getattr(getattr(layer, "moe", None), "experts", None), "kernel", "qmm") == "qmm" for layer in w.layers)
 
 
@@ -549,6 +578,10 @@ def compute_mixed(w: Weights, dsegs: Sequence[Seg], db: Buffers, psegs: Sequence
         _pre_moe(layer, w, dsegs, db, Rd, dp)
         _pre_moe(layer, w, psegs, pb, Rp, pp, cuts=cuts)
         pb.mixed[Rp:Rp + Rd].copy_(db.mixed[:Rd])
+        if getattr(w, "x3", None) is not None:          # EXL3: the window's slots stay fp32, as its own call has them
+            pm, dm = _exl3_moe_mixed(layer.moe, w, pb, Rp, Rd)
+            dp, pp = (*dm, db.inj_m), (*pm, pb.inj_m)
+            continue
         mode, y, wts = moe_block(layer, w, pb, Rp + Rd)
         dp, pp = (mode, y[Rp:], wts[Rp:], db.inj_m), (mode, y[:Rp], wts[:Rp], pb.inj_m)
     return finish(w, w.mixer, db, Rd, dp), finish(w, w.mixer, pb, Rp, pp, logits=bool(ends), ends=ends)

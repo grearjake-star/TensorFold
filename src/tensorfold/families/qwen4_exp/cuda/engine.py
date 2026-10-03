@@ -204,8 +204,10 @@ class FlashNextEngine:
             self.multi = MultiDecoder(w, slots=streams, capacity=self.max_len, depth=self.depth,
                                       confidence=self.confidence, keep=KEEP, points=self.points,
                                       kv_dtype=self.kv_dtype, share=share, vision=self.vision,
-                                      prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=graphs,
-                                      cost=self.cost, timing=self.timing)
+                                      prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace,
+                                      cost=self.cost, timing=self.timing,
+                                      # a lone stream replays the one-stream graphs (TF_LONE_GRAPHS=0: eager rounds)
+                                      graphs=graphs and os.environ.get("TF_LONE_GRAPHS", "1").strip() != "0")
             self.scheduler = Scheduler(self.multi, max_streams=streams)
         else:
             self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
@@ -275,7 +277,8 @@ class FlashNextEngine:
                 if self.depth else "no drafts: the serial reference, one token a round")
         where = (f"up to {streams} streams, each growing to {self.context_window} prompt/reply tokens while memory "
                  f"lasts ({self.multi.memory_gate.room / 2**30:.1f} GiB free for their caches, "
-                 f"{self.multi.window_bytes / 2**30:.2f} GiB for one at the full window), eager" if self.concurrent else
+                 f"{self.multi.window_bytes / 2**30:.2f} GiB for one at the full window), "
+                 f"{'a lone stream on CUDA graphs' if self.multi.solo is not None else 'eager'}" if self.concurrent else
                  f"{self.context_window}-token prompt/reply window; {self.max_len}-token cache")
         again = (f", read again after warm-up in {reread_s:.1f}s" + (f" ({pinned / 2**30:.1f} GiB of it locked)"
                                                                      if pinned else "")) if reread_s else ""
