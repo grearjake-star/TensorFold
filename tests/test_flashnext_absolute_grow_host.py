@@ -122,7 +122,7 @@ class AbsoluteGrowthTests(unittest.TestCase):
         ns["Alone"] = source_class("src/tensorfold/families/qwen4_exp/cuda/multi_solo.py", "Alone",
                                     {"_state_changed", "_flush"}, ns)
         cls = source_class("src/tensorfold/families/qwen4_exp/cuda/multi.py", "MultiDecoder",
-                           {"_grow", "_is_solo", "_busy", "_evict_kept", "_drop_kept", "_make_room", "_slot_for",
+                           {"_grow", "_is_solo", "_release_pinned", "_busy", "_evict_kept", "_drop_kept", "_make_room", "_slot_for",
                             "_remember", "admit", "live", "finish"}, ns)
         self.dec = cls()
         self.dec.capacity, self.dec.depth = 81920, 0
@@ -131,6 +131,7 @@ class AbsoluteGrowthTests(unittest.TestCase):
         self.dec.next_id, self.dec.keep = 0, 8
         self.dec.w, self.dec.buf, self.dec.mbuf, self.dec.pbuf = SimpleNamespace(comm=None), None, None, None
         self.dec.solo, self.dec.solo_on, self.dec.planning = None, False, False
+        self.dec.release, self.dec.released = None, 0          # no pinned n-gram pages to release (TF_NGRAM_LOCK)
         self.dec.link, self.dec.follower = None, None
         self.dec.prefill_rows, self.dec.points, self.dec.vision = 4096, None, None
         live = torch_live(self.torch, capacity.available_bytes)

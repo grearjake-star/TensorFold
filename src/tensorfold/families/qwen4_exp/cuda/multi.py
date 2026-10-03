@@ -25,7 +25,7 @@ from .forward import commit, compute, compute_mixed, converges, stage
 from .mtp import mtp_compute, mtp_stage
 from .state import Buffers, State
 from .multi_solo import Alone, solo
-from .multi_fill import FILL_GUARD, PASS_MIN, PromptPasses
+from .multi_fill import FILL_GUARD, FIRST_PASS, PASS_MIN, PromptPasses  # noqa: F401 (re-exported)
 from .multi_tp import Link as Link
 from .multi_tp import OutOfStep, TwoRanks
 from ..cuda import CONFIDENCE, DEPTH

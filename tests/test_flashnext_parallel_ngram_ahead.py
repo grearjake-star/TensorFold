@@ -9,7 +9,7 @@ from tensorfold.families.qwen4_exp.cuda import decode, multi_fill
 from tensorfold.families.qwen4_exp.cuda.ngram import NGram
 
 
-class Pass(multi_fill.Fill):
+class Pass(multi_fill.PromptPasses):
     def __init__(self, streams):
         self.w, self.filling = object(), streams
 

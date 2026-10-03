@@ -15,7 +15,7 @@ def test_a_rounds_pass_keeps_decoding_its_share(allocations):  # noqa: F811
     dec = multi.MultiDecoder.__new__(multi.MultiDecoder)
     dec.streams = {0: SimpleNamespace(done=False)}
     dec.prefill_rows, dec.share, dec.round_s, dec.row_s = 2048, 0.25, None, None
-    assert dec._pass_rows() == 2048                                   # nothing timed yet: whole passes
+    assert dec._pass_rows() == 256        # house: nothing timed yet, a short first pass (FIRST_PASS) times a row
     dec._timed(0.1, 0)                                                # a round alone: 0.1 s
     dec._timed(0.1 + 512 * 4e-4, 512)                                 # a pass row adds 0.4 ms
     assert dec.round_s == pytest.approx(0.1) and dec.row_s == pytest.approx(4e-4)

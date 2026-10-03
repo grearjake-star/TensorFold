@@ -15,7 +15,7 @@ def _decoder():
     nodes = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
     nodes.extend(node for node in plan.body if isinstance(node, ast.FunctionDef) and node.name == "pass_limit")
     nodes.extend(node for node in source.body if isinstance(node, ast.Assign) and any(
-        isinstance(target, ast.Name) and target.id == "PASS_MIN" for target in node.targets))
+        isinstance(target, ast.Name) and target.id in ("PASS_MIN", "FIRST_PASS") for target in node.targets))
     owner = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "PromptPasses")
     body = [node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name in methods]
     nodes.append(ast.ClassDef(name="Decoder", bases=[], keywords=[], body=body, decorator_list=[], type_params=[]))
@@ -28,7 +28,7 @@ def _decoder():
 
 
 @pytest.mark.parametrize("rows,live,share,round_s,row_s,expected", [
-    (2048, True, 0.25, None, None, 2048),
+    (2048, True, 0.25, None, None, 256),       # house: a short first pass times a row (FIRST_PASS) before sizing
     (2048, True, 0.25, 0.001, 0.001, 512),
     (2048, True, 0.25, 0.08, 0.0005, 640),
     (2048, True, 0.25, 0.1, 0.0004, 960),
@@ -76,6 +76,7 @@ def test_standalone_calibration_uses_completed_nonconvergent_work(converged, fai
     dec.converged, dec.row_s, dec.w, dec.pbuf = converged, prior, object(), object()
     dec.pass_plan, dec.pass_index = None, 0
     dec._pieces, dec._note_passed = lambda *_: pieces, lambda _: None
+    dec._read_ahead = lambda _: None                  # house: --parallel n-gram read-ahead (residency only)
     dec._prompt_candidates = lambda *_: None
     dec._end_rows, dec._cuts, dec._absorb = lambda *_: [], lambda *_: [], lambda *_: []
     dec._joined, dec._failed = lambda *args: ("joined", args[-2]), lambda *_: ("failed", None)

@@ -15,7 +15,7 @@ def _rows(share, round_s, row_s, prefill_rows=2048, live=True):
 def test_first_pass_is_short_then_share_sized():
     assert _rows(0.25, 0.05, None) == multi.FIRST_PASS
     assert _rows(0.25, 0.05, None, prefill_rows=128) == 128
-    assert _rows(0.25, 0.05, 0.0005) == 384                   # 0.05 / (0.25 * 0.0005) = 400 -> 384 (64-row steps)
+    assert _rows(0.25, 0.05, 0.0005) == 512                   # 400 -> 384 (64-row steps), under 0.6.4's 512-row floor
     assert _rows(0.25, 0.05, 1e-6) == 2048
     assert _rows(0.25, 0.05, 1.0) == multi.PASS_MIN
 

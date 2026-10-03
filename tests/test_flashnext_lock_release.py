@@ -80,6 +80,7 @@ def _decoder(host, release):
     md.memory_gate = MemoryGate(1 << 50, reserve=2 * GIB, live=lambda: host[0])
     md.release, md.released = release, 0
     md.kept, md.streams, md.filling, md.free = [], {}, [], [_State() for _ in range(4)]
+    md.solo, md.solo_on, md.planning = None, False, False          # 0.6.4: no lone-stream graph slot, not planning
     return md
 
 
