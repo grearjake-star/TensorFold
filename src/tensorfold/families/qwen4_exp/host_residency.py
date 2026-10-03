@@ -71,21 +71,24 @@ def apply_lock(table: _Residency, policy: dict, budget: int | None = None) -> in
         return table.lock_parts(tuple(table.parts()), already + max(0, mem_available() - policy["lock_reserve"]))
     if mode == "budget":
         already = sum(n for _, n in getattr(table, "_locked", []))
-        want = policy["budget"] if budget is None else budget
-        return table.lock_parts(tuple(table.parts()), min(want, already + max(0, mem_available() - policy["lock_reserve"])))
+        want = planned_lock([table], policy["budget"] if budget is None else budget)
+        return table.lock_parts(tuple(table.parts()), min(already + want,
+                                                          already + max(0, mem_available() - policy["lock_reserve"])))
     return 0
 
 
 def planned_lock(tables, budget: int) -> int:
-    """Bytes a ``budget`` lock pins on ``tables`` with room to spare (``lock_parts``' walk: whole runs in ``parts()``
-    order, stopping at the first that does not fit): a fixed quantity of the checkpoint and the budget."""
+    """Bytes a ``budget`` lock pins on ``tables`` with room to spare: whole runs in ``parts()`` order, stopping at the
+    first that does not fit; a fixed quantity of the checkpoint and the budget. Each run counted may overrun by its
+    two edge pages (a page span is a little over the run's bytes), so N GiB pins N of EXL3's 1 GiB runs, not N - 1."""
 
-    total = 0
+    total = runs = 0
     for table in tables:
         for name in table.parts():
             for arr in table.parts()[name]:
                 size = _span(arr)[1]
-                if total + size > budget:
+                runs += 1
+                if total + size > budget + 2 * PAGE * runs:
                     return total
                 total += size
     return total
