@@ -10,17 +10,17 @@ from tensorfold.cuda.logprobs import capture
 from tensorfold.cuda.streams import Stream
 
 from . import image_rows
-from .decode import _gathered_fits, choose_gathered, entry_end, draft, tp_sample_rows
+from .decode import PREFILL_ROWS, _gathered_fits, choose_gathered, entry_end, draft, ngram_rows_ahead, tp_sample_rows
 from .forward import Cut, commit, compute, cut_snapshot, stage
 from .mtp import mtp_compute, mtp_stage
 from .state import CAND, ENDS
 from .multi_tp import OutOfStep
-from .decode import PREFILL_ROWS
 from .prompt_plan import pass_limit
 
 PASS_MIN = 512
 FIRST_PASS = 256                 # a round's first pass beside decoding streams, before a row's time is known
 FILL_GUARD = 8
+AHEAD_ROWS = 4096                # n-gram pages asked for this many prompt rows past each pass (two idle passes)
 
 
 class PromptPasses:
@@ -103,6 +103,7 @@ class PromptPasses:
         t0 = time.perf_counter()
         try:
             segs = stage(self.w, self.pbuf, [(s.st, s.prompt[a:a + n]) for s, a, n in pieces])
+            self._read_ahead(pieces)
             ends, cuts = self._end_rows(pieces, segs), self._cuts(pieces, segs)
             logits = compute(self.w, segs, self.pbuf, logits=bool(ends), ends=ends, cuts=cuts)
             heads = logits[:len(ends)].clone() if ends else None
@@ -115,6 +116,18 @@ class PromptPasses:
             extra = max(0.0, time.perf_counter() - t0) / max(1, rows)
             self.row_s = extra if self.row_s is None else 0.7 * self.row_s + 0.3 * extra
         return self._joined(pieces, heads, lasts, (time.perf_counter() - t0) / len(pieces), candidates)
+
+    def _read_ahead(self, pieces) -> None:
+        """While this pass runs, ask for the n-gram table pages of each prompt's next AHEAD_ROWS rows (in the
+        background): a pass's gather then finds its rows read instead of faulting them in one by one. Residency only."""
+
+        upto = self.__dict__.setdefault("_ahead_to", {})        # sid -> the prompt row read ahead to
+        for sid in [k for k in upto if k not in {s.sid for s in self.filling}]:
+            del upto[sid]
+        for s, a, n in pieces:
+            lo, hi = max(a + n, upto.get(s.sid, 0)), min(len(s.prompt), a + n + AHEAD_ROWS)
+            if lo < hi and ngram_rows_ahead(self.w, s.prompt, lo, hi):
+                upto[s.sid] = hi
 
     @staticmethod
     def _end_rows(pieces, segs) -> list[int]:

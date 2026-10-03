@@ -358,21 +358,32 @@ NGRAM_AHEAD = os.environ.get("TF_NGRAM_AHEAD", "1") != "0"
 _AHEAD = None                     # the one read-ahead thread pool
 
 
+def _ahead_ple(w):
+    """The PLE layer whose table reads ahead (an EXL3 pack's host table), or None (TF_NGRAM_AHEAD=0, other packs)."""
+
+    if not NGRAM_AHEAD or w.x3 is None:
+        return None
+    p = next((lay.ple for lay in w.layers if lay.ple is not None), None)
+    return p if p is not None and hasattr(p.table, "willneed") else None
+
+
+def _ahead_submit(job) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    global _AHEAD
+    if _AHEAD is None:
+        _AHEAD = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ngram-ahead")
+    _AHEAD.submit(job)
+
+
 def ngram_ahead(e: Engine, prompt: Sequence[int], start: int) -> None:
     """A long prompt on an EXL3 pack: ask for its later chunks' n-gram table pages now (MADV_WILLNEED, in the
     background), so a chunk's gather finds them read while earlier chunks run. Nothing a gather returns changes."""
 
-    global _AHEAD
     w = e.w
-    if not NGRAM_AHEAD or w.x3 is None or len(prompt) - start <= e.prefill_rows:
+    p = _ahead_ple(w)
+    if p is None or len(prompt) - start <= e.prefill_rows:
         return
-    p = next((lay.ple for lay in w.layers if lay.ple is not None), None)
-    if p is None or not hasattr(p.table, "willneed"):
-        return
-    from concurrent.futures import ThreadPoolExecutor
-
-    if _AHEAD is None:
-        _AHEAD = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ngram-ahead")
     hist, toks, rows = e.st.ple_history, list(prompt), e.prefill_rows
     n = p.ngram.n
 
@@ -381,7 +392,24 @@ def ngram_ahead(e: Engine, prompt: Sequence[int], start: int) -> None:
             h = np.asarray(toks[max(0, a - (n - 1)):a], dtype=np.int64) if a - start >= n - 1 else hist
             p.table.willneed(p.ngram.ids(h, np.asarray(toks[a:a + rows], dtype=np.int64)))
 
-    _AHEAD.submit(run)
+    _ahead_submit(run)
+
+
+def ngram_rows_ahead(w, prompt: Sequence[int], a: int, b: int) -> bool:
+    """--parallel's prompt passes: ask for rows [a, b)'s n-gram table pages (MADV_WILLNEED, in the background) while
+    the GPU runs the pass before them; False when nothing reads ahead. ``a`` >= the n-gram history (n - 1 rows), so
+    the rows' own prompt supplies it. Only page residency changes; every gather returns the same bytes."""
+
+    p = _ahead_ple(w)
+    if p is None:
+        return False
+    n = p.ngram.n
+    if b <= a or a < n - 1:
+        return False
+    h = np.asarray(prompt[a - (n - 1):a], dtype=np.int64)
+    toks = np.asarray(prompt[a:b], dtype=np.int64)
+    _ahead_submit(lambda: p.table.willneed(p.ngram.ids(h, toks)))
+    return True
 
 
 @torch.no_grad()

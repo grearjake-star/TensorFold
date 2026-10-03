@@ -382,6 +382,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             self._note_passed(pieces)
             try:
                 psegs = stage(self.w, self.pbuf, [(s.st, s.prompt[a:a + n]) for s, a, n in pieces])
+                self._read_ahead(pieces)
                 cuts = self._cuts(pieces, psegs)
             except Exception as exc:                     # noqa: BLE001  (the pass's requests fail, the round goes on)
                 ended += self._failed(pieces, exc)
