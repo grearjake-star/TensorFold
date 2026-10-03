@@ -227,7 +227,7 @@ def test_a_different_lone_request_takes_the_graph_slot_and_the_kept_prefix_moves
     dec._move_to_solo(s)
     assert dec.solo.st is solo and s.st is solo and not dropped and solo.capacity == 8192
     assert torch.equal(solo.kc[0].k[:200], k)
-    assert dec.kept == [([1, 2, 3], spare, snap, None)] and spare.capacity == 8192
+    assert dec.kept == [([1, 2, 3], spare, snap, None)] and spare.capacity == 256     # house: by rows, not 8192
     assert torch.equal(spare.kc[0].k[:200], kept_k) and spare not in dec.free
 
 

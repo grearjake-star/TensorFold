@@ -83,12 +83,35 @@ class Alone:
         counts = gdn.to_device([len(rows)], torch.int32, self.w.device)
         gdn.replay(table, sc.lin, 1, kept, counts, k[0], v[0], in_place=True)
 
+    def _copy_kept(self, dst, src) -> bool:
+        """House: copy ``src``'s kept prompt ends into ``dst`` by their rows, as a fork copies a prefix, growing ``dst``
+        to those rows only (a whole-slot copy grew every spare to the graph slot's reserved rows)."""
+
+        ends = [k for k in self.kept if k[1] is src]
+        if not ends or self.planning or getattr(self.w, "comm", None) is not None:
+            return False
+        n = max(max(len(k[0]), int(k[2].get("pos", 0))) for k in ends)      # the snapshot's rows
+        m = max(int(k[2].get("mtp_len", 0)) for k in ends)
+        if n > src.pos or m > src.mtp_len or dst.kv_dtype != src.kv_dtype:
+            return False
+        rows = max(n, m) + self.depth + 2
+        if rows > dst.capacity and not self._grow(dst, rows, protect=src):
+            return False
+        dst.copy_prefix(src, n, m)
+        dst.set_pos(n)
+        dst.set_mtp_len(m)
+        return True
+
     def _relocate_kept(self, target, avoid) -> bool:
         """Move all graph-slot keeps into spare rows without eviction; plans record the same copy and ownership move."""
 
         spare = next((f for f in self.free if f is not target and f is not avoid), None)
         if spare is None:
             return False
+        if self._copy_kept(spare, target):      # house: by rows
+            self.free = [f for f in self.free if f is not spare]
+            self.kept = [(ids, spare if st is target else st, snap, tail) for ids, st, snap, tail in self.kept]
+            return True
         size = target.capacity
         if spare.capacity != size:
             self._shrink(spare, release=True)    # back to its first rows (a no-op when already there)
@@ -115,14 +138,15 @@ class Alone:
             return False
         if not any(k[1] is slot for k in self.kept):
             return False
-        size = slot.capacity
-        if st.capacity < size:
-            need = st.cache_bytes(size) - st.cache_bytes() + st.layer_bytes(size)
-            if not self.memory_gate.fits(need):
-                return False
-            self._state_changed(st)
-            self.memory_gate.take(st.resize(size))
-        st.copy_from(slot)
+        if not self._copy_kept(st, slot):        # house: by rows; else the whole slot as before
+            size = slot.capacity
+            if st.capacity < size:
+                need = st.cache_bytes(size) - st.cache_bytes() + st.layer_bytes(size)
+                if not self.memory_gate.fits(need):
+                    return False
+                self._state_changed(st)
+                self.memory_gate.take(st.resize(size))
+            st.copy_from(slot)
         self.kept = [(ids, st if k is slot else k, snap, tail) for ids, k, snap, tail in self.kept]
         self.solo_moves = getattr(self, "solo_moves", 0) + 1
         return True
