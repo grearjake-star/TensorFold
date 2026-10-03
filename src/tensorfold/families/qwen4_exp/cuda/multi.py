@@ -20,6 +20,7 @@ from tensorfold.engine.grammar import GrammarError
 from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _gathered_fits, cost_bars, choose_gathered_streams,
                      entry_end, prefill_begin, tp_sample_rows)
 from . import attn_multi, gdn_multi, image_rows, prefixes
+from .multi_graphs import RoundGraphs, bucket, fold
 from .forward import commit, compute, compute_mixed, converges, stage
 from .mtp import mtp_compute, mtp_stage
 from .state import Buffers, State
@@ -50,7 +51,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
                  share: float = SHARE, points=None, graphs: bool = True, vision=None, workspace_bytes: int = 0,
-                 cost: float = 0.0, timing=None) -> None:
+                 cost: float = 0.0, timing=None, round_graphs: bool = False) -> None:
         self.link = self.follower = None
         self.planning, self.pass_plan, self.mixed_plan = False, None, None
         self.pass_index, self.pass_width = 0, prefill_rows
@@ -72,9 +73,13 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         # slots start small and grow with their stream's context, up to the window, while the gate has room
         self.free = [State(w, min(capacity, FIRST), depth + 1, kv_dtype, limit=capacity) for _ in range(slots)]
         self.slots = list(self.free)
-        self.solo = (solo(w, self.free[0], capacity, depth, self.pbuf)
+        self.solo = (solo(w, self.free[0], capacity, depth, self.pbuf, timing)
                      if graphs and depth > 0 and self.mbuf is not None else None)
         self.solo_on = self.solo is not None
+        # ``round_graphs``: shared rounds (any streams, nothing filling beside them) and draft steps replay CUDA graphs
+        self.rounds = (RoundGraphs(w, depth) if round_graphs and w.comm is None and torch.cuda.is_available() and
+                       all(getattr(layer.moe.experts, "capturable", True) is not False for layer in w.layers)
+                       else None)
         self.slot_bytes = sum(t.numel() * t.element_size() for t in _tensors(self.free[0]))
         self.window_bytes = self.free[0].cache_bytes(capacity)          # one stream's caches at the full window
         free = torch_live(torch, available_bytes) if torch.cuda.is_available() else None
@@ -388,14 +393,28 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                 ended += self._failed(pieces, exc)
                 pieces = []
         held = [self.held.pop(s.sid, []) for s in live]
-        tables = self.buf.gdn_tables = gdn_multi.Tables(self.w, self.gdn, segs, held)
-        self.buf.attn_step = attn_multi.Step(self.w, segs, mtp=False)
+        graphed = self.rounds is not None and not pieces and all(s.st.image_positions is None for s in live)
+        if graphed:                                    # persistent tables, launches bounded by the context bucket
+            n, rows = len(segs), segs[-1][2]
+            ctx = bucket(max(st.pos + a1 - a0 for st, a0, a1 in segs))
+            # last round's kept rows folded first (multi_solo._flush's replay), so the graph's forward is idempotent
+            fold(self.w, self.gdn, [s.st for s in live], held)
+            tables = self.buf.gdn_tables = gdn_multi.Tables(self.w, self.gdn, segs, [[] for _ in live],
+                                                            out=self.rounds.gdn_out(n, rows), width=self.depth + 1)
+            self.buf.attn_step = attn_multi.Step(self.w, segs, mtp=False, out=self.rounds.attn_out(False, n, rows),
+                                                 bucket=ctx)
+        else:
+            tables = self.buf.gdn_tables = gdn_multi.Tables(self.w, self.gdn, segs, held)
+            self.buf.attn_step = attn_multi.Step(self.w, segs, mtp=False)
         try:
             if pieces:                                 # the window and the pass: each layer's experts once for both
                 pends = self._end_rows(pieces, psegs)
                 logits, heads = compute_mixed(self.w, segs, self.buf, psegs, self.pbuf, ends=pends, cuts=cuts)
                 heads = heads[:len(pends)].clone() if pends else None
                 candidates = self._prompt_candidates(len(pends))
+            elif graphed:
+                logits = self.rounds.run(("main", n, rows, tables.cur, ctx),
+                                         lambda: compute(self.w, segs, self.buf))
             else:
                 logits = compute(self.w, segs, self.buf)
         finally:
@@ -496,6 +515,15 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
     def _mtp(self, segs: list) -> torch.Tensor:
         """An MTP step over every drafting stream, its attention one launch a kernel for all of them."""
 
+        if self.rounds is not None and all(st.image_positions is None for st, _, _ in segs):
+            n, rows = len(segs), segs[-1][2]
+            ctx = bucket(max(st.mtp_len + a1 - a0 for st, a0, a1 in segs))
+            self.mbuf.attn_step = attn_multi.Step(self.w, segs, mtp=True, out=self.rounds.attn_out(True, n, rows),
+                                                  bucket=ctx)
+            try:
+                return self.rounds.run(("mtp", n, rows, ctx), lambda: mtp_compute(self.w, segs, self.mbuf))
+            finally:
+                self.mbuf.attn_step = None
         self.mbuf.attn_step = attn_multi.Step(self.w, segs, mtp=True)
         try:
             return mtp_compute(self.w, segs, self.mbuf)

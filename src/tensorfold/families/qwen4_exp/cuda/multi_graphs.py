@@ -1,0 +1,132 @@
+"""CUDA graphs for --parallel rounds of several streams: the verify forward and each MTP draft step replay a graph.
+
+A shared round's launches read every per-stream address (caches, DeltaNet states, n-gram tails, pooled index keys)
+and every row's stream and position from device tables, so one graph serves any streams in any slots at any cache
+size: the tables are persistent buffers per (streams, rows), rewritten by one host-to-device copy before a replay.
+What stays host-side is fixed by the key: the window's stream count and total rows, the DeltaNet scratch parity
+and a power-of-two context bucket that bounds the attention launches
+(chunks and blocks past a row's keys write nothing, so a bound never changes bits; attn_multi._qsa_multi).
+
+Last round's kept DeltaNet rows are folded into the states before the forward (``fold``), so a graph round's forward
+writes only what it writes again with the same bits. A key runs its graph-mode forward eagerly the first ``after - 1``
+times it is seen (compiling its kernels; with ``after`` 1, one discarded eager run first), then is captured and
+replayed; at most ``limit`` graphs are kept (least recently used dropped). TF_MULTI_GRAPHS=0: eager.
+"""
+
+from __future__ import annotations
+
+import gc
+import os
+from collections import OrderedDict
+
+import torch
+
+from .attn_multi import PTRS
+
+LIMIT = int(os.environ.get("TF_MULTI_GRAPHS_MAX", "160"))       # graphs kept (main + MTP), least recently used out
+AFTER = int(os.environ.get("TF_MULTI_GRAPHS_AFTER", "2"))       # the sighting of a key that captures it
+
+
+def fold(w, sc, states, held) -> None:
+    """Fold each stream's held DeltaNet rows (last shared round's kept rows, in the scratch's other parity) into its
+    recurrent states in place: multi_solo._flush's replay for every stream in one launch. Rounds on graphs fold
+    here instead of in the trees (gdn_multi ``pending``), so replaying or re-running a graph never folds twice."""
+
+    todo = [(st, rows) for st, rows in zip(states, held) if rows]
+    if not todo or not sc.lin:
+        return
+    from tensorfold.cuda.kernels import gdn
+
+    parity = 1 - sc.parity
+    k, v, g, beta = [[getattr(sc, name)[parity, li] for li in range(sc.lin)] for name in ("k", "v", "g", "beta")]
+    ptrs = gdn.replay_table(k, v, g, beta, [[st.rec[st.cur[li], li] for li in range(sc.lin)] for st, _ in todo])
+    width = max(len(rows) for _, rows in todo)
+    kept = [r for _, rows in todo for r in list(rows) + [0] * (width - len(rows))]
+    table = gdn.to_device(ptrs, torch.int64, w.device)
+    rows_dev = gdn.to_device(kept, torch.int32, w.device).view(len(todo), width)
+    counts = gdn.to_device([len(rows) for _, rows in todo], torch.int32, w.device)
+    gdn.replay(table, sc.lin, len(todo), rows_dev, counts, k[0], v[0], in_place=True)
+
+
+def bucket(end: int) -> int:
+    """The context bound a graph is captured at: a power of two from 8,192 (decode's Graphs._bucket, uncapped)."""
+
+    return max(8192, 1 << (max(1, end) - 1).bit_length())
+
+
+class RoundGraphs:
+    def __init__(self, w, depth: int, *, limit: int = LIMIT, after: int = AFTER) -> None:
+        self.w, self.width = w, depth + 1
+        self.limit, self.after = max(1, limit), max(1, after)
+        self.pool = torch.cuda.graph_pool_handle()
+        self.graphs: OrderedDict[tuple, tuple[torch.cuda.CUDAGraph, torch.Tensor]] = OrderedDict()
+        self.seen: dict[tuple, int] = {}
+        self.tables: dict[tuple, dict] = {}
+        self.attn_layers = sum(1 for layer in w.layers if not layer.linear)
+        self.lin = sum(1 for layer in w.layers if layer.linear)
+        self.captures = self.replays = self.eager = self.dropped = 0
+
+    def attn_out(self, mtp: bool, n: int, rows: int) -> dict:
+        """Persistent attn_multi.Step tables for windows of ``n`` streams and ``rows`` rows."""
+
+        key = ("attn", mtp, n, rows)
+        got = self.tables.get(key)
+        if got is None:
+            dev = self.w.device
+            layers = 1 if mtp else self.attn_layers
+            got = self.tables[key] = {
+                "ints": torch.zeros((2 * rows + 2 * n,), dtype=torch.int32, device=dev),
+                "ptrs": torch.zeros((layers * PTRS * n,), dtype=torch.int64, device=dev),
+                "tails": torch.zeros((n,), dtype=torch.int64, device=dev)}
+        return got
+
+    def gdn_out(self, n: int, rows: int) -> dict:
+        """Persistent gdn_multi.Tables tables (pending rows padded to ``width`` = depth + 1)."""
+
+        key = ("gdn", n, rows)
+        got = self.tables.get(key)
+        if got is None:
+            dev = self.w.device
+            ints = rows + 4 * rows + 3 * rows + (n + 1) + n * self.width + n
+            got = self.tables[key] = {"i32": torch.zeros((ints,), dtype=torch.int32, device=dev),
+                                      "i64": torch.zeros((2 * self.lin * n,), dtype=torch.int64, device=dev)}
+        return got
+
+    def _capture(self, fn):
+        torch.cuda.synchronize()                 # no gc.collect(): a full collection of a server's heap is a
+        g = torch.cuda.CUDAGraph()               # large share of a mid-round capture; gc stays off while capturing
+        enabled = gc.isenabled()                 # collecting old graphs mid-capture invalidates it (graphs.py)
+        gc.disable()
+        try:
+            with torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
+                out = fn()
+        finally:
+            if enabled:
+                gc.enable()
+        torch.cuda.synchronize()
+        self.captures += 1
+        return g, out
+
+    def run(self, key: tuple, fn):
+        """``fn``'s result for this round: its graph replayed, or ``fn`` eagerly until the key is captured."""
+
+        hit = self.graphs.get(key)
+        if hit is not None:
+            self.graphs.move_to_end(key)
+            hit[0].replay()
+            self.replays += 1
+            return hit[1]
+        seen = self.seen[key] = self.seen.get(key, 0) + 1
+        if seen < self.after:
+            self.eager += 1
+            return fn()
+        if seen == 1:
+            fn()                                 # compiles its launches; a graph round's forward is idempotent
+        while len(self.graphs) >= self.limit:
+            self.graphs.popitem(last=False)
+            self.dropped += 1
+        g, out = self._capture(fn)              # capture runs nothing: the replay is this round's forward
+        self.graphs[key] = (g, out)
+        g.replay()
+        self.replays += 1
+        return out

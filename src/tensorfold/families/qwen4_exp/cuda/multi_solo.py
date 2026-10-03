@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import torch
 
 from tensorfold.cuda.kernels import gdn
@@ -13,7 +15,7 @@ from .forward import commit
 from .state import Buffers
 
 
-def solo(w, st, capacity, depth, pbuf):
+def solo(w, st, capacity, depth, pbuf, timing=None):
     from .graphs import Graphs
 
     if any(getattr(layer.moe.experts, "capturable", True) is False for layer in w.layers):
@@ -25,6 +27,8 @@ def solo(w, st, capacity, depth, pbuf):
     e.buf = Buffers(w, rows, capacity, moe_prefill=True)       # the serial engine and shared rounds use these bits
     e.mbuf, e.pbuf = Buffers(w, rows, capacity), pbuf
     e.graphs = Graphs(e, max_rows=rows)
+    if timing is not None:
+        e.timing = timing                                      # decode.cost_bars: the same table as shared rounds
     return e
 
 
@@ -105,6 +109,7 @@ class Alone:
         """Verify a lone stream through its graphs, commit accepted rows and draft the next chain."""
 
         e, st = self.solo, s.st
+        t0 = time.perf_counter()
         tokens = [s.out[-1]] + list(s.drafts)
         R = len(tokens)
         logits = e.forward(tokens)
@@ -121,7 +126,9 @@ class Alone:
         s.drafts = []
         room = min(self.depth, s.count - len(s.out) - len(path))
         if not last and room > 0:
+            more = {"cost": self.cost} if self.cost > 0 else {}
             s.drafts = draft(e, e.buf.streams[:len(path)], rows[:len(path)], st.pos + 1, room, s.sampling,
-                             self.confidence)
+                             self.confidence, **more)
         s.take(new, self._ends(s))
+        self._timed(time.perf_counter() - t0, 0)    # a prompt arriving next sizes its passes by this round's time
         return [s] if s.done else []

@@ -13,7 +13,7 @@ import triton.language as tl
 from tensorfold.cuda.kernels import gdn as shared
 
 from . import attention as attn_mod, glue
-from .attention import CHUNK, _chunk, _merge_row, _pool_block
+from .attention import CHUNK, SELECT_REGS, _chunk, _merge_row, _pool_block, _radix_place
 
 PTRS = 6                 # a stream's pointers a layer: keys, values, key scales, value scales, index keys, pooled
 
@@ -80,10 +80,120 @@ def _merge_multi(PO, PM, PL, POSR, OUT, NKR, H: tl.constexpr, HK: tl.constexpr, 
     _merge_row(PO, PM, PL, OUT, n, r, tl.program_id(1), H, HK, D, G, CH, NCH, BITS)
 
 
+# --- graph rounds (multi_graphs): every row's select in one launch, its stream's pooled keys found by table ---------
+# The same arithmetic as attention._scores/_select/_select_tiles on the rows of one stream (whose launch is offset to
+# its first row): a row's end is its own position + 1 (POSR) instead of the launch's P0 + r + 1.
+
+@triton.jit
+def _scores_multi(IQ, CP, POSR, SID, SC, NB, N, HI: tl.constexpr, DI: tl.constexpr, RATIO: tl.constexpr,
+                  TOP: tl.constexpr, BB: tl.constexpr):
+    r = tl.program_id(0)
+    j = tl.program_id(1)
+    complete = (tl.load(POSR + r) + 1) // RATIO
+    if complete > TOP and j * BB < complete:
+        POOLED = _ptr(CP + 5 * N, tl.load(SID + r), tl.bfloat16)
+        b = j * BB + tl.arange(0, BB)
+        ok = b < complete
+        d = tl.arange(0, DI)
+        k = tl.load(POOLED + b[:, None].to(tl.int64) * DI + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
+        total = tl.zeros((BB,), dtype=tl.float32)
+        for h in tl.static_range(HI):
+            q = tl.load(IQ + (r * HI + h) * DI + d).to(tl.float32)
+            total = total + tl.maximum(tl.sum(k * q[None, :], axis=1), 0.0)
+        tl.store(SC + r * NB + b, total / tl.sqrt(DI * 1.0), mask=ok)
+
+
+@triton.jit
+def _select_multi(SC, POSR, IDS, NKR, SPR, NB, RATIO: tl.constexpr, TOP: tl.constexpr, IDW: tl.constexpr,
+                  BLOCK: tl.constexpr):
+    r = tl.program_id(0)
+    end = tl.load(POSR + r) + 1
+    complete = end // RATIO
+    if complete <= TOP:
+        tl.store(NKR + r, end)
+        tl.store(SPR + r, 0)
+    else:
+        b = tl.arange(0, BLOCK)
+        ok = b < complete
+        v = tl.load(SC + r * NB + b, mask=ok, other=0.0)
+        bits = v.to(tl.uint32, bitcast=True)
+        key = tl.where((bits & 0x80000000) != 0, ~bits, bits | 0x80000000)
+        key = tl.where(ok, key, 0)
+        lo = tl.zeros((), dtype=tl.uint64)
+        hi = tl.full((), 0xFFFFFFFF, dtype=tl.uint64)
+        k64 = key.to(tl.uint64)
+        for _ in range(33):
+            mid = (lo + hi + 1) // 2
+            count = tl.sum(tl.where(k64 >= mid, 1, 0), axis=0)
+            take = count >= TOP
+            lo = tl.where(take, mid, lo)
+            hi = tl.where(take, hi, mid - 1)
+        cut = lo
+        above = ok & (k64 > cut)
+        equal = ok & (k64 == cut)
+        need = TOP - tl.sum(above.to(tl.int32), axis=0)
+        rank = tl.cumsum(equal.to(tl.int32), axis=0)
+        chosen = above | (equal & (rank <= need))
+        place = tl.cumsum(chosen.to(tl.int32), axis=0) - 1
+        for k in tl.static_range(RATIO):
+            tl.store(IDS + r * IDW + place * RATIO + k, b * RATIO + k, mask=chosen)
+        t = tl.arange(0, RATIO)
+        tail = RATIO * complete + t
+        tl.store(IDS + r * IDW + TOP * RATIO + t, tail, mask=tail < end)
+        tl.store(NKR + r, TOP * RATIO + end - RATIO * complete)
+        tl.store(SPR + r, 1)
+
+
+@triton.jit
+def _select_tiles_multi(SC, POSR, IDS, NKR, SPR, NB, RATIO: tl.constexpr, TOP: tl.constexpr, IDW: tl.constexpr,
+                        TB: tl.constexpr):
+    r = tl.program_id(0)
+    end = tl.load(POSR + r) + 1
+    complete = end // RATIO
+    if complete <= TOP:
+        tl.store(NKR + r, end)
+        tl.store(SPR + r, 0)
+    else:
+        _radix_place(SC, IDS, r, complete, NB, RATIO, TOP, IDW, TB)
+        t = tl.arange(0, RATIO)
+        tail = RATIO * complete + t
+        tl.store(IDS + r * IDW + TOP * RATIO + t, tail, mask=tail < end)
+        tl.store(NKR + r, TOP * RATIO + end - RATIO * complete)
+        tl.store(SPR + r, 1)
+
+
+def _qsa_multi(b, sc, step: "Step", cp, rows: int, context: int) -> None:
+    """Every row's scores and select (dense rows keep their length) with launches bounded by ``context``: qsa_rows'
+    lists for each stream's rows, at one launch shape for any split of the window between streams."""
+
+    ratio, top, di = sc.ratio, sc.budget // sc.ratio, b.iq.shape[2]
+    blocks = min(sc.nb, max(1, triton.cdiv(context, ratio)))
+    bb = 64
+    _scores_multi[(rows, triton.cdiv(blocks, bb))](b.iq, cp, step.posr, step.sid, sc.scores, sc.nb, step.n,
+                                                   HI=b.iq.shape[1], DI=di, RATIO=ratio, TOP=top, BB=bb, num_warps=4)
+    width = triton.next_power_of_2(blocks)
+    if width <= SELECT_REGS:
+        _select_multi[(rows,)](sc.scores, step.posr, sc.ids, sc.nk, sc.sparse, sc.nb, RATIO=ratio, TOP=top,
+                               IDW=sc.idw, BLOCK=width, num_warps=16)
+        return
+    tb, warps = (4096, 8) if rows >= 64 else (8192, 16)
+    _select_tiles_multi[(rows,)](sc.scores, step.posr, sc.ids, sc.nk, sc.sparse, sc.nb, RATIO=ratio, TOP=top,
+                                 IDW=sc.idw, TB=tb, num_warps=warps)
+
+
+def _put(values, dtype, dev, out: torch.Tensor | None) -> torch.Tensor:
+    """A table on the device: a new tensor (eager rounds), or written into ``out`` (a graph's persistent table)."""
+
+    if out is None:
+        return shared.to_device(values, dtype, dev)
+    out.copy_(torch.tensor(values, dtype=dtype).pin_memory(), non_blocking=True)
+    return out
+
+
 class Step:
     """A step's row, stream and cache-pointer tables (the MTP head's with ``mtp``), read now: caches may move."""
 
-    def __init__(self, w, segs: Sequence, mtp: bool) -> None:
+    def __init__(self, w, segs: Sequence, mtp: bool, out: dict | None = None, bucket: int | None = None) -> None:
         n, rows = len(segs), segs[-1][2]
         layers = [l for l in w.layers if not l.linear] if not mtp else [w.mtp.layer]
         self.index = {layer.index: i for i, layer in enumerate(layers)}
@@ -104,10 +214,15 @@ class Step:
                 ptrs[i, :, s] = [kc.k.data_ptr(), kc.v.data_ptr(), kc.ks.data_ptr(), kc.vs.data_ptr(),
                                  ikc.data_ptr(), pooled.data_ptr()]
         dev = w.device
-        ints = shared.to_device(np.concatenate([posr, sid, first, counts]).tolist(), torch.int32, dev)
+        # ``out``: a graph round's persistent tables (multi_graphs), whose launches are bounded by ``bucket`` keys
+        out = out or {}
+        self.bucket = bucket
+        ints = _put(np.concatenate([posr, sid, first, counts]).tolist(), torch.int32, dev, out.get("ints"))
         self.posr, self.sid = ints[:rows], ints[rows:2 * rows]
         self.first, self.counts = ints[2 * rows:2 * rows + n], ints[2 * rows + n:]
-        self.ptrs = shared.to_device(ptrs.ravel().tolist(), torch.int64, dev).view(len(layers), PTRS * n)
+        self.ptrs = _put(ptrs.ravel().tolist(), torch.int64, dev, out.get("ptrs")).view(len(layers), PTRS * n)
+        self.tails = (_put([st.ple_tail.data_ptr() for st, _, _ in segs], torch.int64, dev, out.get("tails"))
+                      if bucket is not None else None)       # each stream's n-gram conv tail (forward.ple_block)
         self.n, self.rows, self.segs = n, rows, list(segs)
         self.ends = [p0 + c for p0, c in zip(first, counts)]
         self.most = max(counts)
@@ -138,17 +253,22 @@ def layer(layer, w, b, step: Step, mtp: bool, scale: float) -> torch.Tensor:
                                VISION=step.vision, S1=sections[1], S2=sections[2],
                                num_warps=2)
     top = sc.budget // sc.ratio
+    graph = step.bucket is not None              # a graph round: launch shapes from the window's rows and bucket only
     if sc.qsa:
-        _pool_multi[(n, step.most // sc.ratio + 2)](cp, step.vision_ptrs, step.first, step.counts,
-                                                    a.ik_scale, w.inv_freq, c.eps, n,
-                                                    DI=c.index_dim, HALF=w.inv_freq.numel(), RATIO=sc.ratio,
-                                                    VISION=step.vision, S1=sections[1], S2=sections[2],
-                                                    num_warps=1)
-        for (st, a0, a1), end in zip(step.segs, step.ends):
-            if end // sc.ratio > top:                # this stream has sparse rows: its own select
-                _, _, pooled, pos, _ = _caches(layer, st, mtp)
-                attn_mod.qsa_rows(b.iq[a0:a1], pooled, pos, _rows_from(sc, a0), a1 - a0, context=end)
-    keys = max(step.ends)
+        most = rows if graph else step.most      # blocks past a stream's rows pool nothing (_pool_block)
+        _pool_multi[(n, most // sc.ratio + 2)](cp, step.vision_ptrs, step.first, step.counts,
+                                               a.ik_scale, w.inv_freq, c.eps, n,
+                                               DI=c.index_dim, HALF=w.inv_freq.numel(), RATIO=sc.ratio,
+                                               VISION=step.vision, S1=sections[1], S2=sections[2],
+                                               num_warps=1)
+        if graph:
+            _qsa_multi(b, sc, step, cp, rows, step.bucket)
+        else:
+            for (st, a0, a1), end in zip(step.segs, step.ends):
+                if end // sc.ratio > top:                # this stream has sparse rows: its own select
+                    _, _, pooled, pos, _ = _caches(layer, st, mtp)
+                    attn_mod.qsa_rows(b.iq[a0:a1], pooled, pos, _rows_from(sc, a0), a1 - a0, context=end)
+    keys = step.bucket if graph else max(step.ends)     # chunks past a row's keys write nothing
     if sc.qsa:
         keys = min(keys, (top + 1) * sc.ratio - 1)
     chunks = min(sc.nch, triton.cdiv(keys, CHUNK))
