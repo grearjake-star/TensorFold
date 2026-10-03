@@ -41,7 +41,7 @@ def test_prompt_upmix_matches_projection_mix_and_chunk_bytes(rows, dims, tile):
 @pytest.mark.parametrize("unequal", [False, True])
 def test_upmix_first_use_checks_both_kernel_variants_and_caches_fallback(monkeypatch, capsys, unequal):
     from types import SimpleNamespace
-    from tensorfold.families.qwen4_exp.cuda import forward, hc_check
+    from tensorfold.families.qwen4_exp.cuda import hc_check, hc_readout
 
     device = torch.device("cuda", torch.cuda.current_device())
     hc_check._checked.clear()
@@ -72,9 +72,9 @@ def test_upmix_first_use_checks_both_kernel_variants_and_caches_fallback(monkeyp
             up.n = 10240
             hc = SimpleNamespace(up=up, prefill_up=up)
             used = []
-            monkeypatch.setattr(forward, "_down_act", lambda *a: None)
-            monkeypatch.setattr(forward, "_mm", lambda x, q, xs, out, b: (used.append(True), out.zero_())[1])
-            forward._readout_plain(hc, b, normed, rows, 1e-6, 4, 320, None, normed=True)
+            monkeypatch.setattr(hc_readout, "_down_act", lambda *a: None)
+            monkeypatch.setattr(hc_readout, "_mm", lambda x, q, xs, out, b: (used.append(True), out.zero_())[1])
+            hc_readout._readout_plain(hc, b, normed, rows, 1e-6, 4, 320, None, normed=True)
             assert used == [True] and torch.equal(b.mixed, torch.full_like(b.mixed, 0.5))
             assert torch.equal(b.xs_mixed, torch.full_like(b.xs_mixed, 16))
             assert not capsys.readouterr().out

@@ -48,7 +48,7 @@ def test_write_norm_matches_release_and_prompt_chunks(mode, rows, dims):
 @pytest.mark.parametrize("unequal", [False, True])
 def test_first_use_checks_real_bytes_and_falls_back_on_a_forced_difference(monkeypatch, capsys, unequal):
     from types import SimpleNamespace
-    from tensorfold.families.qwen4_exp.cuda import forward, hc_check, qmm
+    from tensorfold.families.qwen4_exp.cuda import hc_check, hc_readout, qmm
 
     if torch.cuda.get_device_capability() != (12, 1):
         pytest.skip("the guarded fusion targets GB10")
@@ -75,8 +75,8 @@ def test_first_use_checks_real_bytes_and_falls_back_on_a_forced_difference(monke
             b = SimpleNamespace(prefill=True, pss=torch.empty((17, 10, 4), device=device))
             hc = SimpleNamespace(down=object.__new__(qmm.Q4), inject=False)
             readouts = []
-            monkeypatch.setattr(forward, "_readout", lambda *a, **k: readouts.append(True))
-            forward.hc_block(hc, b, 17, 1e-6, 4, 320, 0, None, torch.empty(17, 4, device=device), h)
+            monkeypatch.setattr(hc_readout, "_readout", lambda *a, **k: readouts.append(True))
+            hc_readout.hc_block(hc, b, 17, 1e-6, 4, 320, 0, None, torch.empty(17, 4, device=device), h)
             assert readouts == [True] and torch.equal(b.pss, torch.full_like(b.pss, 256))
             assert not capsys.readouterr().out
     finally:

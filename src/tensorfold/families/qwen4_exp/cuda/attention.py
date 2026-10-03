@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+from pathlib import Path
+
 import torch
 import triton
 import triton.language as tl
@@ -12,6 +15,12 @@ from .kvquant import dequant_group_4, dequant_group_8, h32
 
 CHUNK = 512
 TILE = 64
+# prompt indexer (qsa_rows from 64 rows): qsa_prompt.cu scores PROMPT_RT rows against a key tile with _scores' exact
+# arithmetic and keeps each PROMPT_SUB-block group's largest key, which bounds the cut so _select_cand reads a row once
+# (the same lists as _select); TF_QSA_PROMPT=stock keeps _scores + _select_tiles
+PROMPT_INDEXER = __import__("os").environ.get("TF_QSA_PROMPT", "") != "stock"
+PROMPT_RT, PROMPT_SUB, PROMPT_CAP = 16, 8, 4096   # prompt indexer: rows a score program, cut-bound group, candidates
+PROMPT_MIN_BLOCKS = 2048   # below ~8K positions _scores + _select is as fast (same lists either way)
 SELECT_REGS = 32768  # _select holds a row's block scores in registers up to this many; past it they spill
 
 
@@ -155,6 +164,11 @@ class AttnScratch:
         self.nk = torch.zeros((rows,), dtype=torch.int32, device=device)
         self.sparse = torch.zeros((rows,), dtype=torch.int32, device=device)
         self.scores = torch.zeros((rows, self.nb), dtype=torch.float32, device=device) if self.qsa else None
+        # prompt rows (qsa_rows above 64 rows): SUB-group key maxima and each row's candidate blocks
+        prompt = self.qsa and rows >= 64
+        self.nsub = -(-self.nb // PROMPT_SUB)
+        self.smx = torch.zeros((rows, self.nsub), dtype=torch.int32, device=device) if prompt else None
+        self.cand = torch.zeros((rows, PROMPT_CAP), dtype=torch.int32, device=device) if prompt else None
 
 
 def attention(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, pos0: torch.Tensor, scratch: AttnScratch,
@@ -299,6 +313,51 @@ def _block_keys(ROW, b, ok):
 
 
 @triton.jit
+def _radix_place(SC, IDS, r, complete, NB, RATIO: tl.constexpr, TOP: tl.constexpr, IDW: tl.constexpr,
+                 TB: tl.constexpr):
+    """Row r's TOP blocks (``_select``'s choice) placed in block order: the cut by radix select, then tile by tile."""
+
+    row = SC + r.to(tl.int64) * NB
+    digits = tl.arange(0, 256)
+    cut = tl.zeros((), dtype=tl.uint64)
+    need = tl.full((), TOP, dtype=tl.int32)       # the cut's rank among the keys sharing its leading bytes
+    for p in tl.static_range(4):
+        shift = 24 - 8 * p
+        hist = tl.zeros((256,), dtype=tl.int32)
+        for t0 in range(0, complete, TB):
+            b = t0 + tl.arange(0, TB)
+            ok = b < complete
+            k64 = _block_keys(row, b, ok)
+            if p > 0:
+                ok = ok & ((k64 >> (shift + 8)) == (cut >> (shift + 8)))
+            hist += tl.histogram(((k64 >> shift) & 0xFF).to(tl.int32), 256, mask=ok)
+        atleast = tl.sum(hist, axis=0) - tl.cumsum(hist, axis=0) + hist    # keys with this byte or a larger one
+        d = tl.max(tl.where(atleast >= need, digits, -1), axis=0)
+        need = need - tl.sum(tl.where(digits > d, hist, 0), axis=0)
+        cut = cut | (d.to(tl.uint64) << shift)
+    # every key above the cut, then the first ``need`` keys equal to it (lower block ids first), in block order
+    seen = tl.zeros((), dtype=tl.int32)
+    placed = tl.zeros((), dtype=tl.int32)
+    t0 = tl.zeros((), dtype=tl.int32)
+    stop = complete
+    while t0 < stop:
+        b = t0 + tl.arange(0, TB)
+        ok = b < complete
+        k64 = _block_keys(row, b, ok)
+        above = ok & (k64 > cut)
+        equal = ok & (k64 == cut)
+        rank = seen + tl.cumsum(equal.to(tl.int32), axis=0)
+        chosen = above | (equal & (rank <= need))
+        place = placed + tl.cumsum(chosen.to(tl.int32), axis=0) - 1
+        for k in tl.static_range(RATIO):
+            tl.store(IDS + r * IDW + place * RATIO + k, b * RATIO + k, mask=chosen)
+        seen += tl.sum(equal.to(tl.int32), axis=0)
+        placed += tl.sum(chosen.to(tl.int32), axis=0)
+        t0 += TB
+        stop = tl.where(placed >= TOP, 0, stop)        # all TOP placed: no later tile holds a chosen block
+
+
+@triton.jit
 def _select_tiles(SC, POS0, IDS, NKR, SPR, NB, RATIO: tl.constexpr, TOP: tl.constexpr, IDW: tl.constexpr,
                   TB: tl.constexpr):
     """``_select``'s lists for rows with more blocks than its registers hold, reading the row in TB-block tiles: the same cut (the TOP-th largest key) by radix select, one byte a pass from the top, then the same blocks placed tile by tile."""
@@ -310,44 +369,76 @@ def _select_tiles(SC, POS0, IDS, NKR, SPR, NB, RATIO: tl.constexpr, TOP: tl.cons
         tl.store(NKR + r, end)
         tl.store(SPR + r, 0)
     else:
+        _radix_place(SC, IDS, r, complete, NB, RATIO, TOP, IDW, TB)
+        t = tl.arange(0, RATIO)
+        tail = RATIO * complete + t
+        tl.store(IDS + r * IDW + TOP * RATIO + t, tail, mask=tail < end)
+        tl.store(NKR + r, TOP * RATIO + end - RATIO * complete)
+        tl.store(SPR + r, 1)
+
+
+@triton.jit
+def _select_cand(SC, SMX, CAND, POS0, IDS, NKR, SPR, NB, NSUB, RATIO: tl.constexpr, TOP: tl.constexpr,
+                 IDW: tl.constexpr, SUB: tl.constexpr, SW: tl.constexpr, CAP: tl.constexpr, TB: tl.constexpr):
+    """``_select``'s lists for prompt rows from the SUB-group maxima qsa_prompt.cu wrote: the TOP-th largest group
+    maximum t bounds the cut from below (TOP groups each hold a key >= t), so every chosen block is among the keys >= t.
+    One pass gathers those candidates in block order; if at most CAP, the cut and placement run on them in registers
+    (``_select``'s arithmetic), else the row falls back to the radix select over all its blocks."""
+
+    r = tl.program_id(0)
+    end = tl.load(POS0) + r + 1
+    complete = end // RATIO
+    if complete <= TOP:
+        tl.store(NKR + r, end)
+        tl.store(SPR + r, 0)
+    else:
         row = SC + r.to(tl.int64) * NB
-        digits = tl.arange(0, 256)
-        cut = tl.zeros((), dtype=tl.uint64)
-        need = tl.full((), TOP, dtype=tl.int32)       # the cut's rank among the keys sharing its leading bytes
-        for p in tl.static_range(4):
-            shift = 24 - 8 * p
-            hist = tl.zeros((256,), dtype=tl.int32)
-            for t0 in range(0, complete, TB):
-                b = t0 + tl.arange(0, TB)
-                ok = b < complete
-                k64 = _block_keys(row, b, ok)
-                if p > 0:
-                    ok = ok & ((k64 >> (shift + 8)) == (cut >> (shift + 8)))
-                hist += tl.histogram(((k64 >> shift) & 0xFF).to(tl.int32), 256, mask=ok)
-            atleast = tl.sum(hist, axis=0) - tl.cumsum(hist, axis=0) + hist    # keys with this byte or a larger one
-            d = tl.max(tl.where(atleast >= need, digits, -1), axis=0)
-            need = need - tl.sum(tl.where(digits > d, hist, 0), axis=0)
-            cut = cut | (d.to(tl.uint64) << shift)
-        # every key above the cut, then the first ``need`` keys equal to it (lower block ids first), in block order
-        seen = tl.zeros((), dtype=tl.int32)
-        placed = tl.zeros((), dtype=tl.int32)
-        t0 = tl.zeros((), dtype=tl.int32)
-        stop = complete
-        while t0 < stop:
+        ngroups = (complete + SUB - 1) // SUB
+        lo = tl.zeros((), dtype=tl.uint64)
+        if ngroups >= TOP:
+            gi = tl.arange(0, SW)
+            m = tl.load(SMX + r.to(tl.int64) * NSUB + gi, mask=gi < ngroups, other=0)
+            m = m.to(tl.uint32, bitcast=True).to(tl.uint64)     # keys are stored in an int32 tensor: no sign
+            hi = tl.full((), 0xFFFFFFFF, dtype=tl.uint64)
+            for _ in range(33):
+                mid = (lo + hi + 1) // 2
+                take = tl.sum(tl.where(m >= mid, 1, 0), axis=0) >= TOP
+                lo = tl.where(take, mid, lo)
+                hi = tl.where(take, hi, mid - 1)
+        bound = lo
+        crow = CAND + r.to(tl.int64) * CAP
+        n = tl.zeros((), dtype=tl.int32)
+        for t0 in range(0, complete, TB):
             b = t0 + tl.arange(0, TB)
             ok = b < complete
-            k64 = _block_keys(row, b, ok)
-            above = ok & (k64 > cut)
-            equal = ok & (k64 == cut)
-            rank = seen + tl.cumsum(equal.to(tl.int32), axis=0)
+            c = ok & (_block_keys(row, b, ok) >= bound)
+            at = n + tl.cumsum(c.to(tl.int32), axis=0) - 1
+            tl.store(crow + at, b, mask=c & (at < CAP))
+            n += tl.sum(c.to(tl.int32), axis=0)
+        if n <= CAP:
+            i = tl.arange(0, CAP)
+            have = i < n
+            cb = tl.load(crow + i, mask=have, other=0)
+            k64 = _block_keys(row, cb, have)
+            lo = tl.zeros((), dtype=tl.uint64)
+            hi = tl.full((), 0xFFFFFFFF, dtype=tl.uint64)
+            for _ in range(33):
+                mid = (lo + hi + 1) // 2
+                count = tl.sum(tl.where(k64 >= mid, 1, 0), axis=0)
+                take = count >= TOP
+                lo = tl.where(take, mid, lo)
+                hi = tl.where(take, hi, mid - 1)
+            cut = lo
+            above = have & (k64 > cut)
+            equal = have & (k64 == cut)
+            need = TOP - tl.sum(above.to(tl.int32), axis=0)
+            rank = tl.cumsum(equal.to(tl.int32), axis=0)
             chosen = above | (equal & (rank <= need))
-            place = placed + tl.cumsum(chosen.to(tl.int32), axis=0) - 1
+            place = tl.cumsum(chosen.to(tl.int32), axis=0) - 1
             for k in tl.static_range(RATIO):
-                tl.store(IDS + r * IDW + place * RATIO + k, b * RATIO + k, mask=chosen)
-            seen += tl.sum(equal.to(tl.int32), axis=0)
-            placed += tl.sum(chosen.to(tl.int32), axis=0)
-            t0 += TB
-            stop = tl.where(placed >= TOP, 0, stop)        # all TOP placed: no later tile holds a chosen block
+                tl.store(IDS + r * IDW + place * RATIO + k, cb * RATIO + k, mask=chosen)
+        else:
+            _radix_place(SC, IDS, r, complete, NB, RATIO, TOP, IDW, TB)
         t = tl.arange(0, RATIO)
         tail = RATIO * complete + t
         tl.store(IDS + r * IDW + TOP * RATIO + t, tail, mask=tail < end)
@@ -367,6 +458,28 @@ def _launch_select(scratch: AttnScratch, pos0: torch.Tensor, rows: int, blocks: 
     tb, warps = (4096, 8) if rows >= 64 else (8192, 16)      # a prompt's row blocks, a decode window
     _select_tiles[(rows,)](scratch.scores, pos0, scratch.ids, scratch.nk, scratch.sparse, scratch.nb,
                            RATIO=scratch.ratio, TOP=top, IDW=scratch.idw, TB=tb, num_warps=warps)
+
+
+@lru_cache(maxsize=1)
+def _prompt_ext():
+    """The prompt indexer's score kernel (qsa_prompt.cu), named for this branch so no other tree's build collides."""
+
+    from tensorfold.cuda.build import load
+
+    here = Path(__file__).parent
+    return load(name="tensorfold_qwen4_exp_qsa_prompt_p7", sources=[str(here / "qsa_prompt.cpp"),
+                                                                     str(here / "qsa_prompt.cu")],
+                extra_cuda_cflags=["-O3"], verbose=False)
+
+
+def _launch_select_cand(scratch: AttnScratch, pos0: torch.Tensor, rows: int, blocks: int) -> None:
+    """``_launch_select``'s lists for prompt rows, from the group maxima qsa_prompt.cu left in ``scratch.smx``."""
+
+    _select_cand[(rows,)](scratch.scores, scratch.smx, scratch.cand, pos0, scratch.ids, scratch.nk, scratch.sparse,
+                          scratch.nb, scratch.nsub, RATIO=scratch.ratio, TOP=scratch.budget // scratch.ratio,
+                          IDW=scratch.idw, SUB=PROMPT_SUB,
+                          SW=triton.next_power_of_2(max(1, triton.cdiv(blocks, PROMPT_SUB))), CAP=PROMPT_CAP,
+                          TB=4096, num_warps=8)
 
 
 def qsa_select(iq: torch.Tensor, ikc: torch.Tensor, pooled: torch.Tensor, pos0: torch.Tensor, ik_scale: torch.Tensor,
@@ -399,6 +512,11 @@ def qsa_rows(iq: torch.Tensor, pooled: torch.Tensor, pos0: torch.Tensor, scratch
     ratio, top = scratch.ratio, scratch.budget // scratch.ratio
     bb = 64
     blocks = scratch.nb if context is None else min(scratch.nb, max(1, triton.cdiv(context, ratio)))
+    if (PROMPT_INDEXER and getattr(scratch, "smx", None) is not None and rows >= 64 and ratio == 4 and top == 512
+            and blocks >= PROMPT_MIN_BLOCKS and iq.shape[1:] == (4, 128)):
+        _prompt_ext().scores(iq, pooled, pos0, scratch.scores, scratch.smx, rows, blocks, PROMPT_RT)
+        _launch_select_cand(scratch, pos0, rows, blocks)
+        return
     _scores[(rows, triton.cdiv(blocks, bb))](iq, pooled, pos0, scratch.scores, scratch.nb, HI=iq.shape[1],
                                                  DI=di, RATIO=ratio, TOP=top, BB=bb, num_warps=4)
     _launch_select(scratch, pos0, rows, blocks)

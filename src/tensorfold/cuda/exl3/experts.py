@@ -20,13 +20,18 @@ GLM_GATEUP = (8, 4, 4, 1)
 GLM_DOWN = (8, 4, 1, 1)
 
 
+# prompt windows rotate their inputs with four warps a program (rot_in4_kernel: each warp rot_in_kernel's arithmetic);
+# TF_ROT_IN4=0 keeps the one-warp programs. Decode windows always keep them.
+ROT_IN4 = __import__("os").environ.get("TF_ROT_IN4", "1") != "0"
+
+
 @lru_cache(maxsize=1)
 def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v8", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v8r", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -240,7 +245,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         ids, members = s.window(R)
         if mode == "group":
             ext.group(pick, ids, s.count, members, R, slots, E)
-    ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
+    ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E, mode == "prompt" and ROT_IN4)
     nt, w, sk, pf = s.cfg_gu
     if mode == "prompt":
         ext.prompt(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, plan.items, plan.counts, plan.members,

@@ -110,6 +110,28 @@ __global__ void rot_in_kernel(const TIN* __restrict__ x, int x_stride, const int
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
 }
 
+// rot_in_kernel's arithmetic per warp, four 128-blocks of K a program (128 threads): fewer, fuller blocks (W5-6).
+template <typename TIN>
+__global__ void __launch_bounds__(128) rot_in4_kernel(const TIN* __restrict__ x, int x_stride,
+                                                      const int* __restrict__ pick, const half* __restrict__ suh0,
+                                                      const half* __restrict__ suh1, half* __restrict__ out0,
+                                                      half* __restrict__ out1, int K, int slots, int E) {
+    const int p = blockIdx.x, blk = blockIdx.y * 4 + (threadIdx.x >> 5), mat = blockIdx.z;
+    const int row = p / slots;
+    const int e = pick[p];
+    if (e < 0 || e >= E) return;
+    const int lane = threadIdx.x & 31;
+    const half* suh = (mat ? suh1 : suh0) + (size_t)e * K + blk * 128 + 4 * lane;
+    const TIN* xr = x + (size_t)row * x_stride + blk * 128 + 4 * lane;
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = to_f<TIN>(xr[j]) * __half2float(suh[j]);
+    fwht128(v, lane);
+    half* o = (mat ? out1 : out0) + (size_t)p * K + blk * 128 + 4 * lane;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
+}
+
 __device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 
 // Program (member row, 128-block of the width): splits summed in order, rotated, * svh, SwiGLU (0: GLM's bf16 roundings, 1: fp32), then Xd = fp16((act * suh_d) @ H).
@@ -411,9 +433,26 @@ void exl3x_group_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucou
 
 void exl3x_rot_in_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
                        const at::Tensor& suh1, at::Tensor& out0, at::Tensor& out1, int64_t rows, int64_t K,
-                       int64_t slots, int64_t E) {
-    dim3 grid((unsigned)(rows * slots), (unsigned)(K / 128), 2);
+                       int64_t slots, int64_t E, bool wide4) {
     auto stream = at::cuda::getCurrentCUDAStream();
+    if (wide4 && K % 512 == 0) {
+        dim3 g4((unsigned)(rows * slots), (unsigned)(K / 512), 2);
+        auto s0 = reinterpret_cast<const half*>(suh0.data_ptr());
+        auto s1 = reinterpret_cast<const half*>(suh1.data_ptr());
+        auto o0 = reinterpret_cast<half*>(out0.data_ptr());
+        auto o1 = reinterpret_cast<half*>(out1.data_ptr());
+        if (x.scalar_type() == at::kBFloat16)
+            rot_in4_kernel<__nv_bfloat16><<<g4, 128, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x_stride, pick.data_ptr<int>(), s0, s1, o0,
+                o1, (int)K, (int)slots, (int)E);
+        else
+            rot_in4_kernel<half><<<g4, 128, 0, stream>>>(reinterpret_cast<const half*>(x.data_ptr()), (int)x_stride,
+                                                         pick.data_ptr<int>(), s0, s1, o0, o1, (int)K, (int)slots,
+                                                         (int)E);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return;
+    }
+    dim3 grid((unsigned)(rows * slots), (unsigned)(K / 128), 2);
     auto s0 = reinterpret_cast<const half*>(suh0.data_ptr());
     auto s1 = reinterpret_cast<const half*>(suh1.data_ptr());
     auto o0 = reinterpret_cast<half*>(out0.data_ptr());

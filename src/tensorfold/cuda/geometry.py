@@ -10,6 +10,7 @@ from .capacity import Geometry, Weights, headers, itemsize
 PREFILL_ROWS = 2048     # a prompt chunk's rows: Flash Next and GLM keep buffers of this many rows
 PROMPT_SHARE = 32       # a dense prompt chunk's arrays take at most this fraction of the GPU's memory
 PREFILL_ATT_ROWS = 256  # Flash Next's prompt attention block
+PROMPT_SUB, PROMPT_CAP = 8, 4096   # its prompt indexer's cut-bound groups and candidate list (attention.PROMPT_*)
 MLA_PROMPT_ATT_ROWS = 512   # GLM's prompt-chunk rows one dense latent attention call takes (forward.PROMPT_ATT_ROWS)
 MLA_SELECT_ROWS = 512       # GLM's prompt-chunk rows whose pool scores are held at once (sparse.SELECT_ROWS)
 
@@ -212,7 +213,7 @@ def gdn_geometry(t: dict, world: int, reserve: int, *, indexed: bool = False, mt
             chunks = (min(capacity, budget + ratio - 1) + 511) // 512
             blocks = (capacity + ratio - 1) // ratio
             scratch = (2 if mtp else 1) * rows * (h * (hd + 2) * chunks + blocks) * 4
-            scratch += PREFILL_ATT_ROWS * (h * (hd + 2) * chunks + blocks) * 4
+            scratch += PREFILL_ATT_ROWS * (h * (hd + 2) * chunks + blocks + -(-blocks // PROMPT_SUB) + PROMPT_CAP) * 4
         else:
             # Bound two retained prefixes, current KV state and a growth copy; speculative rows use separate workspace.
             rounded = 1 << (max(1024, capacity - reserve) - 1).bit_length()
@@ -440,6 +441,7 @@ def indexed_stream_geometry(t: dict, streams: int, each: int, keep: int, *, mtp:
         cache = caches(capacity) + (streams - 1) * caches(min(first, capacity))
         chunks = (min(capacity, budget + ratio - 1) + 511) // 512
         scratch = ((1 + mtp) * rows + PREFILL_ATT_ROWS) * (h * (hd + 2) * chunks + blocks + budget + ratio) * 4
+        scratch += PREFILL_ATT_ROWS * (-(-blocks // PROMPT_SUB) + PROMPT_CAP) * 4
         return fixed + cache + scratch
     return Geometry(bytes_at, each)
 

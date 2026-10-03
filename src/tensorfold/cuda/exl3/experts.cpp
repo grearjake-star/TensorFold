@@ -18,7 +18,7 @@ void exl3x_prompt_down_cuda(const at::Tensor&, const at::Tensor&, const at::Tens
 void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
 void exl3x_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
-                       at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
+                       at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, bool);
 void exl3x_gateup_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                                 const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                                 double, int64_t);
@@ -145,7 +145,7 @@ void group(const at::Tensor& pick, at::Tensor uids, at::Tensor ucount, at::Tenso
 
 void rot_in(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
             const at::Tensor& suh1, at::Tensor out0, at::Tensor out1, int64_t rows, int64_t K, int64_t slots,
-            int64_t E) {
+            int64_t E, bool wide4) {
     TORCH_CHECK(x.is_cuda() && (x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kHalf), "x: bf16/fp16 CUDA");
     check(pick, at::kInt, "pick");
     check(suh0, at::kHalf, "suh0");
@@ -154,7 +154,7 @@ void rot_in(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const
     check(out1, at::kHalf, "out1");
     TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
     c10::cuda::CUDAGuard guard(x.device());
-    exl3x_rot_in_cuda(x, x_stride, pick, suh0, suh1, out0, out1, rows, K, slots, E);
+    exl3x_rot_in_cuda(x, x_stride, pick, suh0, suh1, out0, out1, rows, K, slots, E, wide4);
 }
 
 void gateup_epilogue(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_g, const at::Tensor& svh_u,
