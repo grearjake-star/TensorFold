@@ -37,10 +37,30 @@ class Alone:
     def _state_changed(self, st) -> None:
         """Drop graphs before reallocating a slot: graph pointers must never outlive its cache geometry."""
 
-        if not self.planning and self.solo is not None and st is self.solo.st:
+        if self.planning or self.solo is None:
+            return
+        self.__dict__.setdefault("_slot_graphs", {}).pop(id(st), None)       # house: that slot's kept graphs
+        if st is self.solo.st:
             from .graphs import Graphs
 
             self.solo.graphs = Graphs(self.solo, max_rows=self.solo.rows)
+            self._slot_graphs[id(st)] = (st, self.solo.graphs)
+
+    def _graphs_to(self, st) -> None:
+        """House: the graphs move to slot ``st`` (a kept prefix holds the graph slot, or no room for the copy). Each
+        slot keeps the graphs captured over it until it is resized (``_state_changed``), so conversations taking
+        turns on a full pool capture once per slot, not every turn (0.6.4 recaptured on every move)."""
+
+        from .graphs import Graphs
+
+        cache = self.__dict__.setdefault("_slot_graphs", {})
+        if self.solo.st is not None and id(self.solo.st) not in cache:
+            cache[id(self.solo.st)] = (self.solo.st, self.solo.graphs)          # the slot being left keeps its graphs
+        self.solo.st = st
+        kept = cache.get(id(st))
+        if kept is None or kept[0] is not st:
+            kept = cache[id(st)] = (st, Graphs(self.solo, max_rows=self.solo.rows))
+        self.solo.graphs = kept[1]
 
     def _flush(self, s) -> None:
         """Materialize the shared round's deferred recurrent rows before a graph reads or copies the slot."""
@@ -63,21 +83,10 @@ class Alone:
         counts = gdn.to_device([len(rows)], torch.int32, self.w.device)
         gdn.replay(table, sc.lin, 1, kept, counts, k[0], v[0], in_place=True)
 
-    def _relocate_kept(self, target, avoid, evict: bool = False) -> bool:
+    def _relocate_kept(self, target, avoid) -> bool:
         """Move all graph-slot keeps into spare rows without eviction; plans record the same copy and ownership move."""
 
         spare = next((f for f in self.free if f is not target and f is not avoid), None)
-        if spare is None and evict and not self.planning and self.w.comm is None:
-            # house (speed-v8.1): a resumed lone turn with every slot kept drops the oldest other kept end (LRU), not
-            # the graphs; 0.6.4 moves the graphs instead and each turn recaptures them. A fresh stream left alone
-            # keeps 0.6.4's rule (no kept end is lost for it; fresh prompts take the graph slot at admission)
-            busy = self._busy()
-            spare = next((k[1] for k in self.kept if k[1] is not target and k[1] is not avoid
-                          and id(k[1]) not in busy), None)
-            if spare is not None:
-                self._drop_kept(spare)
-                self._shrink(spare, release=True)
-                self.free.append(spare)
         if spare is None:
             return False
         size = target.capacity
@@ -86,6 +95,7 @@ class Alone:
             need = spare.cache_bytes(size) - spare.cache_bytes() + spare.layer_bytes(size)
             if not self.memory_gate.fits(need):
                 return False
+            self._state_changed(spare)           # house: a resized slot's kept graphs are stale
             self.memory_gate.take(spare.resize(size))
         spare.copy_from(target)
         self.free = [f for f in self.free if f is not spare]
@@ -133,13 +143,12 @@ class Alone:
 
         target, old = self.solo.st, s.st
         self._flush(s)
-        resumed = getattr(s, "cached", 0) > 0          # house: only a resumed turn may evict another kept end
-        if any(k[1] is target for k in self.kept) and not self._relocate_kept(target, old, evict=resumed):
-            self.solo.st = old                   # preserve both prefix chains instead of evicting a kept slot
-            if self.planning:
+        if any(k[1] is target for k in self.kept) and not self._relocate_kept(target, old):
+            if self.planning:                    # preserve both prefix chains instead of evicting a kept slot
+                self.solo.st = old
                 self.actions.append(["solo", self._index(old)])
             else:
-                self._state_changed(old)
+                self._graphs_to(old)
             return
         self.solo_moves = getattr(self, "solo_moves", 0) + 1
         self._drop_kept(target)
@@ -150,11 +159,11 @@ class Alone:
         except NoRoom:
             grown = False
         if not grown:                            # house: no room for the copy's peak, the graphs move to this slot
-            self.solo.st = old                   # instead (0.6.4 raised here and failed the round)
-            if self.planning:
+            if self.planning:                    # instead (0.6.4 raised here and failed the round)
+                self.solo.st = old
                 self.actions.append(["solo", self._index(old)])
             else:
-                self._state_changed(old)
+                self._graphs_to(old)
             self._shrink(target)
             self.free.append(target)
             return

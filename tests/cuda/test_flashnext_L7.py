@@ -152,10 +152,21 @@ def test_lone_requests_on_a_full_pool_never_recapture(slots):
         assert s.out == _ref(w, p, 12, smp) and s.st is dec.solo.st
         assert dec.solo.graphs is graphs
     a, b = prompts[0], prompts[1]                     # two conversations taking turns: each turn resumes its own end
+
+    def captures():                                   # house: each slot keeps its own graphs (multi_solo._graphs_to)
+        sets = {id(g): g for _, g in getattr(dec, "_slot_graphs", {}).values()}
+        sets[id(dec.solo.graphs)] = dec.solo.graphs
+        return sum(g.captures for g in sets.values())
+
+    settled = None
     for turn in range(3):
+        if turn == 1:
+            settled = captures()                      # every slot the two conversations use has captured once
         for i, p in enumerate((a, b)):
             s = _run(dec, p, 10, smp)
-            assert s.out == _ref(w, p, 10, smp) and dec.solo.graphs is graphs
+            assert s.out == _ref(w, p, 10, smp)
+            if settled is not None:
+                assert captures() == settled          # turns on a full pool never recapture
             nxt = p + s.out[:-1] + [40 + turn]
             if i == 0:
                 a = nxt
