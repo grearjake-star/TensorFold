@@ -67,6 +67,16 @@ class Alone:
         """Move all graph-slot keeps into spare rows without eviction; plans record the same copy and ownership move."""
 
         spare = next((f for f in self.free if f is not target and f is not avoid), None)
+        if spare is None and not self.planning and self.w.comm is None:
+            # house (speed-v8.1): every slot kept, so the oldest other kept end goes (LRU), not the graphs; 0.6.4 moves
+            # the graphs instead and each resumed lone turn recaptures them
+            busy = self._busy()
+            spare = next((k[1] for k in self.kept if k[1] is not target and k[1] is not avoid
+                          and id(k[1]) not in busy), None)
+            if spare is not None:
+                self._drop_kept(spare)
+                self._shrink(spare, release=True)
+                self.free.append(spare)
         if spare is None:
             return False
         size = target.capacity
