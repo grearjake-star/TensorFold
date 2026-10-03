@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 
 import numpy as np
@@ -285,8 +286,27 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         finally:
             self.solo_on = self.solo is not None
         if self.solo is not None:                    # last: the graph slot's rows are the ones requests will find
-            self.solo.graphs.warm(self.depth + 1)
-            self.solo.st.reset(self.w)               # the captures wrote its state
+            st = self.solo.st
+            # house (W2): TF_SOLO_ROWS pre-sizes the graph slot so a growing conversation never resizes it (a resize
+            # drops every graph) below that many rows, and captures every context bucket up to it now, not mid-reply
+            want = int(os.environ.get("TF_SOLO_ROWS", "0") or 0)
+            if want > st.capacity and self.w.comm is None:
+                self._grow(st, min(want, st.limit), alone=True)
+            starts = [0]
+            if want:
+                b = 16384
+                while b <= st.capacity:              # a window ending in (b/2, b] uses bucket b (graphs._bucket)
+                    starts.append(b // 2)
+                    b *= 2
+            captured = 0
+            for pos in starts:
+                st.set_pos(pos)
+                st.set_mtp_len(pos)
+                captured += self.solo.graphs.warm(self.depth + 1)
+            st.reset(self.w)                         # the captures wrote its state
+            if want:
+                print(f"[tensorfold] lone-stream graph slot: {st.capacity} rows, {captured} graphs captured over "
+                      f"{len(starts)} context buckets", flush=True)
 
     @torch.no_grad()
     def admit(self, s: Stream, told=None) -> None:
