@@ -16,7 +16,23 @@ from ..host_residency import _Residency
 from tensorfold.cuda.exl3.format import is_exl3  # noqa: F401  (exl3.py and engine.py import it from here)
 
 EXTRA_FILES = ("ngram_embedding.safetensors", "mtp_hyper_connection_mixer_patch.safetensors")
-MOE_WINDOW = 1024        # most rows a routed-expert call takes (its grouping keeps every pick in 48 KB of shared memory)
+# Most rows a routed-expert call takes. The grouping kernel keeps every pick in 48 KB of shared memory (1024 rows);
+# the prompt kernel (TF_EXL3_PROMPT=prompt, the default) groups on the plan and takes a whole 2048-row prompt chunk,
+# reading each expert's weights once a chunk instead of twice. TF_EXL3_MOE_WINDOW overrides (rows never change bits).
+def _moe_window() -> int:
+    from tensorfold.cuda.exl3 import experts as _x
+
+    from tensorfold.cuda.geometry import indexed_prefill_rows
+
+    raw = os.environ.get("TF_EXL3_MOE_WINDOW", "")
+    chunk = min(4096, max(2048, indexed_prefill_rows() or 0))      # TENSORFOLD_PREFILL_ROWS: wider prompt pieces
+    w = int(raw) if raw else (chunk if _x.PROMPT == "prompt" else 1024)
+    if not 16 <= w <= 4096 or (w > 1024 and _x.PROMPT != "prompt"):
+        raise ValueError(f"TF_EXL3_MOE_WINDOW: 16..1024 rows (16..4096 with the prompt kernel), not {w}")
+    return w
+
+
+MOE_WINDOW = _moe_window()
 _DT = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32, "I64": torch.int64, "I32": torch.int32,
        "I16": torch.int16, "U8": torch.uint8, "I8": torch.int8, "U16": torch.int16, "U32": torch.int32}
 
@@ -30,9 +46,10 @@ def extra_files(model_dir: str | Path) -> tuple[Path, ...]:
 def admission(geometry):
     """The engine's geometry plus the EXL3 path's fixed scratch: routed-expert windows and prompt rows."""
 
-    from tensorfold.cuda.geometry import PREFILL_ROWS, exl3_indexed_scratch, with_fixed
+    from tensorfold.cuda.geometry import PREFILL_ROWS, exl3_indexed_scratch, indexed_prefill_rows, with_fixed
 
-    return lambda text: with_fixed(geometry(text), exl3_indexed_scratch(text, MOE_WINDOW, PREFILL_ROWS))
+    rows = max(PREFILL_ROWS, indexed_prefill_rows() or 0)
+    return lambda text: with_fixed(geometry(text), exl3_indexed_scratch(text, MOE_WINDOW, rows))
 
 
 class Pack:

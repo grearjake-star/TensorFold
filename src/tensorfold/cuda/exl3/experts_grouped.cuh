@@ -283,6 +283,175 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     }
 }
 
+// One warp's k tiles for up to MTB member tiles of one expert: each tile decoded once, then MMA'd against every member
+// tile's A fragments. A member row's accumulators see the same B fragments, in the same k order, as in warp_tiles.
+template <int CB, int K2, int NT, int PF, int MTB>
+__device__ __forceinline__ void warp_tiles_multi(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
+                                                 const half* const (&x0)[MTB], const half* const (&x1)[MTB],
+                                                 const bool (&ok0)[MTB], const bool (&ok1)[MTB], int live, int lane,
+                                                 float (&acc)[MTB][NT][2][4]) {
+    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
+    const LaneMap<K2> map(lane);
+    const size_t kstride = (size_t)NTILES * TW;
+    const uint32_t* tp = T + ((size_t)kt0 * NTILES + nt0) * TW + lane;
+
+    uint32_t pf[PF][NT][LW];
+#pragma unroll
+    for (int d = 0; d < PF; ++d)
+        if (d < nkt)
+#pragma unroll
+            for (int i = 0; i < NT; ++i) load_words<K2>(pf[d][i], tp + d * kstride + i * TW, lane);
+
+    for (int ib = 0; ib < nkt; ib += PF) {
+#pragma unroll
+        for (int d = 0; d < PF; ++d) {
+            const int it = ib + d;
+            if (it < nkt) {
+                uint32_t w[NT][LW];
+#pragma unroll
+                for (int i = 0; i < NT; ++i)
+#pragma unroll
+                    for (int l = 0; l < LW; ++l) w[i][l] = pf[d][i][l];
+                if (it + PF < nkt)
+#pragma unroll
+                    for (int i = 0; i < NT; ++i)
+                        load_words<K2>(pf[d][i], tp + (size_t)(it + PF) * kstride + i * TW, lane);
+                const int k = (kt0 + it) * 16;
+                uint32_t a[MTB][4];
+#pragma unroll
+                for (int m = 0; m < MTB; ++m)
+                    if (m < live) {
+                        a[m][0] = load_pair(x0[m] + k, ok0[m]);
+                        a[m][1] = load_pair(x1[m] + k, ok1[m]);
+                        a[m][2] = load_pair(x0[m] + k + 8, ok0[m]);
+                        a[m][3] = load_pair(x1[m] + k + 8, ok1[m]);
+                    }
+#pragma unroll
+                for (int i = 0; i < NT; ++i) {
+                    uint32_t b0[2], b1[2];
+                    decode_tile<CB, K2>(w[i], map, lane, b0, b1);
+#pragma unroll
+                    for (int m = 0; m < MTB; ++m)
+                        if (m < live) {
+                            mma16816(acc[m][i][0], a[m], b0);
+                            mma16816(acc[m][i][1], a[m], b1);
+                        }
+                }
+            }
+        }
+    }
+}
+
+// Program (plan item, n block, matrix and split): an item is one expert's next 16 * MTB pairs (tensorfold.cuda.experts'
+// plan, pairs in pair order), so no program waits on an empty (expert, member tile). Each 16-pair tile computes exactly
+// what grouped_kernel's program for it computes (same K ranges, same k order, warps added in order): the same bits.
+template <int CB, int NT, int W, int PF, int LO, int HI, int MTB>
+__global__ void __launch_bounds__(W * 32) grouped_items_kernel(
+    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
+    const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
+    const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members,
+    float* __restrict__ Z, int K, int N, int P, int SK, int E) {
+    const int item = blockIdx.x;
+    if (item >= counts[0]) return;
+    const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
+    if (e < 0 || e >= E) return;                          // a skipped pick (>= E), as the grouping ignores it
+    const int split = blockIdx.z % SK;
+    const int mat = blockIdx.z / SK;
+    const half* X = mat ? X1 : X0;
+    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
+    const int k2 = mat ? K2_1[e] : K2_0[e];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int KT = K >> 4, NTILES = N >> 4;
+
+    __shared__ int rows_sh[16 * MTB];
+    for (int i = threadIdx.x; i < 16 * MTB; i += W * 32) rows_sh[i] = i < cnt ? members[first + i] : -1;
+    __syncthreads();
+    const int live = (cnt + 15) >> 4;                     // member tiles with a pair (uniform over the block)
+
+    const half* x0[MTB];
+    const half* x1[MTB];
+    bool ok0[MTB], ok1[MTB];
+#pragma unroll
+    for (int m = 0; m < MTB; ++m) {
+        const int r0 = rows_sh[m * 16 + g], r1 = rows_sh[m * 16 + g + 8];
+        x0[m] = X + (size_t)(r0 < 0 ? 0 : r0) * K + 2 * t;
+        x1[m] = X + (size_t)(r1 < 0 ? 0 : r1) * K + 2 * t;
+        ok0[m] = r0 >= 0;
+        ok1[m] = r1 >= 0;
+    }
+
+    const int per_split = KT / SK, per_warp = per_split / W;
+    const int kt0 = split * per_split + warp * per_warp;
+    const int nt0 = blockIdx.y * NT;
+
+    float acc[MTB][NT][2][4];
+#pragma unroll
+    for (int m = 0; m < MTB; ++m)
+#pragma unroll
+        for (int i = 0; i < NT; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) acc[m][i][h][c] = 0.f;
+
+    switch (k2) {
+#define TF_EXL3X_CASE(K2_)                                                                                      \
+    case K2_:                                                                                                   \
+        if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
+            warp_tiles_multi<CB, K2_, NT, PF, MTB>(T, NTILES, kt0, per_warp, nt0, x0, x1, ok0, ok1, live, lane, acc); \
+        else                                                                                                    \
+            __trap();                                                                                           \
+        break;
+        TF_EXL3X_CASE(2)
+        TF_EXL3X_CASE(3)
+        TF_EXL3X_CASE(4)
+        TF_EXL3X_CASE(5)
+        TF_EXL3X_CASE(6)
+        TF_EXL3X_CASE(7)
+        TF_EXL3X_CASE(8)
+        TF_EXL3X_CASE(9)
+        TF_EXL3X_CASE(10)
+        TF_EXL3X_CASE(11)
+        TF_EXL3X_CASE(12)
+        TF_EXL3X_CASE(13)
+        TF_EXL3X_CASE(14)
+        TF_EXL3X_CASE(15)
+        TF_EXL3X_CASE(16)
+#undef TF_EXL3X_CASE
+        default:
+            __trap();
+    }
+
+    // each member tile's warps' partial sums through shared memory, added in warp order (grouped_kernel's reduce)
+    __shared__ float red[W][16][NT * 16];
+#pragma unroll
+    for (int m = 0; m < MTB; ++m) {
+        if (m >= live) break;
+#pragma unroll
+        for (int i = 0; i < NT; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int col = i * 16 + h * 8 + 2 * t;
+                red[warp][g][col] = acc[m][i][h][0];
+                red[warp][g][col + 1] = acc[m][i][h][1];
+                red[warp][g + 8][col] = acc[m][i][h][2];
+                red[warp][g + 8][col + 1] = acc[m][i][h][3];
+            }
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
+            const int row = idx / (NT * 16), col = idx % (NT * 16);
+            const int r = rows_sh[m * 16 + row];
+            if (r < 0) continue;
+            float s = red[0][row][col];
+#pragma unroll
+            for (int w = 1; w < W; ++w) s += red[w][row][col];
+            Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
+        }
+        __syncthreads();
+    }
+}
+
 // W_q [K, N] fp16 of one matrix through the same lane decode (tests; not on the forward path).
 template <int CB, int K2>
 __global__ void dequant_kernel(const uint32_t* __restrict__ T, half* __restrict__ out, int K, int N) {
@@ -319,6 +488,12 @@ struct GroupedArgs {
     int K, N, P, SK, maxm, slots;
     int nexp_max;        // grid.x (upper bound of distinct experts)
     int mats, nt, warps, pf, lo, hi;
+    // the plan form (grouped_items_launch): items (expert, first, count) of 16 * mtb pairs, counts[0] items
+    const int* items = nullptr;
+    const int* counts = nullptr;
+    int items_max = 0;
+    int mtb = 1;
+    int E = 0;
 };
 
 template <int CB>
@@ -337,6 +512,24 @@ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     else if (a.nt == 8 && a.warps == 4 && a.pf == 2) { TF_RANGES(8, 4, 2) }
     else if (a.nt == 4 && a.warps == 4 && a.pf == 2) { TF_RANGES(4, 4, 2) }
     else TORCH_CHECK(false, "unsupported tile setting nt=", a.nt, " warps=", a.warps, " pf=", a.pf);
+#undef TF_RANGES
+#undef TF_LAUNCH
+}
+
+template <int CB>
+void grouped_items_launch(const GroupedArgs& a, cudaStream_t stream) {
+    dim3 grid((unsigned)a.items_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK));
+#define TF_LAUNCH(NT_, W_, PF_, LO_, HI_, MTB_)                                                                 \
+    grouped_items_kernel<CB, NT_, W_, PF_, LO_, HI_, MTB_><<<grid, W_ * 32, 0, stream>>>(                       \
+        a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.items, a.counts, a.members, a.z, a.K, a.N, a.P, a.SK, a.E)
+#define TF_RANGES(NT_, W_, PF_, MTB_)                                                                           \
+    if (a.lo == 8 && a.hi == 8) TF_LAUNCH(NT_, W_, PF_, 8, 8, MTB_);                                            \
+    else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(NT_, W_, PF_, 2, 10, MTB_);                                     \
+    else TF_LAUNCH(NT_, W_, PF_, 2, 16, MTB_);
+    if (a.nt == 8 && a.warps == 4 && a.pf == 1 && a.mtb == 1) { TF_RANGES(8, 4, 1, 1) }
+    else if (a.nt == 8 && a.warps == 4 && a.pf == 1 && a.mtb == 2) { TF_RANGES(8, 4, 1, 2) }
+    else if (a.nt == 4 && a.warps == 4 && a.pf == 1 && a.mtb == 4) { TF_RANGES(4, 4, 1, 4) }
+    else TORCH_CHECK(false, "unsupported item tile setting nt=", a.nt, " warps=", a.warps, " pf=", a.pf, " mtb=", a.mtb);
 #undef TF_RANGES
 #undef TF_LAUNCH
 }

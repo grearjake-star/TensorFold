@@ -14,7 +14,15 @@ from tensorfold.cuda.exl3 import format as fmt
 from .exl3_mm import Scratch, f16, stack, x3
 from .exl3_pack import _DT, NgramTable, Pack, is_exl3
 
-PREFILL_ROWS = 2048       # the prompt buffers' rows (``decode.PREFILL_ROWS``): the n-gram staging holds as many
+def _prefill_rows() -> int:
+    """The prompt pieces' rows the n-gram staging holds: 2048, or TENSORFOLD_PREFILL_ROWS when larger."""
+
+    from tensorfold.cuda.geometry import indexed_prefill_rows
+
+    return max(2048, indexed_prefill_rows() or 0)
+
+
+PREFILL_ROWS = _prefill_rows()
 
 __all__ = ["is_exl3", "load"]
 
