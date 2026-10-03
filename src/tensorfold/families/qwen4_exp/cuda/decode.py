@@ -234,12 +234,13 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
     """Absorb kept rows and chain drafts, always retaining the first even below ``confidence``, then stopping before later drafts below it or after a low-confidence first draft.
 
     With ``price`` (a ``DraftPrice``, --mtp-cost) a chain also stops before a later draft whose calibrated chance of
-    being reached and kept no longer repays the ms it adds to the round; a draft that cannot pass costs no MTP step.
+    being reached and kept no longer repays the ms it adds to the round, or (--mtp-lookahead) once no deeper chain is
+    expected to give more tokens per ms; a draft that cannot pass costs no MTP step.
     Drafts change speed only, never the output."""
 
     st = e.st
     if price is not None:
-        price.begin(sampling is not None and sampling.temperature > 0)
+        price.begin(sampling is not None and sampling.temperature > 0, count)
     logits = absorb(e, streams, next_tokens)
     drafts: list[int] = []
     chain = 1.0
@@ -248,7 +249,7 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
         if confidence > 0 or price is not None:
             d, p = e.sample_draft(logits, position + j, sampling)
             chain *= p
-            low = p < confidence or (price is not None and not price.pays(j, chain))
+            low = p < confidence or (price is not None and not price.keeps(j, chain))
             if low and j > 0:
                 break
         else:
@@ -256,8 +257,8 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
         drafts.append(d)
         if price is not None:
             price.products.append(chain)
-            if j + 1 < count and not price.pays(j + 1, chain):
-                break                                    # products only fall: the next draft cannot pay either
+            if j + 1 < count and not price.more(j, chain):
+                break                                    # the next draft cannot pay: no MTP step for it
         if low:
             break
         if j + 1 < count:

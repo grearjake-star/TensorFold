@@ -344,6 +344,13 @@ startup line prints them), so the prices follow the checkpoint, its kernels and 
 verified, and `--mtp-confidence` still applies. Drafts change speed only: replies equal `"draft": false` output at any
 cost. `--parallel` and `--tp 2` refuse it for now.
 
+`--mtp-lookahead` is the same stop without a C. Before each MTP step it scores every chain length from the current
+one to `--mtp-drafts` by expected tokens (one plus the calibrated chances of reaching and keeping each draft) over the
+round's measured ms, and drafts on only while a deeper length scores higher. Deeper drafts are expected to survive at
+the rate live rounds kept them at that depth, or at the last draft's own rate before rounds have reached it. Unlike
+the marginal bar, it keeps going when a dear draft is followed by cheap ones. It refuses `--mtp-cost`, `--parallel`
+and `--tp 2`.
+
 ## Draft vocabulary provenance
 
 Both backends read the public list in `src/tensorfold/families/qwen4_exp/cuda/draft_vocab.txt`.

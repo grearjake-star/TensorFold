@@ -82,6 +82,10 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                        help="on CUDA, also stop an MTP chain once a later draft's calibrated chance of being kept no "
                             "longer repays the ms it adds to the round, at this many tokens per ms, priced on the engine's "
                             "measured round costs (Flash Next, one stream; default off)")
+    speed.add_argument("--mtp-lookahead", action="store_true", default=None,
+                       help="on CUDA, stop an MTP chain at the depth that gives the most expected tokens per ms of the "
+                            "round, looking over every deeper depth, on calibrated chances and the engine's measured "
+                            "round costs (Flash Next, one stream; default off)")
     speed.add_argument("--lane-kernels", choices=("auto", "on", "off"), default="auto",
                        help="lane kernels for Qwen3.8 dense (auto: on GPUs with tensor units)")
     speed.add_argument("--prompt-cache-gib", type=float, default=None,

@@ -74,6 +74,15 @@ def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any =
             raise ValueError(f"--mtp-cost is tokens per ms, 0 (off) or more, not {cost}")
         if cost > 0 and _cuda_streams(getattr(args, "parallel", "auto")) > 1:
             raise ValueError("--mtp-cost prices one stream's rounds; drop it or --parallel")
+    if getattr(args, "mtp_lookahead", None):
+        engine = getattr(family.package, "cuda_engine", None) if backend == "cuda" else None
+        if engine is None or "mtp_lookahead" not in inspect.signature(engine).parameters:
+            raise ValueError(f"--mtp-lookahead prices a CUDA engine's MTP drafts; {family.title} on "
+                             f"{'CUDA' if backend == 'cuda' else 'MLX'} has no such rule")
+        if (cost or 0) > 0:
+            raise ValueError("--mtp-cost and --mtp-lookahead are two draft stops: pick one")
+        if _cuda_streams(getattr(args, "parallel", "auto")) > 1:
+            raise ValueError("--mtp-lookahead prices one stream's rounds; drop it or --parallel")
     confidence = getattr(args, "mtp_confidence", None)
     if confidence is None:
         return

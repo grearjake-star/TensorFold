@@ -1,6 +1,7 @@
-"""Flash Next's expected-time draft stop (``--mtp-cost``): a later draft is verified only while its chance of being
-kept, the head's chain product calibrated by live rounds, repays the ms it adds to the round. Drafts change speed
-only: drafted output equals serial output, greedy and sampled, at any price."""
+"""Flash Next's expected-time draft stops: ``--mtp-cost`` verifies a later draft only while its chance of being kept,
+the head's chain product calibrated by live rounds, repays the ms it adds to the round; ``--mtp-lookahead`` drafts
+toward the depth with the most expected tokens per ms of the round. Drafts change speed only: drafted output equals
+serial output, greedy and sampled, at any price."""
 
 import pytest
 import torch
@@ -34,6 +35,42 @@ def test_unverified_drafts_teach_nothing() -> None:
     price.products = [0.9, 0.5]
     price.observe(1, 0)                                        # a window cut the second draft before verifying it
     assert price.kept[False][1] is None and price.kept[False][0] == pytest.approx(0.9 * (1 - RATE))
+
+
+
+def test_lookahead_drafts_through_a_dear_row_when_cheap_rows_follow() -> None:
+    table = (30.0, 31.0, 40.0, 41.0, 42.0)                     # the second draft's row costs 9 ms, the rest 1 ms
+    marginal, ahead = DraftPrice(0.1, table, 0.0, 4), DraftPrice(0.0, table, 0.0, 4, lookahead=True)
+    for price in (marginal, ahead):
+        price.begin(False)
+        price.products = [0.85]
+    assert not marginal.more(0, 0.85)                          # 0.85 < 0.1 x 9 ms: the marginal bar stops at one
+    assert ahead.best([0.85], 1) == 4 and ahead.more(0, 0.85)  # four drafts give the most tokens per ms
+    assert not ahead.more(0, 0.2)                              # a weak chain: one draft is the best depth
+
+
+def test_lookahead_drops_a_draft_its_depth_does_not_repay_and_respects_the_chain_limit() -> None:
+    price = DraftPrice(0.0, (30.0, 31.0, 40.0, 41.0, 42.0), 0.5, 4, lookahead=True)
+    price.begin(False)
+    price.products = [0.9]
+    assert price.keeps(0, 0.01)                                # the first draft is always verified
+    assert not price.keeps(1, 0.05) and price.keeps(1, 0.85)
+    price.begin(False, 1)                                      # one token left in the reply
+    assert not price.more(0, 0.99)
+
+
+def test_lookahead_prices_deeper_drafts_at_the_rate_live_rounds_kept_them() -> None:
+    price = DraftPrice(0.0, (30.0, 31.0, 32.0, 33.0), 0.0, 3, lookahead=True)
+    price.begin(False)
+    assert price.more(0, 0.9)                                  # no rounds yet: the head's own rate carries on
+    for _ in range(400):
+        price.begin(False)
+        price.products = [0.9, 0.85, 0.8]
+        price.observe(3, 1)                                    # depth 1 always kept, depth 2 never
+    price.begin(False)
+    assert price.best([0.9], 1) == 1 and not price.more(0, 0.9)
+    price.begin(True)
+    assert price.more(0, 0.9)                                  # sampled rounds keep their own counts
 
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
@@ -73,11 +110,12 @@ def test_drafts_under_the_cost_stop_give_the_serial_tokens(sampling_seed) -> Non
     ref = serial_decode(e, first, 32, sampling).tokens
     for depth in (1, 3, 6):
         for confidence in (0.0, 0.7):
-            for cost in (0.0, 0.02, 0.2, 2.0):                       # any table: the stop moves speed only
-                price = DraftPrice(cost, (24.0, 28.0, 32.0, 35.0, 38.0, 42.0, 44.0), 1.2, depth)
+            for cost in (0.0, 0.02, 0.2, 2.0, None):                 # any table: the stop moves speed only
+                price = DraftPrice(cost or 0.0, (24.0, 28.0, 32.0, 35.0, 38.0, 42.0, 44.0), 1.2, depth,
+                                   lookahead=cost is None)              # None: --mtp-lookahead
                 for _ in range(2):                                   # the second reply runs on calibrated counts
                     assert prefill(e, prompt, sampling) == first
                     got = mtp_decode(e, first, 32, sampling, depth=depth, confidence=confidence, price=price)
                     assert got.tokens == ref, (depth, confidence, cost)
-                    if cost >= 2.0:                 # an unpayable bar (> 1): every round verifies its first draft only
+                    if (cost or 0) >= 2.0:          # an unpayable bar (> 1): every round verifies its first draft only
                         assert max(got.widths) <= 2

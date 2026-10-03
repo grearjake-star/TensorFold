@@ -253,6 +253,8 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
         options["mtp_confidence"] = float(args.mtp_confidence)
     if getattr(args, "mtp_cost", None) is not None:
         options["mtp_cost"] = float(args.mtp_cost)
+    if getattr(args, "mtp_lookahead", None):
+        options["mtp_lookahead"] = True
     if getattr(args, "decode_share", None) is not None:
         options["decode_share"] = float(args.decode_share)
     options["context"] = context if context is not None else args.context
