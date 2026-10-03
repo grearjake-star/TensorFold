@@ -140,7 +140,8 @@ def test_copy_from_takes_a_smaller_state_into_its_first_rows():
 def test_lone_requests_on_a_full_pool_never_recapture(slots):
     """Regression (tier D, 592ee62): once every slot held a kept prompt end, each new lone request swapped the graphs
     to another slot and recaptured them. Now a fresh prompt takes the graph slot at admission (its kept ends move to
-    the slot the prompt would have taken) and a resumed one evicts the oldest other kept end, never the graphs."""
+    the slot the prompt would have taken), and a resumed turn takes the graphs to its own slot, which keeps them:
+    the first conversation's slot captures once (turn 1), then no turn captures."""
 
     w = _model()
     dec = MultiDecoder(w, slots=slots, capacity=1024, depth=3, confidence=0.3, graphs=True)
@@ -159,8 +160,8 @@ def test_lone_requests_on_a_full_pool_never_recapture(slots):
         return sum(g.captures for g in sets.values())
 
     settled = None
-    for turn in range(3):
-        if turn == 1:
+    for turn in range(4):
+        if turn == 2:                                 # turn 1 gave the first conversation's own slot its graphs
             settled = captures()                      # every slot the two conversations use has captured once
         for i, p in enumerate((a, b)):
             s = _run(dec, p, 10, smp)
