@@ -498,6 +498,8 @@ class FlashNextEngine:
         if self.scheduler is not None:
             self.scheduler.close()
             self.scheduler = None
+        if self.ngram is not None:
+            self.ngram.stop()                             # the TF_NGRAM_REPIN thread
 
     def generate(self, prompt: list[int], max_tokens: int, sampling,
                  on_tokens: Callable[[list[int]], bool | None], draft: bool = True, constraint=None,

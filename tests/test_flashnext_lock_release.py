@@ -237,10 +237,13 @@ def test_budget_under_parallel_keeps_the_gate_floor_and_installs_the_release(tmp
     assert multi.release == res.release                         # elastic: growth still unpins, last run first
     assert res.release(1) == spans[3] and table.locked_bytes() == sum(spans[:3])
     assert _same(before, table.gather(ids))
+    res.stop()                                                  # the TF_NGRAM_REPIN thread (test_flashnext_repin)
     table.unlock()
     # MemAvailable under the gate floor + budget: clipped down to the floor, never past it
     monkeypatch.setattr(host_residency, "mem_available", lambda: floor + sum(spans[:2]))
-    note = ngram_residency.Residency({"TF_NGRAM_LOCK": repr(budget / GIB)}).start(None, False, _decoder([0], None))
+    res = ngram_residency.Residency({"TF_NGRAM_LOCK": repr(budget / GIB)})
+    note = res.start(None, False, _decoder([0], None))
+    res.stop()
     assert "CLIPPED" in note and table.locked_bytes() == sum(spans[:2])
     table.unlock()
 

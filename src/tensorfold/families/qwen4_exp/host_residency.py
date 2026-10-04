@@ -24,6 +24,8 @@ def residency_policy(env) -> dict:
                               MemAvailable stays above the reserve
     (unset)                   the engine's own read-back after warm-up (and its run pins within the startup room)
     TF_NGRAM_REFRESH=0        no read-back at all
+    TF_NGRAM_REPIN=1          (default; 0 off) with a lock under --parallel, runs unpinned for growing stream caches
+                              are pinned back between requests while MemAvailable allows (ngram_residency.Residency)
     TF_NGRAM_RESERVE_GIB=10   that reserve (the host's MemAvailable floor; auto:GiB overrides it for the lock)."""
 
     lock = env.get("TF_NGRAM_LOCK", "") or None
@@ -182,6 +184,29 @@ class _Residency:
                     total += size
         self._locked = locked
         return total
+
+    def lock_next(self, names: tuple[str, ...], budget: int, guard=None) -> int:
+        """Re-pin (TF_NGRAM_REPIN): mlock the first array of ``names`` (``lock_parts`` order) not locked now, if the
+        locked total stays within ``budget``; bytes locked (0: none left or fits, or mlock refused). ``guard`` (a lock)
+        covers only the reads and the append, not the mlock: a concurrent ``release`` never waits on page reads."""
+
+        import contextlib
+
+        guard = contextlib.nullcontext() if guard is None else guard
+        with guard:
+            locked = getattr(self, "_locked", [])
+            held = {a for a, _ in locked}
+            total = sum(n for _, n in locked)
+            pick = next(((at, size) for name in names for at, size in map(_span, self.parts()[name])
+                         if at not in held), None)
+        if pick is None or total + pick[1] > budget:
+            return 0
+        if _libc().mlock(*pick) != 0:
+            return 0
+        with guard:
+            self._locked = getattr(self, "_locked", [])
+            self._locked.append(pick)               # the latest locked is the first ``release`` unpins again
+        return pick[1]
 
     def locked_bytes(self) -> int:
         """Bytes ``lock_parts`` holds pinned now."""
