@@ -137,7 +137,7 @@ def test_copy_from_takes_a_smaller_state_into_its_first_rows():
 
 
 @pytest.mark.parametrize("slots", [3, 4])
-def test_lone_requests_on_a_full_pool_never_recapture(slots):
+def test_lone_requests_on_a_full_pool_never_recapture(slots, monkeypatch):
     """Regression (tier D, 592ee62): once every slot held a kept prompt end, each new lone request swapped the graphs
     to another slot and recaptured them. Now a fresh prompt takes the graph slot at admission (its kept ends move to
     the slot the prompt would have taken), and a resumed turn takes the graphs to its own slot, which keeps them:
@@ -154,10 +154,21 @@ def test_lone_requests_on_a_full_pool_never_recapture(slots):
         assert dec.solo.graphs is graphs
     a, b = prompts[0], prompts[1]                     # two conversations taking turns: each turn resumes its own end
 
-    def captures():                                   # house: each slot keeps its own graphs (multi_solo._graphs_to)
-        sets = {id(g): g for _, g in getattr(dec, "_slot_graphs", {}).values()}
-        sets[id(dec.solo.graphs)] = dec.solo.graphs
-        return sum(g.captures for g in sets.values())
+    # house: each slot keeps its own graphs (multi_solo._graphs_to). Count every capture made from here on, in any
+    # graph set: summing the live sets' counters missed a set dropped and recaptured to the same count (AUDIT)
+    from tensorfold.families.qwen4_exp.cuda import graphs as graphs_mod
+
+    made = [0]
+    real = graphs_mod.Graphs._capture
+
+    def counted(self, fn):
+        made[0] += 1
+        return real(self, fn)
+
+    monkeypatch.setattr(graphs_mod.Graphs, "_capture", counted)
+
+    def captures():
+        return made[0]
 
     settled = None
     for turn in range(4):
