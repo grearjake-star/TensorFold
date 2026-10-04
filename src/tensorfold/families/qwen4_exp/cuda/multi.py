@@ -269,8 +269,9 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             st = self._fresh_slot(st)            # house: a fresh prompt decodes in the graph slot when it can take it
         return st, resume, n
 
-    def _remember(self, ids: list[int], st: State, snap: dict, tail, start: bool = False) -> None:
-        prefixes.remember(self, ids, st, snap, tail, start=start)
+    def _remember(self, ids: list[int], st: State, snap: dict, tail, start: bool = False,
+                  checkpoint: bool = False) -> None:
+        prefixes.remember(self, ids, st, snap, tail, start=start, checkpoint=checkpoint)
 
     def live(self) -> int:
         return len(self.streams) + len(self.filling)

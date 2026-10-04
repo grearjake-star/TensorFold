@@ -8,6 +8,22 @@ from typing import Any, Callable, Sequence
 import numpy as np
 
 MIN_GAP = 256            # a snapshot this close to the prompt start or to the previous snapshot saves too little
+CHECKPOINT = "TF_SYS_CHECKPOINT"
+
+
+def checkpoint_rows() -> int:
+    """TF_SYS_CHECKPOINT: the granule (rows, default 2048 = a prompt pass) of the system-block checkpoint; 0: none."""
+
+    import os
+
+    raw = os.environ.get(CHECKPOINT, "").strip()
+    try:
+        rows = int(raw) if raw else 2048
+    except ValueError:
+        raise ValueError(f"{CHECKPOINT}: rows (0: off), not {raw!r}") from None
+    if rows < 0 or 0 < rows < MIN_GAP:
+        raise ValueError(f"{CHECKPOINT}: 0 (off) or at least {MIN_GAP} rows, not {rows}")
+    return rows
 
 
 class TemplateTokens:
@@ -31,18 +47,35 @@ def snapshot_points(openers: Sequence[int], assistant: Sequence[int]) -> Callabl
     from tensorfold.engine.prefill_plan import PrefillPlan
 
     plan = PrefillPlan(openers=openers, assistant=assistant, min_chunk=max(MIN_GAP, len(assistant)))
+    granule = checkpoint_rows()
+
+    def checkpoint(ids: Sequence[int]) -> int | None:
+        """The system-block checkpoint: the last multiple of the granule at least MIN_GAP before the second message's
+        start, so a later prompt whose system block differs only near its end (a date line, a memory section) resumes
+        there instead of prefilling the whole block. None when off or the block is shorter than one granule."""
+
+        if not granule or not plan.openers:
+            return None
+        starts = np.flatnonzero(np.isin(np.asarray(ids, dtype=np.int64), plan.openers))
+        if len(starts) < 2:
+            return None
+        at = (int(starts[1]) - MIN_GAP) // granule * granule
+        return at if at >= granule else None
 
     def points(ids: Sequence[int]) -> list[int]:
         arr = np.asarray(ids, dtype=np.int64)
         found = plan.points(arr)
         starts = np.flatnonzero(np.isin(arr, plan.openers)) if plan.openers else []
         wanted = ([int(starts[1])] if len(starts) > 1 else []) + ([found[-1]] if found else [])
+        cp = checkpoint(ids)
+        wanted += [cp] if cp is not None else []
         out: list[int] = []
         for p in sorted(set(wanted)):
             if MIN_GAP <= p < len(arr) and (not out or p - out[-1] >= MIN_GAP):
                 out.append(p)
         return out
 
+    points.checkpoint = checkpoint
     return points
 
 

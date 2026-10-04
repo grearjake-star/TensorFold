@@ -24,13 +24,31 @@ def _is_start(owner, entry) -> bool:
     return bool(starts) and any(len(t) == len(entry[0]) for t in starts) and tuple(entry[0]) in starts
 
 
+CHECKPOINTS = 4          # system-block checkpoints kept beside ``keep`` (oldest dropped past it)
+
+
+def _checkpoints(owner) -> set:
+    """The ids of kept system-block checkpoints (``remember(checkpoint=True)``), as tuples; created on first use."""
+
+    got = getattr(owner, "checkpoints", None)
+    if got is None:
+        got = owner.checkpoints = set()
+    return got
+
+
+def _is_checkpoint(owner, entry) -> bool:
+    cps = getattr(owner, "checkpoints", None)
+    return bool(cps) and tuple(entry[0]) in cps
+
+
 def _touch(owner, entry) -> None:
     """A resumed message-start state becomes the newest, so a shared system block outlives the conversations
     that fork from it. Prompt ends keep their place: a resend must not age the ends nobody has resent yet."""
 
     if _is_start(owner, entry):
         owner.kept = [k for k in owner.kept if k is not entry] + [entry]
-        _note(owner, entry[0])
+        if not _is_checkpoint(owner, entry):             # a checkpoint is part of a block, not a block to record
+            _note(owner, entry[0])
 
 
 def _note(owner, ids) -> None:
@@ -56,7 +74,7 @@ def _victim(owner) -> int:
     states (the shared system block) go last; every prompt's own newest end outlasts the ends it superseded."""
 
     kept = owner.kept
-    older = [(i, k, _is_start(owner, k)) for i, k in enumerate(kept[:-1])]
+    older = [(i, k, _is_start(owner, k)) for i, k in enumerate(kept[:-1]) if not _is_checkpoint(owner, k)]
     for rule in (lambda k, start: not start and _middle(kept, k),
                  lambda k, start: not start and _longer(kept, k),
                  lambda k, start: not start,
@@ -131,18 +149,32 @@ def slot_for(owner, prompt: list[int], reuse: bool):
     return owner.free.pop(), None, 0
 
 
-def remember(owner, ids, st, snap, tail, start: bool = False) -> None:
+def remember(owner, ids, st, snap, tail, start: bool = False, checkpoint: bool = False) -> None:
     """Keep each slot's prefix chain, returning displaced idle slots to the free list. ``start``: a message-start
-    state (the end of a shared system block), which eviction keeps longest."""
+    state (the end of a shared system block), which eviction keeps longest. ``checkpoint`` (a start too): a
+    system-block checkpoint (markers ``checkpoint``) a block that differs near its end resumes from; at most
+    ``CHECKPOINTS`` are kept beside ``keep`` (they never count against it, and are never recorded as warm starts)."""
 
     starts = _starts(owner)
+    cps = _checkpoints(owner)
+    if checkpoint:
+        cps.add(tuple(ids))
+        start = True
+    else:
+        cps.discard(tuple(ids))
     if start:
         starts.add(tuple(ids))
-        _note(owner, ids)
+        if not checkpoint:
+            _note(owner, ids)
     gone = [k[1] for k in owner.kept if k[0] == ids]
     owner.kept = [k for k in owner.kept if k[0] != ids] + [(ids, st, snap, tail)]
-    while len(owner.kept) > owner.keep:
+    while sum(not _is_checkpoint(owner, k) for k in owner.kept) > owner.keep:
         gone.append(owner.kept.pop(_victim(owner))[1])
+    held = [i for i, k in enumerate(owner.kept) if _is_checkpoint(owner, k)]
+    for i in reversed(held[:max(0, len(held) - CHECKPOINTS)]):     # the oldest checkpoints past the limit
+        gone.append(owner.kept.pop(i)[1])
+    if cps:
+        owner.checkpoints = {t for t in cps if any(tuple(k[0]) == t for k in owner.kept)}
     if starts:
         lengths = {len(k[0]) for k in owner.kept}
         owner.starts = {t for t in starts if len(t) in lengths and any(len(k[0]) == len(t) and tuple(k[0]) == t
