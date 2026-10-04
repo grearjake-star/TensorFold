@@ -138,3 +138,24 @@ def test_a_relocated_kept_end_takes_only_its_rows(decoder):
     slot.resize(65536)
     spare = dec.free[0]
     assert dec._relocate_kept(slot, None) and spare.copied == [("rows", 2999)] and spare.capacity == 8192
+
+
+def test_a_failed_hand_over_returns_the_popped_slot(decoder):
+    """AUDIT: the hand-over's copy can raise past the gate (a CUDA OOM in resize); the slot slot_for popped for the
+    fresh prompt must go back to the free list (it leaked: neither free, kept nor busy, a --parallel slot lost)."""
+
+    dec = decoder(2)
+    slot = dec.solo.st
+    _request(dec, _text(1, 3000))                     # the graph slot keeps the first conversation's end
+    other = next(st for st in dec.slots if st is not slot)
+    assert other in dec.free and any(k[1] is slot for k in dec.kept)
+
+    def oom(rows):
+        raise RuntimeError("CUDA out of memory (simulated)")
+
+    other.resize = oom
+    with pytest.raises(RuntimeError, match="out of memory"):
+        dec._slot_for(_text(2, 9000), True)           # a fresh prompt: the kept end would move into ``other``
+    del other.resize                                  # (the shrink back to FIRST rows may allocate again)
+    assert other in dec.free                          # not leaked
+    assert all(k[1] is slot for k in dec.kept)        # the kept end stays where its rows are

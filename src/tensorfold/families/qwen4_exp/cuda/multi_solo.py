@@ -160,7 +160,13 @@ class Alone:
         if any(f is slot for f in self.free):
             self.free = [f for f in self.free if f is not slot] + [st]
             return slot
-        return slot if self._hand_over(st) else st
+        try:
+            took = self._hand_over(st)
+        except Exception:                        # a failed copy or resize (CUDA OOM past the gate's estimate): the
+            self.free.append(st)                 # slot slot_for popped goes back, as slot_for's own fork path does;
+            self._shrink(st, force=True)         # the graph slot's kept ends never moved
+            raise
+        return slot if took else st
 
     def _move_to_solo(self, s) -> None:
         """Copy a lone stream into the graph slot after committing its pending rows and matching cache sizes."""
