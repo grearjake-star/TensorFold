@@ -405,12 +405,21 @@ def candidates(w: Weights, b: Buffers, logits: torch.Tensor, R: int, *, id_map: 
 
 
 STAGE_AHEAD = "TF_FLASH_STAGE_AHEAD"
+STAGE_BATCH = "TF_STAGE_BATCH"
 
 
 def stage_ahead() -> bool:
     """Whether ``stage`` reads the n-gram rows before its wait (TF_FLASH_STAGE_AHEAD=0: after it, as before)."""
 
     return os.environ.get(STAGE_AHEAD, "1").strip().lower() not in ("0", "off", "false", "no")
+
+
+def stage_batch() -> bool:
+    """Whether an EXL3 pack's ``stage`` reads every window's n-gram rows of a layer in one gather, one host write and
+    one copy (TF_STAGE_BATCH=0: one of each per window, as before). The windows' staging rows are contiguous in
+    window order, so both write the same bytes to the same rows."""
+
+    return os.environ.get(STAGE_BATCH, "1").strip().lower() not in ("0", "off", "false", "no")
 
 
 def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]) -> list[Seg]:
@@ -426,14 +435,20 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
     if R > b.rows:
         raise ValueError(f"window of {R} rows, buffers hold {b.rows}")
     lookups = []                         # (layer's PLE, row ids [rows, heads], first staging row)
+    batch = w.x3 is not None and len(windows) > 1 and stage_batch()
     for layer in w.layers:
         if layer.ple is not None:
             p = layer.ple
+            per = []
             for (st, tokens), (_, a0, _) in zip(windows, segs):
                 toks = np.asarray(tokens, dtype=np.int64)
                 ids = p.ngram.ids(st.ple_history, toks)
                 st.ple_last = (st.ple_history, toks)
-                lookups.append((p, ids, a0 * (ids.size // len(toks))))
+                per.append((p, ids, a0 * (ids.size // len(toks))))
+            if batch:                    # window k's rows start where window k-1's end: one lookup from the first row
+                lookups.append((p, np.concatenate([ids.reshape(-1) for _, ids, _ in per]), per[0][2]))
+            else:
+                lookups.extend(per)
     # the table reads before the wait, which ends once the GPU has run the previous step: their faults overlap it
     ahead = [p.table.gather(ids) for p, ids, _ in lookups] if w.x3 is None and stage_ahead() else None
     b.staged.synchronize()               # the previous step's copies out of the pinned buffers are done
