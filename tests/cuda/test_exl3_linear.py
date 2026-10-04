@@ -156,3 +156,30 @@ def test_split_k_without_bias_agrees_with_zero_bias_and_preserves_rows(codebook,
         assert torch.equal(expected.view(torch.int32), got_bias.view(torch.int32))
         alone = torch.cat([plain(row[None], out_dtype=torch.float32) for row in x[:rows]])
         assert torch.equal(out.view(torch.int32), alone.view(torch.int32))
+
+
+MODES = (0, 6, 7)               # linear.tall_mode(): linear_kernel at every row count; the mid-M kernels; linear_wc
+# (bits, K, N, split): ashhart/TensorFold#260's shapes (the 27B's projections with its loader's splits, a split layer of
+# 32+ column blocks, others) and Flash Next 4.05's (6-bit, one split / folded splits / Z splits; 4-bit indexer)
+MODE_SHAPES = [(4, 17408, 5120, (1, 8)), (4, 5120, 10240, (5, 4)), (4, 5120, 6144, (5, 2)), (4, 6144, 5120, (16, 2)),
+               (3, 17408, 5120, (4, 2)), (6, 5120, 4096, (5, 2)), (6, 1024, 2048, (1, 8)), (2, 2048, 1024, (2, 4)),
+               (6, 2560, 10240, (1, 8)), (6, 2560, 6144, (4, 4)), (6, 6144, 2560, (8, 4)), (4, 2560, 640, (4, 4))]
+
+
+@pytest.mark.parametrize("bits,k,n,split", MODE_SHAPES, ids=lambda v: str(v))
+@pytest.mark.parametrize("codebook", ["mul1", "3inst"])
+def test_every_kernel_mode_gives_linear_kernels_bits(codebook, bits, k, n, split):
+    """Rows 1..128: each mode's output equals linear_kernel's bit for bit (with a bias too), and a row alone equals it."""
+
+    trellis, suh, svh = _tensors(codebook, bits, kt=k // 16, nt=n // 16, seed=k + n)
+    bias = torch.linspace(-0.125, 0.125, n, dtype=torch.float16)
+    x = torch.randn((128, k), device="cuda").half()
+    for b in (None, bias):
+        layer = linear.Exl3Linear.from_tensors(trellis, suh, svh, codebook, bias=b)
+        layer.split = split
+        ref = layer(x, mode=0)
+        for mode in MODES[1:]:
+            for m in range(1, 129):
+                assert torch.equal(layer(x[:m], mode=mode), ref[:m]), f"mode {mode}, {m} rows, bias {b is not None}"
+            for r in (0, 17, 127):
+                assert torch.equal(layer(x[r:r + 1], mode=mode), ref[r:r + 1]), f"mode {mode}, row {r} alone"

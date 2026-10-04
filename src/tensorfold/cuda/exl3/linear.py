@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -13,12 +14,51 @@ from . import format as fmt
 CODEBOOK_IDS = {"3inst": 0, "mcg": 1, "mul1": 2}
 
 
+def tall_mode() -> int:
+    """The kernel for 17-128 rows (1-16 rows always take ``linear_kernel``); every mode gives linear_kernel's bits.
+
+    7 (default): ``linear_wc`` (linear_wc.cuh) for 4- and 6-bit mul1 layers, else 6, the mid-M kernels (each k step's
+    tiles decoded once for 16 or 32 rows); 0: ``linear_kernel`` at every row count, re-decoding each tile per 16 rows.
+    TF_EXL3_TALL=0 turns both off, TF_EXL3_TALL=midm stops at the mid-M kernels; upstream's TENSORFOLD_EXL3_MIDM=0 and
+    TENSORFOLD_EXL3_WC=0 (ashhart/TensorFold#260) are honoured the same way.
+    """
+
+    tall = os.environ.get("TF_EXL3_TALL", "1").strip().lower()
+    if tall in ("0", "off", "false", "no") or os.environ.get("TENSORFOLD_EXL3_MIDM", "1") == "0":
+        return 0
+    if tall in ("midm", "6") or os.environ.get("TENSORFOLD_EXL3_WC", "1") == "0":
+        return 6
+    return 7
+
+
+MODE = tall_mode()
+
+
+def tall_kernel(bits: float, codebook: str, m: int, k: int, n: int, split: tuple[int, int], mode: int | None = None) -> str:
+    """Which kernel ``linear.cu`` runs for one call (a mirror of exl3_linear_cuda's and dispatch_wc's choice)."""
+
+    mode = MODE if mode is None else mode
+    sk, wk = split
+    if m <= 16 or mode == 0:
+        return "linear_kernel"
+    k2 = k2_of(bits)
+    if mode >= 7 and codebook == "mul1" and k2 in (8, 12):
+        per_warp = k // 16 // sk // wk
+        nb = n // 128
+        fold = sk > 1 and nb >= 32
+        if per_warp % 2 == 0 and m <= 128 and not (not fold and k2 == 8 and 32 < m <= 40):
+            mt2 = m <= 32 or 64 < m <= 96 or (fold and m > 96 and nb >= 64)
+            ks = 4 if per_warp % 4 == 0 and not (k2 == 12 and m > 96) else 2
+            return f"linear_wc<MT={2 if mt2 else 4},KS={ks}{',fold' if fold else ''}>"
+    return f"linear_mpg<P={2 if m > 48 else 1}>"
+
+
 @lru_cache(maxsize=1)
 def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_exl3_linear_v3", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
+    return load(name="tensorfold_exl3_linear_v4", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
                 extra_include_paths=[str(here)], extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
                 verbose=False)
 
@@ -163,8 +203,10 @@ class Exl3Linear:
         return c
 
     def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None, out_dtype: torch.dtype | None = None,
-                 xh: torch.Tensor | None = None, z: torch.Tensor | None = None) -> torch.Tensor:
-        """y [M, N] = x [M, K] @ W + bias for M = 1..128; scratch ``xh`` fp16 [M, K] and ``z`` fp32 (SK > 1) allocated when not given."""
+                 xh: torch.Tensor | None = None, z: torch.Tensor | None = None, mode: int | None = None) -> torch.Tensor:
+        """y [M, N] = x [M, K] @ W + bias for M = 1..128; scratch ``xh`` fp16 [M, K] and ``z`` fp32 (SK > 1) allocated when not given.
+
+        ``mode``: the 17-128-row kernel (``tall_mode()``), the module's ``MODE`` when None; the bits never depend on it."""
 
         if x.dim() != 2 or x.shape[1] != self.k or not 1 <= x.shape[0] <= 128:
             raise ValueError(f"x must be [1..128, {self.k}], got {tuple(x.shape)}")
@@ -181,7 +223,7 @@ class Exl3Linear:
         ext = _ext()
         ext.rot_in(x, self.suh, xh)
         ext.linear(xh, self.words, sk_stride, nb_stride, self.svh, self.bias, out, z if sk > 1 else None,
-                   self.counters, self.k2, CODEBOOK_IDS[self.codebook], sk, wk)
+                   self.counters, self.k2, CODEBOOK_IDS[self.codebook], sk, wk, MODE if mode is None else mode)
         return out
 
     def unpack(self, out: torch.Tensor | None = None) -> torch.Tensor:
