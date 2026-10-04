@@ -409,6 +409,9 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             if self.w.comm is None:
                 self._move_to_solo(s) if s.st is not self.solo.st else self._flush(s)
             return failed + ended + self._solo_round(s)
+        times = getattr(self.rounds, "host", None)        # S1-HOST: host stretches the GPU waits for (done line)
+        if times is not None:
+            times.start()
         t0 = time.perf_counter()
         windows = [(s.st, [s.out[-1]] + list(s.drafts)) for s in live]
         segs = stage(self.w, self.buf, windows)
@@ -449,6 +452,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                 heads = heads[:len(pends)].clone() if pends else None
                 candidates = self._prompt_candidates(len(pends))
             elif graphed:
+                if times is not None:
+                    times.launched(("main", n, rows, tables.cur, ctx) in self.rounds.graphs)
                 logits = self.rounds.run(("main", n, rows, tables.cur, ctx),
                                          lambda: compute(self.w, segs, self.buf))
             else:
@@ -535,8 +540,11 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         elif self.cost > 0:
             bars = cost_bars(self.cost, self.depth, self.timing)
         chain = {s.sid: 1.0 for s, _, _ in todo}
+        times = getattr(self.rounds, "host", None)
         for j in range(self.depth):
             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
+            if times is not None:
+                times.picked()
             nxt = []
             for (s, prev), (d, p) in zip(active, picks):
                 chain[s.sid] *= p
@@ -590,8 +598,12 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             self.mbuf.attn_step = attn_multi.Step(self.w, segs, mtp=True, out=self.rounds.attn_out(True, n, rows),
                                                   bucket=ctx)
             try:
-                return self.rounds.run(("mtp", n, rows, ctx) + heads.launch_key(segs),
-                                       lambda: mtp_compute(self.w, segs, self.mbuf))
+                key = ("mtp", n, rows, ctx) + heads.launch_key(segs)
+                hit = key in self.rounds.graphs
+                got = self.rounds.run(key, lambda: mtp_compute(self.w, segs, self.mbuf))
+                if getattr(self.rounds, "host", None) is not None:
+                    self.rounds.host.mtp_launched(hit)
+                return got
             finally:
                 self.mbuf.attn_step = None
         self.mbuf.attn_step = attn_multi.Step(self.w, segs, mtp=True)

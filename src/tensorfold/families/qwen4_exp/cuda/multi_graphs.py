@@ -19,9 +19,11 @@ import gc
 import os
 from collections import OrderedDict
 
+import numpy as np
 import torch
 
 from .attn_multi import PTRS
+from .hostprep import Times
 
 LIMIT = int(os.environ.get("TF_MULTI_GRAPHS_MAX", "160"))       # graphs kept (main + MTP), least recently used out
 AFTER = int(os.environ.get("TF_MULTI_GRAPHS_AFTER", "2"))       # the sighting of a key that captures it
@@ -37,15 +39,22 @@ def fold(w, sc, states, held) -> None:
         return
     from tensorfold.cuda.kernels import gdn
 
-    parity = 1 - sc.parity
-    k, v, g, beta = [[getattr(sc, name)[parity, li] for li in range(sc.lin)] for name in ("k", "v", "g", "beta")]
-    ptrs = gdn.replay_table(k, v, g, beta, [[st.rec[st.cur[li], li] for li in range(sc.lin)] for st, _ in todo])
+    from . import hostprep
+
+    ptrs = hostprep.fold_ptrs(sc, [st for st, _ in todo])
     width = max(len(rows) for _, rows in todo)
     kept = [r for _, rows in todo for r in list(rows) + [0] * (width - len(rows))]
-    table = gdn.to_device(ptrs, torch.int64, w.device)
-    rows_dev = gdn.to_device(kept, torch.int32, w.device).view(len(todo), width)
-    counts = gdn.to_device([len(rows) for _, rows in todo], torch.int32, w.device)
-    gdn.replay(table, sc.lin, len(todo), rows_dev, counts, k[0], v[0], in_place=True)
+    k0, v0 = sc.k[1 - sc.parity, 0], sc.v[1 - sc.parity, 0]
+    if hostprep.ON:                              # one int32 table (rows then counts) and the pointers, pinned twice
+        table = hostprep.put(ptrs, torch.int64, w.device, None, "fold_i64")
+        ints = hostprep.put(np.asarray(kept + [len(rows) for _, rows in todo], dtype=np.int32), torch.int32, w.device,
+                            None, "fold_i32")
+        rows_dev, counts = ints[:len(kept)].view(len(todo), width), ints[len(kept):]
+    else:
+        table = gdn.to_device(ptrs, torch.int64, w.device)
+        rows_dev = gdn.to_device(kept, torch.int32, w.device).view(len(todo), width)
+        counts = gdn.to_device([len(rows) for _, rows in todo], torch.int32, w.device)
+    gdn.replay(table, sc.lin, len(todo), rows_dev, counts, k0, v0, in_place=True)
 
 
 def bucket(end: int) -> int:
@@ -64,6 +73,7 @@ class RoundGraphs:
         self.tables: dict[tuple, dict] = {}
         self.attn_layers = sum(1 for layer in w.layers if not layer.linear)
         self.lin = sum(1 for layer in w.layers if layer.linear)
+        self.host = Times()                      # S1-HOST: host ms the GPU waits for in replayed rounds
         self.captures = self.replays = self.eager = self.dropped = 0
         self.kinds: dict[str, list[int]] = {}    # key[0] ("main" / "mtp") -> [replays, eager, captures, dropped]
 
@@ -142,4 +152,6 @@ class RoundGraphs:
         capture, not a replay), and the graphs kept."""
 
         parts = [f"{k}={'/'.join(str(n) for n in v)}" for k, v in sorted(self.kinds.items())]
-        return " ".join(parts + [f"kept={len(self.graphs)}"])
+        host = getattr(self, "host", None)
+        host = [host.summary()] if host is not None and host.rounds else []
+        return " ".join(parts + [f"kept={len(self.graphs)}"] + host)

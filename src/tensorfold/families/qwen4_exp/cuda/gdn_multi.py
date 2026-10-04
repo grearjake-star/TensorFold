@@ -9,7 +9,7 @@ import torch
 
 from tensorfold.cuda.kernels import gdn as shared
 
-from . import gdn_io
+from . import gdn_io, hostprep
 from .attn_multi import _put
 from .gdn import DK, DV
 
@@ -36,29 +36,24 @@ class Tables:
         """``out``/``width``: a graph round's persistent tables (multi_graphs), pending rows padded to ``width``."""
         n, rows = len(segs), segs[-1][2]
         lin = scratch.lin
-        taps = np.arange(4)[None, :]
-        win = np.empty((rows, 4), dtype=np.int32)
-        sid = np.empty((rows,), dtype=np.int32)
-        for s, (_, a0, a1) in enumerate(segs):
-            j = np.arange(a1 - a0)[:, None] + taps
-            win[a0:a1] = np.where(j < 3, j, a0 + j)            # < 3: a conv state row, else window row tap - 3
-            sid[a0:a1] = s
-        entries, starts, slots, most = shared.plan_host([list(range(-1, a1 - a0 - 1)) for _, a0, a1 in segs])
+        sid, win = hostprep.gdn_rows(segs)                     # win < 3: a conv state row, else window row tap - 3
+        plan = hostprep.plan_host([a1 - a0 for _, a0, a1 in segs])
+        if hostprep.ON:
+            plan_ints, slots, most = plan
+        else:
+            entries, starts, slots, most = plan
+            plan_ints = np.asarray(entries + starts, dtype=np.int32)
         width = width or max([len(rows_) for rows_ in pending] + [1])
         held = np.zeros((n, width), dtype=np.int32)             # each stream's last-round kept rows, not yet folded
         for s, rows_ in enumerate(pending):
             held[s, :len(rows_)] = rows_
         counts = np.asarray([len(rows_) for rows_ in pending], dtype=np.int32)
-        ints = np.concatenate([sid, win.ravel(), np.asarray(entries + starts, dtype=np.int32), held.ravel(), counts])
-        ptrs = np.empty((2, lin, n), dtype=np.int64)
-        for s, (st, _, _) in enumerate(segs):
-            for li in range(lin):
-                ptrs[0, li, s] = st.conv[li].data_ptr()
-                ptrs[1, li, s] = st.rec[st.cur[li], li].data_ptr()
+        ints = np.concatenate([sid, win.ravel(), plan_ints, held.ravel(), counts])
+        ptrs = hostprep.gdn_ptrs(segs, lin)
         dev = w.device
         out = out or {}
-        i32 = _put(ints.tolist(), torch.int32, dev, out.get("i32"))
-        i64 = _put(ptrs.ravel().tolist(), torch.int64, dev, out.get("i64"))
+        i32 = _put(ints, torch.int32, dev, out.get("i32"), "gdn_i32")
+        i64 = _put(ptrs.ravel(), torch.int64, dev, out.get("i64"), "gdn_i64")
         self.sid, self.win = i32[:rows], i32[rows:5 * rows].view(rows, 4)
         at = 8 * rows + n + 1
         self.plan = shared.Plan(i32[5 * rows:8 * rows].view(rows, 3), i32[8 * rows:at], slots, most)

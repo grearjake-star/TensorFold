@@ -12,7 +12,7 @@ import triton.language as tl
 
 from tensorfold.cuda.kernels import gdn as shared
 
-from . import attention as attn_mod, glue
+from . import attention as attn_mod, glue, hostprep
 from .attention import CHUNK, SELECT_REGS, _chunk, _merge_row, _pool_block, _radix_place
 
 PTRS = 6                 # a stream's pointers a layer: keys, values, key scales, value scales, index keys, pooled
@@ -181,9 +181,14 @@ def _qsa_multi(b, sc, step: "Step", cp, rows: int, context: int) -> None:
                                  IDW=sc.idw, TB=tb, num_warps=warps)
 
 
-def _put(values, dtype, dev, out: torch.Tensor | None) -> torch.Tensor:
-    """A table on the device: a new tensor (eager rounds), or written into ``out`` (a graph's persistent table)."""
+def _put(values, dtype, dev, out: torch.Tensor | None, site: str = "") -> torch.Tensor:
+    """A table on the device: a new tensor (eager rounds), or written into ``out`` (a graph's persistent table).
+    ``values``: a list or an array; TF_MULTI_HOST_AHEAD: from ``site``'s double-buffered pinned buffers (hostprep)."""
 
+    if hostprep.ON and site:
+        return hostprep.put(values, dtype, dev, out, site)
+    if isinstance(values, np.ndarray):
+        values = values.tolist()
     if out is None:
         return shared.to_device(values, dtype, dev)
     out.copy_(torch.tensor(values, dtype=dtype).pin_memory(), non_blocking=True)
@@ -203,25 +208,18 @@ class Step:
             posr[a0:a1] = p0 + np.arange(a1 - a0)
             sid[a0:a1] = s
         counts = [a1 - a0 for _, a0, a1 in segs]
-        ptrs = np.empty((len(layers), PTRS, n), np.int64)
-        for s, (st, _, _) in enumerate(segs):
-            for i, layer in enumerate(layers):
-                if mtp:
-                    kc, ikc, pooled = st.mtp_kc, st.mtp_ikc, st.mtp_pooled
-                else:
-                    a = st.att_index[layer.index]
-                    kc, ikc, pooled = st.kc[a], st.ikc[a], st.pooled[a]
-                ptrs[i, :, s] = [kc.k.data_ptr(), kc.v.data_ptr(), kc.ks.data_ptr(), kc.vs.data_ptr(),
-                                 ikc.data_ptr(), pooled.data_ptr()]
+        ptrs = hostprep.attn_ptrs(segs, layers, mtp, PTRS)
         dev = w.device
         # ``out``: a graph round's persistent tables (multi_graphs), whose launches are bounded by ``bucket`` keys
         out = out or {}
         self.bucket = bucket
-        ints = _put(np.concatenate([posr, sid, first, counts]).tolist(), torch.int32, dev, out.get("ints"))
+        site = "mtp" if mtp else "main"
+        ints = _put(np.concatenate([posr, sid, first, counts]), torch.int32, dev, out.get("ints"), site + "_ints")
         self.posr, self.sid = ints[:rows], ints[rows:2 * rows]
         self.first, self.counts = ints[2 * rows:2 * rows + n], ints[2 * rows + n:]
-        self.ptrs = _put(ptrs.ravel().tolist(), torch.int64, dev, out.get("ptrs")).view(len(layers), PTRS * n)
-        self.tails = (_put([st.ple_tail.data_ptr() for st, _, _ in segs], torch.int64, dev, out.get("tails"))
+        self.ptrs = _put(ptrs.ravel(), torch.int64, dev, out.get("ptrs"), site + "_ptrs").view(len(layers), PTRS * n)
+        self.tails = (_put([st.ple_tail.data_ptr() for st, _, _ in segs], torch.int64, dev, out.get("tails"),
+                           site + "_tails")
                       if bucket is not None else None)       # each stream's n-gram conv tail (forward.ple_block)
         self.n, self.rows, self.segs = n, rows, list(segs)
         self.ends = [p0 + c for p0, c in zip(first, counts)]
