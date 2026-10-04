@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 
 import torch
@@ -17,8 +18,9 @@ from .state import CAND, ENDS
 from .multi_tp import OutOfStep
 from .prompt_plan import pass_limit
 
-PASS_MIN = 512
-FIRST_PASS = 256                 # a round's first pass beside decoding streams, before a row's time is known
+PASS_MIN = int(os.environ.get("TF_PASS_MIN", "512") or 512)            # house: env-tunable (R-PREFILL P-B)
+FIRST_PASS = int(os.environ.get("TF_FIRST_PASS", "256") or 256)  # a round's first pass beside decoding streams, before a
+#                                                                  row's time is known
 FILL_GUARD = 8
 AHEAD_ROWS = 4096                # n-gram pages asked for this many prompt rows past each pass (two idle passes)
 

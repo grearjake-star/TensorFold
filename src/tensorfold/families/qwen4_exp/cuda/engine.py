@@ -14,7 +14,8 @@ from . import CONFIDENCE, COST, DEPTH
 
 MAX_DEPTH = 15           # a verify window of at most 16 rows
 KEEP_SERIAL = 4          # prompt states the serial engine keeps (they share its attention rows)
-KEEP = 8                 # prompt states (one token before each end) a concurrent decoder keeps to resume from
+KEEP = int(os.environ.get("TF_KEEP", "8") or 8)   # prompt states (one token before each end) a concurrent decoder
+#  keeps to resume from; house: TF_KEEP (upstream #302 --checkpoint-slots) raises it for more slots
 # Reserve bounded tower workspace separately from its weights; override for measured deployments.
 VISION_WORKSPACE = 4 * 2**30
 
