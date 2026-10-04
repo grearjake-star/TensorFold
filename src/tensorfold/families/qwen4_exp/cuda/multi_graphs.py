@@ -65,6 +65,7 @@ class RoundGraphs:
         self.attn_layers = sum(1 for layer in w.layers if not layer.linear)
         self.lin = sum(1 for layer in w.layers if layer.linear)
         self.captures = self.replays = self.eager = self.dropped = 0
+        self.kinds: dict[str, list[int]] = {}    # key[0] ("main" / "mtp") -> [replays, eager, captures, dropped]
 
     def attn_out(self, mtp: bool, n: int, rows: int) -> dict:
         """Persistent attn_multi.Step tables for windows of ``n`` streams and ``rows`` rows."""
@@ -110,23 +111,35 @@ class RoundGraphs:
     def run(self, key: tuple, fn):
         """``fn``'s result for this round: its graph replayed, or ``fn`` eagerly until the key is captured."""
 
+        count = self.kinds.setdefault(str(key[0]), [0, 0, 0, 0])
         hit = self.graphs.get(key)
         if hit is not None:
             self.graphs.move_to_end(key)
             hit[0].replay()
             self.replays += 1
+            count[0] += 1
             return hit[1]
         seen = self.seen[key] = self.seen.get(key, 0) + 1
         if seen < self.after:
             self.eager += 1
+            count[1] += 1
             return fn()
         if seen == 1:
             fn()                                 # compiles its launches; a graph round's forward is idempotent
         while len(self.graphs) >= self.limit:
-            self.graphs.popitem(last=False)
+            old, _ = self.graphs.popitem(last=False)
             self.dropped += 1
+            self.kinds.setdefault(str(old[0]), [0, 0, 0, 0])[3] += 1
         g, out = self._capture(fn)              # capture runs nothing: the replay is this round's forward
+        count[2] += 1                            # a capture round: its replay is not counted as a replay
         self.graphs[key] = (g, out)
         g.replay()
         self.replays += 1
         return out
+
+    def summary(self) -> str:
+        """Cumulative counts since start, per kind: ``main=replays/eager/captures/dropped`` (a capture round is one
+        capture, not a replay), and the graphs kept."""
+
+        parts = [f"{k}={'/'.join(str(n) for n in v)}" for k, v in sorted(self.kinds.items())]
+        return " ".join(parts + [f"kept={len(self.graphs)}"])

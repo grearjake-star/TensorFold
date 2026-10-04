@@ -566,7 +566,9 @@ class App:
         warning = unanswered(finish, chat and thinking, content, calls)
         if warning:
             print(warning, flush=True)
-        print_done(len(prompt), (cached or [0])[0], thinking, out, finish, stats, request)
+        rounds = getattr(getattr(getattr(self.engine, "scheduler", None), "decoder", None), "rounds", None)
+        print_done(len(prompt), (cached or [0])[0], thinking, out, finish, stats, request,
+                   graphs=rounds.summary() if hasattr(rounds, "summary") else None)
         if body.get("return_token_ids"):              # the reply's ids in the "tensorfold" block, for exactness checks
             stats = {**(stats or {}), "token_ids": [int(t) for t in out]}
         logprobs = (self._probability_decoder.format(probabilities.emitted(out), ends)
@@ -634,8 +636,9 @@ def token_sha(tokens: list[int]) -> str:
 
 
 def print_done(prompt: int, cached: int, thinking: bool, out: list[int], finish: str, stats: dict[str, Any],
-               request: Any) -> None:
-    """The Mac server's ``done`` line for a finished reply; tok/s runs from the first token to the last."""
+               request: Any, graphs: str | None = None) -> None:
+    """The Mac server's ``done`` line for a finished reply; tok/s runs from the first token to the last. ``graphs``:
+    the --parallel round graphs' cumulative counts (multi_graphs.RoundGraphs.summary), appended when given."""
 
     ended = time.perf_counter()
     first, started = getattr(request, "first", None), getattr(request, "started", ended)
@@ -644,8 +647,8 @@ def print_done(prompt: int, cached: int, thinking: bool, out: list[int], finish:
     print(f"[tensorfold] done req-{uuid.uuid4().hex[:12]} prompt={prompt} cached={cached} thinking={thinking} "
           f"tokens={len(out)} sha={token_sha(out)} finish={finish} tok/s={rate:.1f} "
           f"ttft={(first - started) if first is not None else -1:.2f}s prefill={stats.get('prefill_s', -1):.2f}s "
-          f"rounds={stats.get('rounds', 0)} accepted={stats.get('accepted', 0)}/{stats.get('drafted', 0)}",
-          flush=True)
+          f"rounds={stats.get('rounds', 0)} accepted={stats.get('accepted', 0)}/{stats.get('drafted', 0)}"
+          + (f" graphs {graphs}" if graphs else ""), flush=True)
 
 
 from tensorfold.cuda.http import Server, make_handler, serve, usage_of  # noqa: E402,F401  (the HTTP side)
