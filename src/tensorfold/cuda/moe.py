@@ -20,6 +20,12 @@ def _tile(m: int) -> int:
     return 128
 
 
+# S1-ROUTE experiment: TF_ROUTER_BE (default 32) = experts a router program takes for <= 16 rows (decode). 16 doubles
+# the programs on the 2.6 MB read (17 -> 33 for 513 rows); each logit keeps its K order (BK steps, the same MMA
+# shape): kept only if tests/cuda/test_moe_route_fused.py shows the same bits.
+ROUTER_BE = int(__import__("os").environ.get("TF_ROUTER_BE", "32"))
+
+
 @triton.jit
 def _router(X, W, OUT, M, x_stride, D: tl.constexpr, NE: tl.constexpr, BM: tl.constexpr,
             BLOCK_E: tl.constexpr, BK: tl.constexpr):
@@ -47,7 +53,7 @@ def router(x: torch.Tensor, rows: torch.Tensor, out: torch.Tensor | None = None)
         out = torch.empty((m, ne), dtype=torch.float32, device=x.device)
     bm = _tile(m)
     if bm == 16:
-        be, bk, stages = 32, 256, 4
+        be, bk, stages = ROUTER_BE, 256, 4
     else:
         be, bk, stages = 64, 64, 3               # Smaller K tiles keep prefill within shared-memory limits.
     grid = (triton.cdiv(m, bm), triton.cdiv(ne, be))

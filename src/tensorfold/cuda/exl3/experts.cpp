@@ -28,6 +28,10 @@ void exl3x_combine_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64
 void exl3x_down_combine_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, const at::Tensor&,
                              at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
 
+void exl3x_route_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, const at::Tensor&, int64_t, const at::Tensor&,
+                      const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,
+                      int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
                 ": expected a contiguous CUDA tensor of the right dtype");
@@ -204,6 +208,32 @@ void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor&
     exl3x_down_combine_cuda(Z, pick, svh_d, y, wts, out, rows, P, D, SK, slots, E);
 }
 
+// S1-ROUTE: the decode routing chain after the router in one launch (top-k + weights, grouping, rot_in; same bits)
+void route(const at::Tensor& logits, at::Tensor pick, at::Tensor wts, const at::Tensor& x, int64_t x_stride,
+           const at::Tensor& suh0, const at::Tensor& suh1, at::Tensor out0, at::Tensor out1, at::Tensor uids,
+           at::Tensor ucount, at::Tensor members, at::Tensor counter, int64_t R, int64_t K, int64_t slots, int64_t NE,
+           int64_t topk, int64_t E) {
+    check(logits, at::kFloat, "logits");
+    check(pick, at::kInt, "pick");
+    check(wts, at::kFloat, "wts");
+    TORCH_CHECK(x.is_cuda() && (x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kHalf), "x: bf16/fp16 CUDA");
+    check(suh0, at::kHalf, "suh0");
+    check(suh1, at::kHalf, "suh1");
+    check(out0, at::kHalf, "out0");
+    check(out1, at::kHalf, "out1");
+    check(uids, at::kInt, "uids");
+    check(ucount, at::kInt, "ucount");
+    check(members, at::kInt, "members");
+    check(counter, at::kInt, "counter");
+    TORCH_CHECK(logits.dim() == 2 && logits.size(0) >= R && logits.size(1) == NE + 1, "logits: [R, NE + 1]");
+    TORCH_CHECK(pick.numel() >= R * slots && wts.numel() >= R * slots, "pick/wts too small");
+    TORCH_CHECK(uids.numel() >= std::min<int64_t>(R * slots, E), "uids too small");
+    TORCH_CHECK(members.size(0) >= uids.numel() && members.size(1) >= 1, "members too small");
+    c10::cuda::CUDAGuard guard(x.device());
+    exl3x_route_cuda(logits, pick, wts, x, x_stride, suh0, suh1, out0, out1, uids, ucount, members, counter, R, K,
+                     slots, NE, topk, E);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped", &grouped);
     m.def("grouped_items", &grouped_items);
@@ -216,4 +246,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("down_epilogue", &down_epilogue);
     m.def("combine", &combine);
     m.def("down_combine", &down_combine);
+    m.def("route", &route);
 }

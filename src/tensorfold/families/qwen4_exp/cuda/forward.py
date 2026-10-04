@@ -268,12 +268,18 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> tuple:
 def _exl3_moe(m, w: Weights, b: Buffers, R: int) -> tuple:
     """Routed and shared experts on the grouped EXL3 kernel in windows (rows are independent); prompts keep bf16 slots."""
 
-    from tensorfold.cuda.exl3.experts import routed
+    from tensorfold.cuda.exl3.experts import route, route_ok, routed
 
     from .exl3_pack import MOE_WINDOW
 
     buf = b.moe
     moe_mod.router(b.mixed[:R], m.router, buf.logits[:R])
+    if not b.prefill and route_ok(R, b.mixed, m.experts, w.x3.moe, w.cfg.top_k, w.cfg.experts):
+        # S1-ROUTE: top-k, grouping and rot_in in one launch (TF_MOE_ROUTE_FUSED; the same bits)
+        route(buf.logits[:R], b.mixed[:R], buf.pick[:R], buf.wts[:R], m.experts, w.x3.moe, R, w.cfg.top_k,
+              w.cfg.experts)
+        y = routed(b.mixed[:R], buf.pick[:R], None, m.experts, w.x3.moe, None, R, prepped=True)
+        return 2, y.view(R, buf.slots, -1), buf.wts[:R]
     moe_mod.select_rows(buf.logits[:R], buf, w.cfg.top_k, w.cfg.experts)
     if not b.prefill and R <= MOE_WINDOW:
         y = routed(b.mixed[:R], buf.pick[:R], None, m.experts, w.x3.moe, None, R)

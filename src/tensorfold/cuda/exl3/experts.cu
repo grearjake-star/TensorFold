@@ -261,6 +261,184 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
     for (int j = 0; j < 4; ++j) out[(size_t)r * D + n + j] = acc[j];
 }
 
+// ---- S1-ROUTE (TF_MOE_ROUTE_FUSED): tensorfold.cuda.moe._topk_rows + group_kernel + rot_in_kernel in one launch ----
+// Same bits as the three launches: the top-k reproduces the Triton kernel's PTX (max.f32 reductions over the same
+// next_pow2(NE + 1) values padded with -inf, the lowest id among equal maxima, ex = ex2.approx.f32((m - top) * log2e),
+// total = 0 + ex_0 + ex_1 + ... in pick order, w = bf16(div.full.f32(ex, total)), the shared slot NE with weight
+// bf16(div.full.f32(1, ex2.approx.f32((0 - bf16(l_NE)) * log2e) + 1))); rot_in is rot_in_kernel's per-lane arithmetic
+// (written out the same way); the grouping is integers (group_kernel's order: experts by id, members in pair order).
+// Grid (R * slots, K / 512, 2), 128 threads: block (pair p, 4 blocks of 128 of K, gate/up) takes its own pick with
+// k + 1 rounds of a warp top-k and rotates x into xg/xu; the row's slot-0 block (y = z = 0) also writes the row's picks
+// and weights; the last of those R blocks to finish (a counter, reset by it) groups every pick.
+constexpr float ROUTE_LOG2E = 1.44269502162933349609375f;   // 0x3FB8AA3B: Triton's fp32 tl.exp scale
+
+__device__ __forceinline__ float ex2_approx_f32(float x) {
+    float y;
+    asm volatile("ex2.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+__device__ __forceinline__ float div_full_f32(float a, float b) {
+    float y;
+    asm volatile("div.full.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b));
+    return y;
+}
+
+__device__ __forceinline__ float bf16_round(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
+
+// One warp: `rounds` picks of row L (NE logits; NV * 32 = next_pow2(NE + 1) values, the rest -inf). want_idx = the id
+// of round `want`; lane k (< rounds) gets round k's id and ex; total = the sum of the rounds' ex in order.
+template <int NV>
+__device__ __forceinline__ void warp_topk(const float* __restrict__ L, int NE, int rounds, int want, int lane,
+                                          int& want_idx, int& my_id, float& my_ex, float& total) {
+    float v[NV];
+#pragma unroll
+    for (int j = 0; j < NV; ++j) {
+        const int i = lane + 32 * j;
+        v[j] = i < NE ? L[i] : -INFINITY;
+    }
+    float top = v[0];
+#pragma unroll
+    for (int j = 1; j < NV; ++j) top = fmaxf(top, v[j]);
+#pragma unroll
+    for (int o = 16; o; o >>= 1) top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, o));
+    total = 0.f;
+    for (int k = 0; k < rounds; ++k) {
+        float m = v[0];
+#pragma unroll
+        for (int j = 1; j < NV; ++j) m = fmaxf(m, v[j]);
+#pragma unroll
+        for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        int c = NV * 32;
+#pragma unroll
+        for (int j = NV - 1; j >= 0; --j)
+            if (v[j] == m) c = lane + 32 * j;
+#pragma unroll
+        for (int o = 16; o; o >>= 1) c = min(c, __shfl_xor_sync(0xffffffffu, c, o));
+        const float ex = ex2_approx_f32(__fmul_rn(__fsub_rn(m, top), ROUTE_LOG2E));
+        total = __fadd_rn(total, ex);
+        if (lane == k) {
+            my_id = c;
+            my_ex = ex;
+        }
+        if (k == want) want_idx = c;
+#pragma unroll
+        for (int j = 0; j < NV; ++j)
+            if (lane + 32 * j == c) v[j] = -INFINITY;
+    }
+}
+
+// rot_in_kernel's lane arithmetic, the same expressions in the same order.
+template <typename TIN>
+__device__ __forceinline__ void route_rot_lane(const TIN* __restrict__ x, int x_stride, int row, int p, int e, int blk,
+                                               int mat, const half* __restrict__ suh0, const half* __restrict__ suh1,
+                                               half* __restrict__ out0, half* __restrict__ out1, int K, int lane) {
+    const half* suh = (mat ? suh1 : suh0) + (size_t)e * K + blk * 128 + 4 * lane;
+    const TIN* xr = x + (size_t)row * x_stride + blk * 128 + 4 * lane;
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = to_f<TIN>(xr[j]) * __half2float(suh[j]);
+    fwht128(v, lane);
+    half* o = (mat ? out1 : out0) + (size_t)p * K + blk * 128 + 4 * lane;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
+}
+
+constexpr int ROUTE_THREADS = 128;
+constexpr int ROUTE_GPT = 8;                 // experts a thread counts while grouping: E <= 1024
+
+template <typename TIN, int NV>
+__global__ void __launch_bounds__(ROUTE_THREADS) route_kernel(
+    const float* __restrict__ L, int NL, int NE, int topk, int* __restrict__ pick, float* __restrict__ wts,
+    const TIN* __restrict__ x, int x_stride, const half* __restrict__ suh0, const half* __restrict__ suh1,
+    half* __restrict__ out0, half* __restrict__ out1, int K, int slots, int E, int* __restrict__ uids,
+    int* __restrict__ ucount, int* __restrict__ members, int maxm, int R, int* __restrict__ counter) {
+    extern __shared__ int sh_pick[];
+    __shared__ int warp_tot[32];
+    __shared__ int is_last;
+    const int p = blockIdx.x, row = p / slots, k = p % slots;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const bool writer = k == 0 && blockIdx.y == 0 && blockIdx.z == 0;
+    int e = NE;                                              // slot topk: the shared expert
+    if (k < topk) {
+        const bool full = writer && warp == 0;
+        int idx = NV * 32, my_id = 0;
+        float my_ex = 0.f, total = 0.f;
+        warp_topk<NV>(L + (size_t)row * NL, NE, full ? topk : k + 1, k, lane, idx, my_id, my_ex, total);
+        e = idx;
+        if (full) {
+            if (lane < topk) {
+                pick[row * slots + lane] = my_id;
+                wts[row * slots + lane] = bf16_round(div_full_f32(my_ex, total));
+            } else if (lane == topk) {
+                const float sg = bf16_round(L[(size_t)row * NL + NE]);
+                const float den = __fadd_rn(ex2_approx_f32(__fmul_rn(__fsub_rn(0.f, sg), ROUTE_LOG2E)), 1.f);
+                pick[row * slots + lane] = NE;
+                wts[row * slots + lane] = bf16_round(div_full_f32(1.f, den));
+            }
+            __threadfence();
+        }
+    }
+    if (e >= 0 && e < E) route_rot_lane<TIN>(x, x_stride, row, p, e, blockIdx.y * 4 + warp, blockIdx.z, suh0, suh1,
+                                             out0, out1, K, lane);
+    if (!writer) return;
+    __syncthreads();
+    if (threadIdx.x == 0) is_last = atomicAdd(counter, 1) == R - 1;
+    __syncthreads();
+    if (!is_last) return;
+    __threadfence();
+    // group_kernel on 128 threads: the same outputs (integers)
+    const int n = R * slots;
+    for (int i = threadIdx.x; i < n; i += ROUTE_THREADS) sh_pick[i] = __ldcg(pick + i);
+    __syncthreads();
+    const int per = (E + ROUTE_THREADS - 1) / ROUTE_THREADS;
+    int cnt[ROUTE_GPT];
+    int used = 0;
+#pragma unroll
+    for (int q = 0; q < ROUTE_GPT; ++q) {
+        const int ex = threadIdx.x * per + q;
+        int c = 0;
+        if (q < per && ex < E)
+            for (int i = 0; i < n; ++i) c += sh_pick[i] == ex;
+        cnt[q] = c;
+        used += c > 0;
+    }
+    int inc = used;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        int v = __shfl_up_sync(0xffffffffu, inc, o);
+        if (lane >= o) inc += v;
+    }
+    if (lane == 31) warp_tot[warp] = inc;
+    __syncthreads();
+    if (warp == 0) {
+        int v = lane < ROUTE_THREADS / 32 ? warp_tot[lane] : 0;
+        int s = v;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            int y = __shfl_up_sync(0xffffffffu, s, o);
+            if (lane >= o) s += y;
+        }
+        __syncwarp();
+        warp_tot[lane] = s - v;                                   // exclusive per warp
+        if (lane == 31) ucount[0] = s;
+    }
+    __syncthreads();
+    int place = warp_tot[warp] + inc - used;
+#pragma unroll
+    for (int q = 0; q < ROUTE_GPT; ++q) {
+        if (cnt[q] == 0) continue;
+        const int ex = threadIdx.x * per + q;
+        uids[place] = ex;
+        int j = 0;
+        for (int i = 0; i < n && j < maxm; ++i)
+            if (sh_pick[i] == ex) members[place * maxm + j++] = (i / slots) * 32 + (i % slots);
+        for (; j < maxm; ++j) members[place * maxm + j] = -1;
+        ++place;
+    }
+    if (threadIdx.x == 0) *counter = 0;                       // ready for the next launch (stream order)
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -564,5 +742,39 @@ void exl3x_down_combine_cuda(const at::Tensor& Z, const at::Tensor& pick, const 
         Z.data_ptr<float>(), pick.data_ptr<int>(), reinterpret_cast<const half*>(svh_d.data_ptr()),
         y.data_ptr<float>(), wts.data_ptr<float>(), out.data_ptr<float>(), (int)P, (int)D, (int)SK, (int)E,
         (int)slots);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_route_cuda(const at::Tensor& logits, at::Tensor& pick, at::Tensor& wts, const at::Tensor& x, int64_t x_stride,
+                      const at::Tensor& suh0, const at::Tensor& suh1, at::Tensor& out0, at::Tensor& out1,
+                      at::Tensor& uids, at::Tensor& ucount, at::Tensor& members, at::Tensor& counter, int64_t R,
+                      int64_t K, int64_t slots, int64_t NE, int64_t topk, int64_t E) {
+    TORCH_CHECK(slots == topk + 1 && slots <= 32, "route: slots = top_k + 1 <= 32");
+    TORCH_CHECK(E <= ROUTE_THREADS * ROUTE_GPT, "route: too many experts");
+    TORCH_CHECK(NE + 1 <= 1024 && K % 512 == 0, "route: NE + 1 <= 1024 logits and K a multiple of 512");
+    int nb = 1;           // next_pow2(NE + 1), the Triton kernel's BLOCK (only NV * 32 > NE matters: pads are -inf)
+    while (nb < NE + 1) nb <<= 1;
+    dim3 grid((unsigned)(R * slots), (unsigned)(K / 512), 2);
+    const size_t smem = (size_t)R * slots * sizeof(int);
+    TORCH_CHECK(smem <= 32 * 1024, "route: too many rows");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto s0 = reinterpret_cast<const half*>(suh0.data_ptr());
+    auto s1 = reinterpret_cast<const half*>(suh1.data_ptr());
+    auto o0 = reinterpret_cast<half*>(out0.data_ptr());
+    auto o1 = reinterpret_cast<half*>(out1.data_ptr());
+    const int NL = (int)logits.size(1), maxm = (int)members.size(1);
+#define TF_ROUTE_LAUNCH(TIN, NV)                                                                                    \
+    route_kernel<TIN, NV><<<grid, ROUTE_THREADS, smem, stream>>>(                                                  \
+        logits.data_ptr<float>(), NL, (int)NE, (int)topk, pick.data_ptr<int>(), wts.data_ptr<float>(),             \
+        reinterpret_cast<const TIN*>(x.data_ptr()), (int)x_stride, s0, s1, o0, o1, (int)K, (int)slots, (int)E,     \
+        uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(), maxm, (int)R, counter.data_ptr<int>())
+    const bool bf = x.scalar_type() == at::kBFloat16;
+    switch (nb) {
+        case 1024: if (bf) TF_ROUTE_LAUNCH(__nv_bfloat16, 32); else TF_ROUTE_LAUNCH(half, 32); break;
+        case 512: if (bf) TF_ROUTE_LAUNCH(__nv_bfloat16, 16); else TF_ROUTE_LAUNCH(half, 16); break;
+        case 256: if (bf) TF_ROUTE_LAUNCH(__nv_bfloat16, 8); else TF_ROUTE_LAUNCH(half, 8); break;
+        default: if (bf) TF_ROUTE_LAUNCH(__nv_bfloat16, 4); else TF_ROUTE_LAUNCH(half, 4); break;   // nb <= 128
+    }
+#undef TF_ROUTE_LAUNCH
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

@@ -177,6 +177,7 @@ class Scratch:
         maxu = min(P, ex.count)
         self.ids = torch.zeros((maxu,), dtype=torch.int32, device=device)
         self.count = torch.zeros((1,), dtype=torch.int32, device=device)
+        self.route_done = torch.zeros((1,), dtype=torch.int32, device=device)   # route(): rows done (reset by the last)
         self.members_buf = torch.full((maxu * rows,), -1, dtype=torch.int32, device=device)
         self.rows, self.slots, self.count_experts = rows, slots, ex.count
         self.device = device
@@ -238,9 +239,37 @@ def _mode(R: int, group: bool) -> str:
     return "group"
 
 
+# S1-ROUTE: TF_MOE_ROUTE_FUSED=1 (default; 0 off) runs a decode window's top-k (tensorfold.cuda.moe.select_rows), its
+# grouping and rot_in as one launch (``route``) after the router, for windows the grouping kernel takes (rows <=
+# TF_EXL3_PROMPT_ROWS) up to TF_MOE_ROUTE_ROWS rows. The kernel repeats each step's arithmetic in the same order: the
+# same picks, weights, groups and rotated rows, bit for bit (tests/cuda/test_moe_route_fused.py).
+ROUTE_FUSED = _ENV.get("TF_MOE_ROUTE_FUSED", "1").strip() != "0"
+ROUTE_ROWS = int(_ENV.get("TF_MOE_ROUTE_ROWS", "64"))
+
+
+def route_ok(R: int, x: torch.Tensor, ex: Exl3RoutedExperts, s: Scratch, top_k: int, experts: int,
+             fused: bool | None = None) -> bool:
+    """Whether ``route`` takes these R rows (else select_rows + routed's own grouping and rot_in)."""
+
+    fused = ROUTE_FUSED if fused is None else fused
+    return (fused and 0 < R <= ROUTE_ROWS and R <= s.rows and _mode(R, True) == "group" and s.slots == top_k + 1
+            and s.slots <= 32 and experts + 1 <= 1024 and ex.count <= 1024 and ex.dims % 512 == 0
+            and x.dtype in (torch.bfloat16, torch.float16) and hasattr(s, "route_done"))
+
+
+def route(logits: torch.Tensor, x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor, ex: Exl3RoutedExperts,
+          s: Scratch, R: int, top_k: int, experts: int) -> None:
+    """R rows' router logits [R, experts + 1] fp32 -> pick/wts [R, top_k + 1] (select_rows' bits), s's groups (the
+    grouping kernel's) and s.xg/s.xu (rot_in's): then ``routed(..., prepped=True)``. One launch, no host sync."""
+
+    ids, members = s.window(R)
+    _ext().route(logits, pick, wts, x, x.stride(0), ex.suh_g, ex.suh_u, s.xg, s.xu, ids, s.count, members,
+                 s.route_done, R, ex.dims, s.slots, experts, top_k, ex.count)
+
+
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
-           group: bool = True, y_out: torch.Tensor | None = None) -> torch.Tensor:
+           group: bool = True, y_out: torch.Tensor | None = None, prepped: bool = False) -> torch.Tensor:
     """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync.
 
     ``y_out`` ([R * slots, D] bf16, contiguous; prompt windows without ``wts``): Y rounded once to bf16 straight from the
@@ -252,7 +281,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     P = R * slots
     if R > s.rows:
         raise ValueError(f"{R} rows but the scratch holds {s.rows}")
-    mode = _mode(R, group)
+    mode = _mode(R, group and not prepped)       # prepped: route() grouped and rotated already
     if mode in ("items", "prompt"):
         from tensorfold.cuda import experts as grouped
 
@@ -265,7 +294,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         ids, members = s.window(R)
         if mode == "group":
             ext.group(pick, ids, s.count, members, R, slots, E)
-    ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E, mode == "prompt" and ROT_IN4)
+    if not prepped:
+        ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E, mode == "prompt" and ROT_IN4)
     nt, w, sk, pf = s.cfg_gu
     if mode == "prompt":
         ext.prompt(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, plan.items, plan.counts, plan.members,
