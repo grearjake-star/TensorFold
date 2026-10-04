@@ -32,7 +32,7 @@ def test_a_block_with_a_new_tail_resumes_from_the_checkpoint_with_a_fresh_prefil
     monkeypatch.setenv("TF_SYS_CHECKPOINT", "256")
     w = _model()
     g = torch.Generator().manual_seed(5)
-    fixed = torch.randint(1, V - 2, (700,), generator=g).tolist()
+    fixed = torch.randint(1, V - 2, (800,), generator=g).tolist()
     tail_a = torch.randint(1, V - 2, (60,), generator=g).tolist()
     tail_b = torch.randint(1, V - 2, (75,), generator=g).tolist()            # a different "date line"
     user = torch.randint(1, V - 2, (20,), generator=g).tolist()
