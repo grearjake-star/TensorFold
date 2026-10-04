@@ -155,5 +155,84 @@ class PrefixKeepTest(unittest.TestCase):
         self.assertEqual(len(owner.free), 1)
 
 
+def conversation(owner, system, user, turns, step=480, tag=0):
+    """A conversation's turns on ``system``: each resends the last prompt plus ``step`` tokens; returns cached counts."""
+
+    prompt = list(system) + [tag * 100000 + 50000 + i for i in range(user)]
+    cached = []
+    for t in range(turns):
+        cached.append(owner.request(prompt, points=(len(system),)))
+        prompt = prompt + [tag * 100000 + 90000 + t * step + i for i in range(step)]
+    return cached, prompt
+
+
+class PrefixClaimTest(unittest.TestCase):
+    """#315 with the house rules: a fork with no free slot claims the idle slot that loses the fewest kept tokens."""
+
+    def interleaved(self, slots):
+        owner = Owner(slots=slots)
+        other = list(range(500000, 504700))                        # another system block, used first
+        conversation(owner, other, 300, 1, tag=3)
+        prompts, cached = {}, {1: [], 2: []}
+        for t in range(4):
+            for tag, user in ((1, 8000), (2, 12000)):             # each longer than the other block
+                if t == 0:
+                    prompts[tag] = SYSTEM + [tag * 100000 + i for i in range(user)]
+                else:
+                    prompts[tag] = prompts[tag] + [tag * 100000 + 90000 + t * 480 + i for i in range(480)]
+                cached[tag].append((owner.request(prompts[tag], points=(len(SYSTEM),)), len(prompts[tag])))
+        return cached
+
+    def test_two_long_conversations_on_one_system_block_resume_their_own_turns(self):
+        for slots in (2, 4):
+            cached = self.interleaved(slots)
+            for tag in (1, 2):
+                for (c, _), (_, before) in zip(cached[tag][1:], cached[tag]):
+                    self.assertEqual(c, before - 1, (slots, tag))
+
+    def test_a_claim_skips_a_slot_that_keeps_a_system_block(self):
+        owner = Owner(slots=3)
+        conversation(owner, list(range(600000, 600400)), 100, 1, tag=4)    # slot: its system block + a short end
+        conversation(owner, [], 700, 1, tag=5)                             # slot: one end, no system block
+        conversation(owner, SYSTEM, 3000, 2)                               # slot: SYSTEM + a long chain
+        held = {id(k[1]) for k in owner.kept if prefixes._is_start(owner, k)}
+        plain = next(k[1] for k in owner.kept if len(k[0]) == 699)
+        st, _, cached = prefixes.slot_for(owner, SYSTEM + [1, 2, 3], True)
+        self.assertEqual(cached, len(SYSTEM))
+        self.assertIs(st, plain)
+        self.assertNotIn(id(st), held)
+
+    def test_a_refused_claim_keeps_the_victims_chains_in_their_places(self):
+        owner = Owner(slots=2)
+        conversation(owner, list(range(600000, 600400)), 100, 1, tag=4)
+        conversation(owner, SYSTEM, 3000, 2)
+        before = list(owner.kept)
+        owner._grow = lambda st, rows, protect=None: False
+        st, _, cached = prefixes.slot_for(owner, SYSTEM + [1, 2, 3], True)
+        self.assertEqual(cached, len(SYSTEM))
+        self.assertEqual([k for k in owner.kept if k[1] is not st], [k for k in before if k[1] is not st])
+
+    def test_a_fresh_prompt_without_a_free_slot_spares_the_system_blocks_slot(self):
+        owner = Owner(slots=2)
+        conversation(owner, SYSTEM, 300, 1)                                # oldest: SYSTEM's slot
+        conversation(owner, [], 700, 1, tag=5)
+        system_slot = next(k[1] for k in owner.kept if len(k[0]) == len(SYSTEM))
+        st, resume, cached = prefixes.slot_for(owner, [7] * 500, True)
+        self.assertIsNone(resume)
+        self.assertIsNot(st, system_slot)
+        self.assertTrue(any(len(k[0]) == len(SYSTEM) for k in owner.kept))
+
+    def test_a_claimed_fork_records_its_system_block_for_warm_starts(self):
+        noted = []
+        owner = Owner(slots=2)
+        owner.warm_starts = type('W', (), {'note': lambda self, ids: noted.append(len(ids))})()
+        conversation(owner, [], 700, 1, tag=5)
+        conversation(owner, SYSTEM, 3000, 2)
+        noted.clear()
+        st, _, cached = prefixes.slot_for(owner, SYSTEM + [1, 2, 3], True)
+        self.assertEqual((cached, noted), (len(SYSTEM), [len(SYSTEM)]))
+        self.assertTrue(all(k[1] is not st for k in owner.kept))
+
+
 if __name__ == '__main__':
     unittest.main()

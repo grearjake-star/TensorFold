@@ -67,15 +67,35 @@ def _victim(owner) -> int:
     return 0
 
 
+def _claim(owner, best, busy):
+    """The idle slot whose kept chains are shortest, when losing them costs less than resuming in place would (or the
+    source is busy). Among those, a slot keeping no message-start state goes first: a shared system block stays."""
+
+    longest, slots, starts = {}, {}, set()
+    for k in owner.kept:
+        key = id(k[1])
+        longest[key] = max(longest.get(key, 0), len(k[0]))
+        slots[key] = k[1]
+        if _is_start(owner, k):
+            starts.add(key)
+    cut = None if id(best[1]) in busy else longest[id(best[1])] - len(best[0])
+    idle = [(key in starts, n, i, key) for i, (key, n) in enumerate(longest.items())
+            if key not in busy and key != id(best[1]) and (cut is None or n < cut)]
+    return slots[min(idle)[3]] if idle else None
+
+
 def slot_for(owner, prompt: list[int], reuse: bool):
-    """Copy a fork into spare capacity; otherwise retain the released idle-slot and memory-pressure behavior."""
+    """Copy a fork into spare capacity, or into the idle slot that loses the least; otherwise keep the old behavior."""
 
     busy = owner._busy()
     best = _best(owner.kept, prompt) if reuse else None
     fork = best is not None and (id(best[1]) in busy or _longer(owner.kept, best))
     if fork:
-        if owner.free:
-            spare = owner.free.pop()
+        spare, before = (owner.free.pop(), None) if owner.free else (None, None)
+        if spare is None and (victim := _claim(owner, best, busy)) is not None:
+            spare, before = victim, list(owner.kept)
+            owner._drop_kept(victim)
+        if spare is not None:
             try:
                 if owner._grow(spare, len(prompt) + owner.depth + 2, protect=best[1]):
                     spare.copy_prefix(best[1], len(best[0]), best[2]["mtp_len"])
@@ -85,7 +105,12 @@ def slot_for(owner, prompt: list[int], reuse: bool):
                 owner.free.append(spare)
                 owner._shrink(spare, force=True)
                 raise
-            owner.free.append(spare)
+            if before is None:
+                owner.free.append(spare)
+            else:                                    # refused: the victim's chains stay, in their old places
+                left = {id(k) for k in owner.kept}
+                owner.kept = [k for k in before if k[1] is spare or id(k) in left] + \
+                             [k for k in owner.kept if all(k is not b for b in before)]
         best = _best(owner.kept, prompt, busy) if reuse else None
         if best is not None and owner.free and _longer(owner.kept, best):
             best = None
@@ -96,9 +121,11 @@ def slot_for(owner, prompt: list[int], reuse: bool):
         _touch(owner, best)
         return best[1], {"state": best[2], "tail": best[3]}, n
     if not owner.free:
-        idle = next((k[1] for k in owner.kept if id(k[1]) not in busy), None)
-        if idle is None:
+        idle = [k[1] for k in owner.kept if id(k[1]) not in busy]
+        if not idle:
             raise RuntimeError("no free stream slot")
+        held = {id(k[1]) for k in owner.kept if _is_start(owner, k)}
+        idle = next((st for st in idle if id(st) not in held), idle[0])   # a kept system block's slot goes last
         owner._drop_kept(idle)
         owner.free.append(idle)
     return owner.free.pop(), None, 0
