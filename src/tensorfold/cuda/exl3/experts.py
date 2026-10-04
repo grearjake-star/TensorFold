@@ -243,7 +243,11 @@ def _mode(R: int, group: bool) -> str:
 # grouping and rot_in as one launch (``route``) after the router, for windows the grouping kernel takes (rows <=
 # TF_EXL3_PROMPT_ROWS) up to TF_MOE_ROUTE_ROWS rows. The kernel repeats each step's arithmetic in the same order: the
 # same picks, weights, groups and rotated rows, bit for bit (tests/cuda/test_moe_route_fused.py).
-ROUTE_FUSED = _ENV.get("TF_MOE_ROUTE_FUSED", "1").strip() != "0"
+_ROUTE = _ENV.get("TF_MOE_ROUTE_FUSED", "1").strip().lower()
+ROUTE_FUSED = _ROUTE != "0"
+# "1" (default): top-k + weights + grouping in one block (select_group), then rot_in's own unchanged launch: 3 launches
+# -> 2. "single": all three in one grid (route_kernel; redoes each pair's top-k: measured slower, kept for the bench).
+ROUTE_SINGLE = _ROUTE == "single"
 ROUTE_ROWS = int(_ENV.get("TF_MOE_ROUTE_ROWS", "64"))
 
 
@@ -263,8 +267,12 @@ def route(logits: torch.Tensor, x: torch.Tensor, pick: torch.Tensor, wts: torch.
     grouping kernel's) and s.xg/s.xu (rot_in's): then ``routed(..., prepped=True)``. One launch, no host sync."""
 
     ids, members = s.window(R)
-    _ext().route(logits, pick, wts, x, x.stride(0), ex.suh_g, ex.suh_u, s.xg, s.xu, ids, s.count, members,
-                 s.route_done, R, ex.dims, s.slots, experts, top_k, ex.count)
+    if ROUTE_SINGLE:
+        _ext().route(logits, pick, wts, x, x.stride(0), ex.suh_g, ex.suh_u, s.xg, s.xu, ids, s.count, members,
+                     s.route_done, R, ex.dims, s.slots, experts, top_k, ex.count)
+        return
+    _ext().select_group(logits, pick, wts, ids, s.count, members, R, s.slots, experts, top_k, ex.count)
+    _ext().rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, ex.dims, s.slots, ex.count, False)
 
 
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,

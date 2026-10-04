@@ -48,12 +48,13 @@ def _flag(**env):
     full = {k: v for k, v in os.environ.items() if not k.startswith("TF_MOE_ROUTE")}
     full.update(PYTHONPATH=str(ROOT / "src"), CUDA_VISIBLE_DEVICES="", **env)
     r = subprocess.run([sys.executable, "-c", "from tensorfold.cuda.exl3 import experts as x; "
-                        "print(x.ROUTE_FUSED, x.ROUTE_ROWS)"], env=full, capture_output=True, text=True, timeout=300)
+                        "print(x.ROUTE_FUSED, x.ROUTE_ROWS, x.ROUTE_SINGLE)"], env=full, capture_output=True, text=True, timeout=300)
     assert r.returncode == 0, r.stderr
     return r.stdout.split()
 
 
 def test_env_default_is_on_and_zero_turns_it_off():
-    assert _flag() == ["True", "64"]
-    assert _flag(TF_MOE_ROUTE_FUSED="0") == ["False", "64"]
-    assert _flag(TF_MOE_ROUTE_FUSED="1", TF_MOE_ROUTE_ROWS="16") == ["True", "16"]
+    assert _flag() == ["True", "64", "False"]                          # default: select_group + rot_in
+    assert _flag(TF_MOE_ROUTE_FUSED="0") == ["False", "64", "False"]
+    assert _flag(TF_MOE_ROUTE_FUSED="1", TF_MOE_ROUTE_ROWS="16") == ["True", "16", "False"]
+    assert _flag(TF_MOE_ROUTE_FUSED="single") == ["True", "64", "True"]

@@ -32,6 +32,9 @@ void exl3x_route_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, const at::Ten
                       const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,
                       int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
 
+void exl3x_select_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,
+                             int64_t, int64_t, int64_t, int64_t, int64_t);
+
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
                 ": expected a contiguous CUDA tensor of the right dtype");
@@ -234,6 +237,23 @@ void route(const at::Tensor& logits, at::Tensor pick, at::Tensor wts, const at::
                      slots, NE, topk, E);
 }
 
+// S1-ROUTE v2: top-k + weights and the grouping in one block (rot_in stays its own launch; same bits)
+void select_group(const at::Tensor& logits, at::Tensor pick, at::Tensor wts, at::Tensor uids, at::Tensor ucount,
+                  at::Tensor members, int64_t R, int64_t slots, int64_t NE, int64_t topk, int64_t E) {
+    check(logits, at::kFloat, "logits");
+    check(pick, at::kInt, "pick");
+    check(wts, at::kFloat, "wts");
+    check(uids, at::kInt, "uids");
+    check(ucount, at::kInt, "ucount");
+    check(members, at::kInt, "members");
+    TORCH_CHECK(logits.dim() == 2 && logits.size(0) >= R && logits.size(1) == NE + 1, "logits: [R, NE + 1]");
+    TORCH_CHECK(pick.numel() >= R * slots && wts.numel() >= R * slots, "pick/wts too small");
+    TORCH_CHECK(uids.numel() >= std::min<int64_t>(R * slots, E), "uids too small");
+    TORCH_CHECK(members.size(0) >= uids.numel() && members.size(1) >= 1, "members too small");
+    c10::cuda::CUDAGuard guard(logits.device());
+    exl3x_select_group_cuda(logits, pick, wts, uids, ucount, members, R, slots, NE, topk, E);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped", &grouped);
     m.def("grouped_items", &grouped_items);
@@ -247,4 +267,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("combine", &combine);
     m.def("down_combine", &down_combine);
     m.def("route", &route);
+    m.def("select_group", &select_group);
 }

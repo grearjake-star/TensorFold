@@ -1,6 +1,6 @@
-"""S1-ROUTE (TF_MOE_ROUTE_FUSED): a decode window's top-k + weights (tensorfold.cuda.moe.select_rows, Triton), its
-grouping (group_kernel) and rot_in (rot_in_kernel) as one launch (tensorfold.cuda.exl3.experts.route). Every output
-must be bit-identical with the three launches:
+"""S1-ROUTE (TF_MOE_ROUTE_FUSED): a decode window's top-k + weights (tensorfold.cuda.moe.select_rows, Triton) and its
+grouping (group_kernel) in one block (select_group; rot_in keeps its own launch: "two"), or all three in one grid
+(route_kernel: "single"). Every output must be bit-identical with the three launches:
 
 - the kernel alone on many random windows (1..64 rows, Flash Next's 512 experts + the shared gate logit, top 10;
   logits with forced ties, -inf and very large spreads; bf16 and fp16 rows): picks, weights, the groups (count, ids,
@@ -85,9 +85,13 @@ def _old(L, x, ex, s, R):
     _ext().rot_in(x, x.stride(0), s.pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, SLOTS, ex.count, False)
 
 
-def _new(L, x, ex, s, R):
-    _ext().route(L, s.pick, s.wts, x, x.stride(0), ex.suh_g, ex.suh_u, s.xg, s.xu, s.ids, s.count, s.members, s.done,
-                 R, D, SLOTS, NE, TOPK, ex.count)
+def _new(L, x, ex, s, R, kind="two"):
+    if kind == "single":
+        _ext().route(L, s.pick, s.wts, x, x.stride(0), ex.suh_g, ex.suh_u, s.xg, s.xu, s.ids, s.count, s.members,
+                     s.done, R, D, SLOTS, NE, TOPK, ex.count)
+        return
+    _ext().select_group(L, s.pick, s.wts, s.ids, s.count, s.members, R, SLOTS, NE, TOPK, ex.count)
+    _ext().rot_in(x, x.stride(0), s.pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, SLOTS, ex.count, False)
 
 
 def _same(a, b, R, what):
@@ -103,8 +107,10 @@ def _same(a, b, R, what):
     assert int(b.done) == 0, (what, "counter not reset")
 
 
+@pytest.mark.parametrize("kind", ("two", "single"))
 @pytest.mark.parametrize("E", (NE + 1, NE), ids=("shared-in-table", "routed-only"))
-def test_route_kernel_matches_the_three_launches(E):
+def test_route_kernel_matches_the_three_launches(E, kind):
+    route = kind
     g = torch.Generator().manual_seed(17 + E)
     ex = _fake_layer(E, g)
     checked = 0
@@ -117,25 +123,26 @@ def test_route_kernel_matches_the_three_launches(E):
                     x = big[:, :D]
                     a, b = _Scr(R, E), _Scr(R, E)
                     _old(L, x, ex, a, R)
-                    _new(L, x, ex, b, R)
-                    _same(a, b, R, (R, kind, dt, trial))
+                    _new(L, x, ex, b, R, route)
+                    _same(a, b, R, (R, kind, dt, trial, route))
                     checked += R
     assert checked > 1500
 
 
-def test_route_kernel_replays_from_a_graph_with_new_inputs():
+@pytest.mark.parametrize("route", ("two", "single"))
+def test_route_kernel_replays_from_a_graph_with_new_inputs(route):
     g = torch.Generator().manual_seed(5)
     ex = _fake_layer(NE + 1, g)
     for R in (3, 11, 40):
         L = _logits(R, "normal", g)
         x = torch.randn((R, D), generator=g).to(torch.bfloat16).cuda()
         s = _Scr(R, NE + 1)
-        _new(L, x, ex, s, R)                                  # warm
+        _new(L, x, ex, s, R, route)                           # warm
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             for _ in range(3):                                # several launches a graph: the counter resets each
-                _new(L, x, ex, s, R)
+                _new(L, x, ex, s, R, route)
         for trial in range(4):
             L.copy_(_logits(R, ("normal", "ties", "spread", "few")[trial], g))
             x.copy_(torch.randn((R, D), generator=g).to(torch.bfloat16).cuda())
@@ -241,8 +248,10 @@ def test_cut_model_verify_windows_are_bit_identical(cut_model, monkeypatch):
 
     monkeypatch.setattr(experts, "route", spy)
     runs = {}
-    for fused in (False, True, False, True):
+    for mode in ("off", "two", "off", "two", "single"):
+        fused = mode != "off"
         monkeypatch.setattr(experts, "ROUTE_FUSED", fused)
+        monkeypatch.setattr(experts, "ROUTE_SINGLE", mode == "single")
         e = Engine(w, capacity=1024, max_rows=64, prefill_rows=128, graphs=False)
         e.reset()
         out, at = [], 0

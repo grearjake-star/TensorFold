@@ -439,6 +439,84 @@ __global__ void __launch_bounds__(ROUTE_THREADS) route_kernel(
     if (threadIdx.x == 0) *counter = 0;                       // ready for the next launch (stream order)
 }
 
+// S1-ROUTE v2: select_rows' top-k + weights (warp_topk, one warp a row) and group_kernel's grouping in one 1024-thread
+// block; rot_in stays its own (unchanged) launch. The grouping is integers and gives group_kernel's outputs: experts
+// < E by id (uids, ucount), each one's members (row * 32 + slot) in pair order, -1 after the last up to maxm. Counts
+// come from shared-memory atomics (order-free), a member's place from the earlier pairs with the same expert.
+constexpr int SG_THREADS = 1024;
+
+template <int NV>
+__global__ void __launch_bounds__(SG_THREADS) select_group_kernel(
+    const float* __restrict__ L, int NL, int NE, int topk, int* __restrict__ pick, float* __restrict__ wts,
+    int* __restrict__ uids, int* __restrict__ ucount, int* __restrict__ members, int maxm, int R, int slots, int E) {
+    extern __shared__ int sh_pick[];
+    __shared__ int sh_cnt[SG_THREADS];
+    __shared__ int sh_place[SG_THREADS];
+    __shared__ int warp_tot[32];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    sh_cnt[tid] = 0;
+    for (int row = warp; row < R; row += SG_THREADS / 32) {
+        int idx = 0, my_id = 0;
+        float my_ex = 0.f, total = 0.f;
+        warp_topk<NV>(L + (size_t)row * NL, NE, topk, 0, lane, idx, my_id, my_ex, total);
+        if (lane < topk) {
+            pick[row * slots + lane] = my_id;
+            wts[row * slots + lane] = bf16_round(div_full_f32(my_ex, total));
+            sh_pick[row * slots + lane] = my_id;
+        } else if (lane == topk) {
+            const float sg = bf16_round(L[(size_t)row * NL + NE]);
+            const float den = __fadd_rn(ex2_approx_f32(__fmul_rn(__fsub_rn(0.f, sg), ROUTE_LOG2E)), 1.f);
+            pick[row * slots + lane] = NE;
+            wts[row * slots + lane] = bf16_round(div_full_f32(1.f, den));
+            sh_pick[row * slots + lane] = NE;
+        }
+    }
+    __syncthreads();
+    const int n = R * slots;
+    for (int i = tid; i < n; i += SG_THREADS) {
+        const int e = sh_pick[i];
+        if (e >= 0 && e < E) atomicAdd(&sh_cnt[e], 1);
+    }
+    __syncthreads();
+    // exclusive scan of (count > 0) over expert ids
+    const int used = tid < E && sh_cnt[tid] > 0;
+    int inc = used;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        int v = __shfl_up_sync(0xffffffffu, inc, o);
+        if (lane >= o) inc += v;
+    }
+    if (lane == 31) warp_tot[warp] = inc;
+    __syncthreads();
+    if (warp == 0) {
+        int v = warp_tot[lane];
+        int s = v;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            int y = __shfl_up_sync(0xffffffffu, s, o);
+            if (lane >= o) s += y;
+        }
+        __syncwarp();
+        warp_tot[lane] = s - v;
+        if (lane == 31) ucount[0] = s;
+    }
+    __syncthreads();
+    const int place = warp_tot[warp] + inc - used;
+    sh_place[tid] = place;
+    if (used) {
+        uids[place] = tid;
+        for (int j = sh_cnt[tid]; j < maxm; ++j) members[place * maxm + j] = -1;
+    }
+    __syncthreads();
+    for (int i = tid; i < n; i += SG_THREADS) {
+        const int e = sh_pick[i];
+        if (e < 0 || e >= E) continue;
+        int rank = 0;
+        for (int j = 0; j < i; ++j) rank += sh_pick[j] == e;
+        if (rank < maxm) members[sh_place[e] * maxm + rank] = (i / slots) * 32 + (i % slots);
+    }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -776,5 +854,30 @@ void exl3x_route_cuda(const at::Tensor& logits, at::Tensor& pick, at::Tensor& wt
         default: if (bf) TF_ROUTE_LAUNCH(__nv_bfloat16, 4); else TF_ROUTE_LAUNCH(half, 4); break;   // nb <= 128
     }
 #undef TF_ROUTE_LAUNCH
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_select_group_cuda(const at::Tensor& logits, at::Tensor& pick, at::Tensor& wts, at::Tensor& uids,
+                             at::Tensor& ucount, at::Tensor& members, int64_t R, int64_t slots, int64_t NE,
+                             int64_t topk, int64_t E) {
+    TORCH_CHECK(slots == topk + 1 && slots <= 32, "select_group: slots = top_k + 1 <= 32");
+    TORCH_CHECK(E <= SG_THREADS && NE + 1 <= 1024, "select_group: E <= 1024 and NE + 1 <= 1024");
+    const size_t smem = (size_t)R * slots * sizeof(int);
+    TORCH_CHECK(smem <= 32 * 1024, "select_group: too many rows");
+    int nb = 1;
+    while (nb < NE + 1) nb <<= 1;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int NL = (int)logits.size(1), maxm = (int)members.size(1);
+#define TF_SG_LAUNCH(NV)                                                                                           \
+    select_group_kernel<NV><<<1, SG_THREADS, smem, stream>>>(logits.data_ptr<float>(), NL, (int)NE, (int)topk,   \
+        pick.data_ptr<int>(), wts.data_ptr<float>(), uids.data_ptr<int>(), ucount.data_ptr<int>(),                 \
+        members.data_ptr<int>(), maxm, (int)R, (int)slots, (int)E)
+    switch (nb) {
+        case 1024: TF_SG_LAUNCH(32); break;
+        case 512: TF_SG_LAUNCH(16); break;
+        case 256: TF_SG_LAUNCH(8); break;
+        default: TF_SG_LAUNCH(4); break;
+    }
+#undef TF_SG_LAUNCH
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
