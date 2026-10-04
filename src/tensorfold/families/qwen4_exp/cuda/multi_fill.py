@@ -12,6 +12,7 @@ from tensorfold.cuda.streams import Stream
 from . import image_rows
 from .decode import PREFILL_ROWS, _gathered_fits, choose_gathered, entry_end, draft, ngram_rows_ahead, tp_sample_rows
 from .forward import Cut, commit, compute, cut_snapshot, stage
+from . import heads
 from .mtp import mtp_compute, mtp_stage
 from .state import CAND, ENDS
 from .multi_tp import OutOfStep
@@ -175,7 +176,12 @@ class PromptPasses:
                   for (s, a, n), (_, a0, _) in zip(pieces, segs) if self.fills[s.sid][1] and a + 1 < len(s.prompt)]
         if absorb:                   # the MTP head absorbs each prompt's rows (its cache in position order)
             absorb = [(st, nxt, streams[:len(nxt)]) for st, nxt, streams in absorb]
-            mtp_compute(self.w, mtp_stage(self.w, self.pbuf, absorb), self.pbuf)
+            parts = heads.groups([st for st, _, _ in absorb])
+            if len(parts) > 1:       # house: one launch a head; a launch overwrites the pass's streams, so copy them
+                absorb = [(st, nxt, streams.clone()) for st, nxt, streams in absorb]
+            for idx in parts:
+                group = [absorb[i] for i in idx]
+                mtp_compute(self.w, mtp_stage(self.w, self.pbuf, group), self.pbuf)
             for st, nxt, _ in absorb:
                 st.set_mtp_len(st.mtp_len + len(nxt))
         for (s, a, n), (st, a0, _) in zip(pieces, segs):

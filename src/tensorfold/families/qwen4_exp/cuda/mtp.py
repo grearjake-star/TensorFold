@@ -6,7 +6,7 @@ from typing import Sequence
 
 import torch
 
-from . import glue
+from . import glue, heads
 from .forward import _embed, _mm, candidates, finish, layer_forward
 from .state import Buffers, State
 from .weights import Weights
@@ -39,7 +39,7 @@ def mtp_compute(w: Weights, segs: Sequence, b: Buffers, *, last_only: bool = Tru
     """The MTP head's GPU work (capturable); ``last_only``: the draft head's logits of each stream's last row."""
 
     c = w.cfg
-    m = w.mtp
+    m = heads.of(w, segs)                    # house: the launch states' head (w.mtp unless two heads)
     n = segs[-1][2]
     _embed(w, b.ids[:n], 1, b.mtp_e[:n])
     en, xe = glue.rmsnorm(b.mtp_e[:n], m.norm_e, c.eps, out=b.mixed[:n], xs=b.xs_mixed[:n])

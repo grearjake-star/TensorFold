@@ -173,6 +173,7 @@ class State:
         # MTP head (its own attention cache; ``mtp_len`` entries, the last ``mtp_drafted`` of them chained drafts)
         self.mtp_len = 0
         self.mtp_drafted = 0
+        self.mtp_head = 0               # house (heads.py): which MTP head wrote this cache; fixed per sequence
         self.mtp_pos = torch.zeros((1,), dtype=torch.int32, device=dev)
         if w.mtp is not None:
             self.mtp_kc = kvcache.KVCache(capacity, c.kv_heads, c.head_dim, dev, self.kv_dtype)
@@ -240,6 +241,7 @@ class State:
         self.set_rope_delta(0)
         self.image_positions, self.image_rows, self.image_features = None, (), None
         self.mtp_drafted = 0
+        self.mtp_head = 0
         self.set_mtp_len(0)
 
     def set_rope_delta(self, delta: int) -> None:
@@ -335,6 +337,7 @@ class State:
             self.ikc[i][:pos].copy_(source.ikc[i][:pos])
             self.pooled[i][:pos // self.ratio].copy_(source.pooled[i][:pos // self.ratio])
         if mtp_len:
+            self.mtp_head = getattr(source, "mtp_head", 0)     # the copied cache rows are that head's
             copy_cache(self.mtp_kc, source.mtp_kc, mtp_len)
             self.mtp_ikc[:mtp_len].copy_(source.mtp_ikc[:mtp_len])
             self.mtp_pooled[:mtp_len // self.ratio].copy_(source.mtp_pooled[:mtp_len // self.ratio])
@@ -348,7 +351,7 @@ class State:
         return {"pos": self.pos, "rec": self.rec[p].clone(), "conv": self.conv.clone(),
                 "ple_tail": self.ple_tail.clone(),
                 "ple_history": None if self.ple_history is None else self.ple_history.copy(),
-                "mtp_len": self.mtp_len - self.mtp_drafted}
+                "mtp_len": self.mtp_len - self.mtp_drafted, "mtp_head": self.mtp_head}
 
     def restore(self, snap: dict) -> None:
         self.rec[0].copy_(snap["rec"])
@@ -361,4 +364,5 @@ class State:
         self.set_rope_delta(0)                       # kept prompts are text only
         self.image_positions, self.image_rows, self.image_features = None, (), None
         self.mtp_drafted = 0
+        self.mtp_head = snap.get("mtp_head", 0)          # a kept end keeps the head that wrote its MTP cache
         self.set_mtp_len(snap["mtp_len"])

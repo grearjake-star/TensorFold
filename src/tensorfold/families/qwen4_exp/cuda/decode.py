@@ -20,6 +20,7 @@ from .draft_cost import DRAFT_MS, VERIFY_MS, cost_bars, timing_table  # noqa: F4
 from .forward import Cut, commit, cut_snapshot, forward
 from . import image_rows
 from .state import CAND, Buffers, State
+from . import heads
 from .mtp import mtp_forward
 from .weights import Weights
 
@@ -312,11 +313,14 @@ def prefill_begin(e: Engine, prompt: Sequence[int], *, mtp: bool = True, resume:
         raise ValueError("prefill requires at least one token")
     if resume is None:
         e.reset()
+        e.st.mtp_head = heads.pick(e.w, len(prompt))      # house: TF_HEAD_SWITCH_ROWS (0 when off)
         return 0
     st = e.st
-    st.restore(resume["state"])
+    st.restore(resume["state"])                          # a kept end keeps its head (heads.py)
     if not 0 < st.pos < len(prompt):
         raise ValueError("a resumed prompt must extend the cached tokens")
+    if st.mtp_len == 0:                                  # no MTP cache yet: the prompt picks
+        st.mtp_head = heads.pick(e.w, len(prompt))
     if _absorbs(e, mtp) and resume.get("tail") is not None:
         mtp_forward(e.w, st, e.pbuf, [prompt[st.pos]], resume["tail"])
         st.set_mtp_len(st.mtp_len + 1)

@@ -20,7 +20,8 @@ from tensorfold.engine.grammar import GrammarError
 
 from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _gathered_fits, cost_bars, choose_gathered_streams,
                      entry_end, prefill_begin, tp_sample_rows)
-from . import attn_multi, gdn_multi, image_rows, prefixes
+from . import attn_multi, gdn_multi, heads, image_rows, prefixes
+from .draft_cost import joint_bars, joint_settings
 from .multi_graphs import RoundGraphs, bucket, fold
 from .forward import commit, compute, compute_mixed, converges, stage
 from .mtp import mtp_compute, mtp_stage
@@ -64,6 +65,12 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         self.points = points                         # a prompt's message starts to keep states at, or None
         self.vision = vision
         self.cost, self.timing = cost, timing            # the expected-time stop (decode.cost_bars), as one stream's
+        self.joint = joint_settings(os.environ)          # house: TF_JOINT_PRICE=1 prices shared rounds' drafts jointly
+        if self.joint is not None and cost > 0:
+            rate = self.joint["rate"]
+            print(f"[tensorfold] joint draft pricing: on (shared rounds; aggregate rate "
+                  f"{f'{rate} tokens/ms' if rate else 'from the verify table'}, "
+                  f"{'TF_JOINT_VERIFY_MS' if self.joint['verify'] else 'the one-stream'} row costs)", flush=True)
         self.eos = tuple(w.cfg.eos) if stop_eos else ()
         rows = slots * (depth + 1)
         # a round's window and a prompt pass share each layer's expert launch: the pass's buffers hold both
@@ -482,7 +489,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                     s.error = exc
             last = s.error is not None or len(s.out) + len(new) >= s.count or end in self._ends(s)
             kept.append((s, a0, rows[:len(path)], new, last))
-        self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last])
+        self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last],
+                        rows=sum(1 for *_, last in kept if not last))
         for s, _, _, new, _ in kept:
             if s.error is not None:
                 s.done = True
@@ -497,8 +505,12 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             self.held.pop(s.sid, None)
         return failed + done + ended
 
-    def _draft_all(self, streams: list) -> None:
-        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth."""
+    def _draft_all(self, streams: list, rows: int | None = None) -> None:
+        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth.
+
+        ``rows``: the streams the next round verifies (each its pending row), drafting or not; with joint pricing
+        (TF_JOINT_PRICE=1) a stream's next draft is priced at that round's marginal row and aggregate rate
+        (draft_cost.JointBars), else at one stream's bars. Speed only: drafts never change the output."""
 
         for s, _, _ in streams:
             s.drafts = []
@@ -511,34 +523,62 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             if st.mtp_drafted:
                 st.set_mtp_len(st.mtp_len - st.mtp_drafted)
                 st.mtp_drafted = 0
-        windows = [(s.st, keep, self.buf.streams[a0:a0 + len(keep)]) for s, a0, keep in todo]
-        segs = mtp_stage(self.w, self.mbuf, windows)
-        logits = self._mtp(segs)
-        for (s, _, keep), (st, a0, a1) in zip(todo, segs):
-            st.set_mtp_len(st.mtp_len + len(keep))
-        active = [(s, a1 - 1) for s, (_, _, a1) in zip([t[0] for t in todo], segs)]
-        bars = cost_bars(self.cost, self.depth, self.timing) if self.cost > 0 else None
+        logits, prevs = self._mtp_windows([(s.st, keep, self.buf.streams[a0:a0 + len(keep)]) for s, a0, keep in todo])
+        for s, _, keep in todo:
+            s.st.set_mtp_len(s.st.mtp_len + len(keep))
+        active = [(s, prev) for (s, _, _), prev in zip(todo, prevs)]
+        bars = joint = None
+        if self.cost > 0 and getattr(self, "joint", None) is not None:
+            n = max(len(streams), rows or 0)
+            joint = joint_bars(self.joint, self.cost, self.timing, n, n)
+        elif self.cost > 0:
+            bars = cost_bars(self.cost, self.depth, self.timing)
         chain = {s.sid: 1.0 for s, _, _ in todo}
         for j in range(self.depth):
             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
             nxt = []
-            for (s, row), (d, p) in zip(active, picks):
+            for (s, prev), (d, p) in zip(active, picks):
                 chain[s.sid] *= p
-                low = (self.confidence > 0 and p < self.confidence) or (bars is not None and chain[s.sid] < bars[j])
+                c = chain[s.sid]
+                bar = joint.bar() if joint is not None else bars[j] if bars is not None else None
+                low = (self.confidence > 0 and p < self.confidence) or (bar is not None and c < bar)
                 if low and j > 0:
                     continue
                 s.drafts.append(d)
-                if not low and j + 1 < room[s.sid] and not (bars is not None and chain[s.sid] < bars[j + 1]):
-                    nxt.append((s, row, d))
+                if joint is not None:
+                    joint.take()                     # the round verifies one more row
+                after = joint.bar() if joint is not None else bars[j + 1] if bars is not None else None
+                if not low and j + 1 < room[s.sid] and not (after is not None and c < after):
+                    nxt.append((s, prev, d))
             if not nxt:
                 return
-            windows = [(s.st, [d], self.mbuf.streams[row:row + 1]) for s, row, d in nxt]
-            segs = mtp_stage(self.w, self.mbuf, windows)
-            logits = self._mtp(segs)
+            logits, prevs = self._mtp_windows([(s.st, [d], prev) for s, prev, d in nxt])
             for s, _, _ in nxt:
                 s.st.set_mtp_len(s.st.mtp_len + 1)
                 s.st.mtp_drafted += 1
-            active = [(s, a0) for (s, _, _), (_, a0, _) in zip(nxt, segs)]
+            active = [(s, prev) for (s, _, _), prev in zip(nxt, prevs)]
+
+    def _mtp_windows(self, windows: list) -> tuple[torch.Tensor, list]:
+        """One MTP step over ``windows`` ((state, tokens, input streams), ...): each window's last-row draft logits
+        (one row a window, in order) and its output stream row, the next step's input. House: streams on different
+        MTP heads (TF_HEAD_SWITCH_ROWS) take one launch a head; one head is today's single launch."""
+
+        parts = heads.groups([st for st, _, _ in windows])
+        if len(parts) == 1:
+            segs = mtp_stage(self.w, self.mbuf, windows)
+            logits = self._mtp(segs)
+            return logits, [self.mbuf.streams[a1 - 1:a1] for _, _, a1 in segs]
+        # each launch overwrites the MTP buffers: inputs and results are copied out of them
+        windows = [(st, tokens, x.clone()) for st, tokens, x in windows]
+        rows: list = [None] * len(windows)
+        prevs: list = [None] * len(windows)
+        for idx in parts:
+            segs = mtp_stage(self.w, self.mbuf, [windows[i] for i in idx])
+            out = self._mtp(segs)
+            for k, (i, (_, _, a1)) in enumerate(zip(idx, segs)):
+                rows[i] = out[k:k + 1].clone()
+                prevs[i] = self.mbuf.streams[a1 - 1:a1].clone()
+        return torch.cat(rows), prevs
 
     def _mtp(self, segs: list) -> torch.Tensor:
         """An MTP step over every drafting stream, its attention one launch a kernel for all of them."""
@@ -549,7 +589,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             self.mbuf.attn_step = attn_multi.Step(self.w, segs, mtp=True, out=self.rounds.attn_out(True, n, rows),
                                                   bucket=ctx)
             try:
-                return self.rounds.run(("mtp", n, rows, ctx), lambda: mtp_compute(self.w, segs, self.mbuf))
+                return self.rounds.run(("mtp", n, rows, ctx) + heads.launch_key(segs),
+                                       lambda: mtp_compute(self.w, segs, self.mbuf))
             finally:
                 self.mbuf.attn_step = None
         self.mbuf.attn_step = attn_multi.Step(self.w, segs, mtp=True)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from .forward import compute, stage
+from .heads import launch_key
 from .mtp import mtp_compute, mtp_stage
 
 
@@ -13,8 +14,8 @@ class Graphs:
         self.e = e
         self.max_rows = max_rows
         self.main: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}
-        self.mtp: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
-        self.mtp_out: dict[tuple[int, int], torch.Tensor] = {}
+        self.mtp: dict[tuple, torch.cuda.CUDAGraph] = {}
+        self.mtp_out: dict[tuple, torch.Tensor] = {}
         self.pool = torch.cuda.graph_pool_handle()
         self.captures = 0
 
@@ -68,7 +69,7 @@ class Graphs:
         if n > self.max_rows:
             return mtp_compute(w, segs, b)
         context = self._bucket(st.mtp_len + n)
-        key = (n, context)
+        key = (n, context) + launch_key(segs)            # house: a second MTP head has its own graphs
         g = self.mtp.get(key)
         if g is None:
             out = mtp_compute(w, segs, b, context=context)     # eager warm-up; its result is the view replays fill
@@ -93,8 +94,12 @@ class Graphs:
                 self.forward([0] * R)
         st.cur = saved
         if e.mbuf is not None:
-            for n in range(1, rows + 1):
-                self.mtp_forward([0] * n, e.buf.streams[:n])
+            head = getattr(st, "mtp_head", 0)
+            for h in range(len(getattr(e.w, "mtp_heads", None) or [None])):      # house: every MTP head
+                st.mtp_head = h
+                for n in range(1, rows + 1):
+                    self.mtp_forward([0] * n, e.buf.streams[:n])
+            st.mtp_head = head
         torch.cuda.synchronize()
         return self.captures - before
 

@@ -576,4 +576,5 @@ def cut_snapshot(w: Weights, st: State, b: Buffers, cut: Cut, mtp_len: int) -> d
         history = np.concatenate([before, tokens[:cut.row]])[-(c.ngram_size - 1):]
         shift_windows(tail[None], b.ple_nrow[None, cut.at:cut.at + cut.row], cut.row, tail.shape[1])
     return {"pos": st.pos + cut.row, "rec": cut.rec, "conv": cut.conv, "ple_tail": tail,
-            "ple_history": None if history is None else history.copy(), "mtp_len": mtp_len}
+            "ple_history": None if history is None else history.copy(), "mtp_len": mtp_len,
+            "mtp_head": getattr(st, "mtp_head", 0)}

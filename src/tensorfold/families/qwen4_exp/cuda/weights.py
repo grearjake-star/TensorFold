@@ -69,6 +69,10 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     if exl3.is_exl3(model_dir):                       # an EXL3 pack: its own loader, the same dataclasses
         return exl3.load(model_dir, device, mtp=mtp, tp=tp, draft_vocab=draft_vocab, table_reads=table_reads,
                          mtp_head=mtp_head)
+    from .heads import SWITCH_ENV, switch_rows
+
+    if mtp and switch_rows():
+        raise ValueError(f"{SWITCH_ENV}: the two-head switch is for EXL3 packs; unset it for this checkpoint")
     full = Config.read(model_dir)
     rank, world = tp if tp is not None else (0, 1)
     cfg = full if world == 1 else replace(full, heads=full.heads // world, kv_heads=full.kv_heads // world,

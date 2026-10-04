@@ -226,6 +226,7 @@ class Weights:
     draft_head: Q4 | None = None   # the MTP drafts' head over a token subset (None: the full head)
     draft_ids: torch.Tensor | None = None   # the subset's token ids (this rank's share), in draft-head row order
     x3: Any = None            # an EXL3 checkpoint's shared scratch (``exl3.Scratch``); None for the MLX checkpoint
+    mtp_heads: list | None = None   # house (TF_HEAD_SWITCH_ROWS): [primary, long] MTP heads; None: ``mtp`` alone
 
     @property
     def device(self) -> torch.device:
@@ -257,7 +258,8 @@ class Weights:
                 for y in x:
                     add(y)
 
-        for part in (self.embed, self.layers, self.mixer, self.head, self.mtp, self.draft_head, self.draft_ids):
+        for part in (self.embed, self.layers, self.mixer, self.head, self.mtp, self.draft_head, self.draft_ids,
+                     self.mtp_heads):
             add(part)
         return sum(seen.values()) + (self.x3.nbytes() if self.x3 is not None else 0)
 

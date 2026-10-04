@@ -182,6 +182,15 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     offset = centred_offset(pk, [f"{T}layers.{i}.attn_hyper_connection.hc_norm.weight" for i in range(cfg.layers)])
     override = exl3_head(pk, mtp_head) if mtp and mtp_head else {}
     used: set[str] = set()
+    # house: TF_HEAD_SWITCH_ROWS loads a second MTP head (heads.py): the pack's own, or TF_MTP_HEAD_LONG
+    from .heads import LONG_ENV, SWITCH_ENV, long_head, switch_rows
+
+    switch = switch_rows() if mtp else None
+    long_path = long_head() if switch else None
+    if switch and not mtp_head and not long_path:
+        raise ValueError(f"{SWITCH_ENV} picks between two heads: set TF_MTP_HEAD (short prompts) or {LONG_ENV}")
+    long_override = exl3_head(pk, long_path) if long_path else {}
+    shared_experts: list = [None]                     # the second head reads the first one's expert table
 
     def get(name: str) -> torch.Tensor:               # a pack tensor, or the trained head's (MTP names only)
         if name in override:
@@ -216,6 +225,8 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     def moe(name: str) -> MoEW:
         router = torch.cat([get(name + ".gate.weight").to(torch.bfloat16),
                             get(name + ".shared_expert_gate.weight").to(torch.bfloat16)]).to(device).contiguous()
+        if shared_experts[0] is not None:
+            return MoEW(router, shared_experts[0])
         return MoEW(router, expert_table(pk, name + ".experts", cfg.experts, name + ".shared_expert", device))
 
     def attention(name: str) -> AttnW:
@@ -282,6 +293,22 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
                 raise ValueError(f"{mtp_head}: tensors the MTP head does not read: {unused[:5]}")
             w.meta["mtp_head"] = str(mtp_head)
             print(f"[tensorfold] MTP head: {len(used)} tensors from {mtp_head} (EXL3 pack: linears as fp16)", flush=True)
+        if switch:
+            from .heads import head_bytes
+
+            shared_experts[0] = w.mtp.layer.moe.experts
+            override, used = long_override, set()
+            second = MTPW(centred("mtp.pre_fc_norm_embedding.weight"), centred("mtp.pre_fc_norm_hidden.weight"),
+                          lin("mtp.fc_embedding"), lin("mtp.fc_hidden"),
+                          layer(-1, "mtp.layers.0", "attention", False), hc("mtp.hyper_connection_mixer", False))
+            if override and sorted(set(override) - used):
+                raise ValueError(f"{long_path}: tensors the MTP head does not read: {sorted(set(override) - used)[:5]}")
+            w.mtp_heads = [w.mtp, second]
+            w.meta["head_switch_rows"] = switch
+            w.meta["mtp_head_long"] = str(long_path or "own")
+            w.meta["mtp_head_long_bytes"] = head_bytes(w)
+            print(f"[tensorfold] MTP head switch: prompts of {switch}+ tokens draft with "
+                  f"{long_path or 'the pack MTP head'} (+{w.meta['mtp_head_long_bytes'] / 2**20:.1f} MiB)", flush=True)
     ple = next((lay.ple for lay in loaded if lay.ple is not None), None)
     sc.allocate(device, experts=loaded[0].moe.experts, rows=PREFILL_ROWS,
                 ple_words=ple.table.words_per_row if ple else 0, ple_heads=ple.ngram.heads if ple else 0,
