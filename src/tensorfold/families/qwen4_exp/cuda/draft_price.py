@@ -1,5 +1,6 @@
 """--mtp-cost: price a later MTP draft by its calibrated chance of being kept against the ms it adds to the round;
---mtp-lookahead: draft toward the depth that gives the most expected tokens per ms of the whole round."""
+--mtp-lookahead: draft toward the depth that gives the most expected tokens per ms of the whole round;
+--mtp-live-cost: re-price either stop from the rounds' own times as decoding goes."""
 
 from __future__ import annotations
 
@@ -10,14 +11,16 @@ import numpy as np
 import torch
 
 RATE = 0.05          # EMA weight of one round's observation
+PRIOR = 0.01         # weight the startup table keeps under --mtp-live-cost (the live rounds' weight grows to 1)
 
 
 class DraftPrice:
     """The measured round costs and the head's chain product calibrated per depth by the kept/drafted counts of live
-    rounds (greedy and sampled apart). ``lookahead`` replaces the marginal bar at ``cost`` by the round's best depth."""
+    rounds (greedy and sampled apart). ``lookahead`` replaces the marginal bar at ``cost`` by the round's best depth.
+    ``live`` corrects the startup prices by a line in the round's draft count, fitted to the rounds' measured times."""
 
     def __init__(self, cost: float, verify_ms: Sequence[float], draft_ms: float, depth: int,
-                 lookahead: bool = False) -> None:
+                 lookahead: bool = False, live: bool = False) -> None:
         ms = list(verify_ms)
         while len(ms) < depth + 3:                  # windows past the measured table repeat its last step
             ms.append(ms[-1] + (ms[-1] - ms[-2]) if len(ms) > 1 else ms[-1])
@@ -26,6 +29,42 @@ class DraftPrice:
         self.said = {False: [None] * depth, True: [None] * depth}   # EMA of the head's product for those drafts
         self.sampled, self.lookahead, self.limit = False, bool(lookahead), int(depth)
         self.products: list[float] = []
+        self.table, self.live = tuple(ms), bool(live)   # the startup prices; ``verify`` follows the live line
+        self.sums = [0.0] * 5                       # EMA of 1, x, x^2, y, xy over timed rounds: x drafts, y live - table
+        self.rounds = 0
+
+    def table_ms(self, drafts: int) -> float:
+        """The startup table's ms for a round of ``drafts`` verified drafts: its window plus their MTP steps."""
+
+        return self.table[drafts] + drafts * self.draft_ms
+
+    def line(self) -> tuple[float, float]:
+        """The live correction, ms = a + b x drafts over the table: least squares on the EMA of timed rounds, with the
+        table itself (no correction at 0 .. depth drafts) kept at weight ``PRIOR`` so one depth cannot tilt it alone."""
+
+        n, sx, sxx, sy, sxy = self.sums
+        xs = range(self.depth + 1)
+        n += PRIOR
+        sx += PRIOR * sum(xs) / len(xs)
+        sxx += PRIOR * sum(x * x for x in xs) / len(xs)
+        det = n * sxx - sx * sx
+        b = (n * sxy - sx * sy) / det if det > 1e-12 else 0.0
+        b = max(b, -0.5 * (self.table_ms(self.depth) - self.table_ms(0)) / max(1, self.depth))  # drafts never free
+        return (sy - b * sx) / n, b
+
+    def timed(self, drafts: int, ms: float) -> None:
+        """One round that verified ``drafts`` drafts took ``ms`` (host clock, between the reads that end two rounds:
+        its MTP steps, verify window, sampling and commit); with ``live`` the prices move toward such rounds."""
+
+        if not self.live or drafts >= len(self.table):
+            return
+        table = self.table_ms(drafts)
+        y = min(max(ms - table, -0.5 * table), 2 * table)   # a stall (a paused host) moves the line a bounded step
+        for i, v in enumerate((1.0, drafts, drafts * drafts, y, drafts * y)):
+            self.sums[i] += RATE * (v - self.sums[i])
+        self.rounds += 1
+        a, b = self.line()
+        self.verify = [v + a + b * d for d, v in enumerate(self.table)]
 
     def adds(self, j: int) -> float:
         """ms that verifying draft j (0-based) adds to the round: one more verify row and its MTP step."""
@@ -98,8 +137,20 @@ class DraftPrice:
     def describe(self) -> str:
         v = self.verify
         ahead = "look-ahead over every depth; " if self.lookahead else ""
+        if self.live:
+            ahead += "re-priced by live round times from: "
         return (f"{ahead}verify {v[0]:.1f}-{v[self.depth]:.1f} ms for 1-{self.depth + 1} rows, a draft step "
                 f"{self.draft_ms:.2f} ms")
+
+
+    def fits(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        """(intercept, ms a draft) of the startup table's rounds and of the current prices, over 0 .. depth drafts."""
+
+        xs = np.arange(self.depth + 1)
+        table = [self.table_ms(int(d)) for d in xs]
+        now = [self.verify[int(d)] + d * self.draft_ms for d in xs]
+        (bt, at), (bn, an) = np.polyfit(xs, table, 1), np.polyfit(xs, now, 1)
+        return (float(at), float(bt)), (float(an), float(bn))
 
 
 @torch.no_grad()

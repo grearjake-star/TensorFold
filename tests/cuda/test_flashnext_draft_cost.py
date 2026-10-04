@@ -1,12 +1,13 @@
 """Flash Next's expected-time draft stops: ``--mtp-cost`` verifies a later draft only while its chance of being kept,
 the head's chain product calibrated by live rounds, repays the ms it adds to the round; ``--mtp-lookahead`` drafts
 toward the depth with the most expected tokens per ms of the round. Drafts change speed only: drafted output equals
-serial output, greedy and sampled, at any price."""
+serial output, greedy and sampled, at any price. ``--mtp-live-cost`` moves either stop's prices toward the rounds'
+measured times."""
 
 import pytest
 import torch
 
-from tensorfold.families.qwen4_exp.cuda.draft_price import RATE, DraftPrice
+from tensorfold.families.qwen4_exp.cuda.draft_price import PRIOR, RATE, DraftPrice
 
 
 def test_each_draft_is_priced_by_the_ms_it_adds() -> None:
@@ -73,6 +74,42 @@ def test_lookahead_prices_deeper_drafts_at_the_rate_live_rounds_kept_them() -> N
     assert price.more(0, 0.9)                                  # sampled rounds keep their own counts
 
 
+def test_live_cost_fits_the_rounds_measured_times_from_the_startup_table() -> None:
+    table = (30.0, 33.0, 36.0, 39.0, 42.0)
+    fixed, live = DraftPrice(0.0, table, 1.0, 4, lookahead=True), DraftPrice(0.0, table, 1.0, 4, lookahead=True, live=True)
+    assert live.verify == fixed.verify and live.line() == (0.0, 0.0)          # no rounds yet: the startup table
+    for i in range(400):                                   # live rounds: 2 ms more, and 1.5 ms more a draft
+        d = 1 + i % 3
+        fixed.timed(d, fixed.table_ms(d) + 2.0 + 1.5 * d)
+        live.timed(d, live.table_ms(d) + 2.0 + 1.5 * d)
+    assert fixed.verify[:5] == list(table)                 # off unless asked
+    a, b = live.line()
+    assert a == pytest.approx(2.0, abs=0.1) and b == pytest.approx(1.5, abs=0.1)     # PRIOR pulls a little to 0
+    assert live.verify[4] == pytest.approx(42.0 + a + 4 * b)
+    (at, bt), (an, bn) = live.fits()
+    assert (at, bt) == pytest.approx((30.0, 4.0)) and bn == pytest.approx(4.0 + b)
+    live.timed(2, 1e6)                                     # one stalled round moves the line by a bounded step
+    assert live.line()[1] < b + 2.0 and PRIOR > 0
+
+
+def test_live_cost_stops_the_lookahead_where_dear_live_drafts_no_longer_pay() -> None:
+    table = (30.0, 31.0, 32.0, 33.0, 34.0)                 # the table: drafts nearly free
+    price = DraftPrice(0.0, table, 0.2, 4, lookahead=True, live=True)
+    price.begin(False)
+    assert price.best([0.9], 1) == 4                       # priced on the table: draft all four
+    for _ in range(200):
+        price.timed(2, price.table_ms(2) + 60.0)           # live: every draft costs 30 ms more
+        price.timed(1, price.table_ms(1) + 30.0)
+    price.begin(False)
+    assert price.best([0.9], 1) < 4 and not price.more(0, 0.6)
+    marginal = DraftPrice(0.02, table, 0.2, 4, live=True)
+    assert marginal.pays(1, 0.25)                          # 0.02 x 1.2 ms
+    for _ in range(200):
+        marginal.timed(2, marginal.table_ms(2) + 30.0)
+        marginal.timed(1, marginal.table_ms(1) + 15.0)
+    assert not marginal.pays(1, 0.25)                      # 0.02 x ~15 ms
+
+
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 
 
@@ -119,3 +156,29 @@ def test_drafts_under_the_cost_stop_give_the_serial_tokens(sampling_seed) -> Non
                     assert got.tokens == ref, (depth, confidence, cost)
                     if (cost or 0) >= 2.0:          # an unpayable bar (> 1): every round verifies its first draft only
                         assert max(got.widths) <= 2
+
+
+@cuda
+@pytest.mark.parametrize("sampling_seed", [None, 1234])
+def test_drafts_priced_on_live_round_times_give_the_serial_tokens(sampling_seed) -> None:
+    from test_flashnext_forward import _model
+
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.qwen4_exp.cuda.decode import Engine, mtp_decode, prefill, serial_decode
+
+    w = _model()
+    sampling = None if sampling_seed is None else Sampling(seed=sampling_seed, temperature=0.7, top_k=20, top_p=0.8)
+    prompt = [5, 17, 99, 250, 7, 64, 30, 11, 12, 13]
+    e = Engine(w, capacity=512, max_rows=8, prefill_rows=16)
+    first = prefill(e, prompt, sampling)
+    ref = serial_decode(e, first, 32, sampling).tokens
+    table = (0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1)             # far below the tiny model's real rounds: live moves it
+    for depth in (1, 3, 6):
+        for confidence in (0.0, 0.7):
+            for cost in (0.0, 0.2):                         # 0.0: --mtp-lookahead
+                price = DraftPrice(cost, table, 0.05, depth, lookahead=cost == 0.0, live=True)
+                for _ in range(3):                          # later replies run on live prices
+                    assert prefill(e, prompt, sampling) == first
+                    got = mtp_decode(e, first, 32, sampling, depth=depth, confidence=confidence, price=price)
+                    assert got.tokens == ref, (depth, confidence, cost)
+                assert price.rounds > 0 and price.verify[0] > table[0]   # rounds were timed and re-priced

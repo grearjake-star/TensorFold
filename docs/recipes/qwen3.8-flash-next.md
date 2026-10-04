@@ -351,6 +351,12 @@ the rate live rounds kept them at that depth, or at the last draft's own rate be
 the marginal bar, it keeps going when a dear draft is followed by cheap ones. It refuses `--mtp-cost`, `--parallel`
 and `--tp 2`.
 
+`--mtp-live-cost` re-prices either stop from the rounds themselves. Every round's time is read on the host clock at
+the point where the round already waits for its sampled tokens, so it adds no synchronisation. The engine fits a line
+to the gap between those times and the startup prices, in the round's draft count (an exponential average over recent
+rounds, with the startup table kept at a small weight), and prices drafts on the startup table plus that line. Live
+rounds also pay for the host's side of each MTP step and the sampling, which the startup windows leave out.
+
 ## Draft vocabulary provenance
 
 Both backends read the public list in `src/tensorfold/families/qwen4_exp/cuda/draft_vocab.txt`.

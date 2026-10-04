@@ -434,7 +434,7 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
     pos0 = st.pos
     unabsorbed = None                                  # the last round's kept rows, not yet in the MTP cache
     torch.cuda.synchronize()
-    start = time.perf_counter()
+    start = tick = time.perf_counter()
     more = {"price": price} if price is not None else {}   # a keyword only when on: tools may stand in a plain ``draft``
     drafts = draft(e, e.last_streams, [pending], st.pos + 1, min(depth, count - len(out)), sampling, confidence,
                    **more)
@@ -448,6 +448,10 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         if window is not None:
             constraint.mask(logits[:R], window, w.meta.get("vocab_offset", 0))
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling, gathered=window is None)
+        if price is not None:                            # the sampled ids are on the host: the round has ended
+            now = time.perf_counter()
+            price.timed(len(drafts), (now - tick) * 1000)
+            tick = now
         keep = 1
         for i, d in enumerate(drafts):
             if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):

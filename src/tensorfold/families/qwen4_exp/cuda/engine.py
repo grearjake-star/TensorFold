@@ -38,7 +38,7 @@ class FlashNextEngine:
                  context_explicit: bool | None = None, tp: int = 1, rank: int = 0, master: str = "", port: int = 29551,
                  prefetch: bool = True, graphs: bool = True, streams: int = 1, ple_on_ssd: bool = False,
                  kv_dtype: str = "bf16", share: float = 0.0, vision: bool = False, vision_urls: bool = False,
-                 cost: float = 0.0, lookahead: bool = False) -> None:
+                 cost: float = 0.0, lookahead: bool = False, live_cost: bool = False) -> None:
         import torch
 
         from .exl3_pack import admission, extra_files, is_exl3
@@ -78,6 +78,8 @@ class FlashNextEngine:
             raise ValueError(f"MTP draft cost: tokens per ms, 0 (off) or more, not {cost}")
         if float(cost) > 0 and lookahead:
             raise ValueError("--mtp-cost and --mtp-lookahead are two draft stops: pick one")
+        if live_cost and not (float(cost) > 0 or lookahead):
+            raise ValueError("--mtp-live-cost re-prices --mtp-cost or --mtp-lookahead: add one")
         if (float(cost) > 0 or lookahead) and (streams > 1 or tp > 1):
             raise ValueError("the expected-time draft stop prices one stream's rounds on one GPU: drop --mtp-cost "
                              "or --mtp-lookahead, or --parallel / --tp 2")
@@ -85,6 +87,7 @@ class FlashNextEngine:
         self.tp, self.rank, self.depth, self.confidence = tp, rank, int(depth), float(confidence)
         self.cost = float(cost) if self.depth else 0.0
         self.lookahead = bool(lookahead) and self.depth > 0
+        self.live_cost = bool(live_cost)
         self.kv_dtype = check_kv(kv_dtype)
         self.comm = None
         self.vision = None                   # the image tower (``QwenCudaVision``) with --vision
@@ -200,7 +203,7 @@ class FlashNextEngine:
             warm(self.e)
             if self.cost > 0 or self.lookahead:       # the stop prices drafts with this engine's own round costs
                 self.price = DraftPrice(self.cost, *measure_round_costs(self.e, self.depth + 1), self.depth,
-                                        lookahead=self.lookahead)
+                                        lookahead=self.lookahead, live=self.live_cost)
         if self.vision is not None:
             self.vision.warm()
             torch.cuda.empty_cache()
