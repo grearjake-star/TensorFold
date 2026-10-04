@@ -29,7 +29,7 @@ from .multi_solo import Alone, solo
 from .multi_fill import FILL_GUARD, FIRST_PASS, PASS_MIN, PromptPasses  # noqa: F401 (re-exported)
 from .multi_tp import Link as Link
 from .multi_tp import OutOfStep, TwoRanks
-from ..cuda import CONFIDENCE, DEPTH
+from ..cuda import CONFIDENCE, DEPTH, env_int
 
 FIRST, STEP = 256, 8192          # rows an idle slot keeps; rows a stream's caches grow by at a time
 GIB = 1024**3
@@ -289,7 +289,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             st = self.solo.st
             # house (W2): TF_SOLO_ROWS pre-sizes the graph slot so a growing conversation never resizes it (a resize
             # drops every graph) below that many rows, and captures every context bucket up to it now, not mid-reply
-            want = int(os.environ.get("TF_SOLO_ROWS", "0") or 0)
+            want = env_int("TF_SOLO_ROWS", 0, 0)
             if want > st.capacity and self.w.comm is None:
                 self._grow(st, min(want, st.limit), alone=True)
             starts = [0]

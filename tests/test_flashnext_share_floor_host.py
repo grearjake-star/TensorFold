@@ -19,7 +19,8 @@ def _decoder():
     owner = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "PromptPasses")
     body = [node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name in methods]
     nodes.append(ast.ClassDef(name="Decoder", bases=[], keywords=[], body=body, decorator_list=[], type_params=[]))
-    namespace = {"PREFILL_ROWS": 2048, "ENDS": 16, "os": __import__("os")}   # house: PASS_MIN/FIRST_PASS read env
+    namespace = {"PREFILL_ROWS": 2048, "ENDS": 16,     # house: PASS_MIN/FIRST_PASS read env (env_int)
+                 "env_int": __import__("tensorfold.families.qwen4_exp.cuda", fromlist=["env_int"]).env_int}
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(root / "multi_fill.py"), "exec"), namespace)
     dec = namespace["Decoder"]()
     dec.streams = {0: SimpleNamespace(done=False)}
