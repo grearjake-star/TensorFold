@@ -6,6 +6,9 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include <mutex>
+#include <unordered_map>
+
 #include "experts_prompt.cuh"
 
 namespace {
@@ -342,6 +345,55 @@ void exl3x_grouped_items_cuda(const at::Tensor& X0, const at::Tensor& X1, const 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// Prompt instances on a side stream (TF_EXL3_PROMPT_SIDE): ``widths`` carries the K2 instances to launch in its low 32
+// bits and, in its high 32 bits, those to run on a side stream beside the rest (the shared expert's width: a few items
+// that otherwise run alone after the routed experts' instance). Every pair is computed by one program of one instance,
+// which writes only that pair's rows, so where an instance runs never changes a bit. The side stream forks from and
+// joins back into the current stream with events (also inside a CUDA graph capture).
+namespace {
+struct SideStream {
+    at::cuda::CUDAStream stream;
+    cudaEvent_t fork, join;
+};
+std::mutex side_mutex;
+SideStream* side_stream(int device, cudaStream_t current) {
+    static std::unordered_map<int, SideStream*> streams;
+    auto it = streams.find(device);
+    if (it != streams.end()) return it->second;
+    cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+    C10_CUDA_CHECK(cudaStreamIsCapturing(current, &capturing));
+    if (capturing != cudaStreamCaptureStatusNone) return nullptr;     // no stream/event creation inside a capture
+    auto* s = new SideStream{at::cuda::getStreamFromPool(true, static_cast<c10::DeviceIndex>(device)), nullptr, nullptr};
+    C10_CUDA_CHECK(cudaEventCreateWithFlags(&s->fork, cudaEventDisableTiming));
+    C10_CUDA_CHECK(cudaEventCreateWithFlags(&s->join, cudaEventDisableTiming));
+    streams[device] = s;
+    return s;
+}
+
+// launch(mask, stream): the side widths first, on the side stream (high priority: its few programs start early),
+// then the rest on ``stream``; the current stream waits for both.
+template <typename Launch>
+void with_side(int64_t widths, cudaStream_t stream, int device, Launch launch) {
+    const int all = (int)(widths & 0xffffffffLL), side = (int)(widths >> 32) & all;
+    if (side == 0 || side == all) {
+        launch(all, stream);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(side_mutex);
+    SideStream* sd = side_stream(device, stream);
+    if (sd == nullptr) {                                  // first use inside a capture: one stream, the same bits
+        launch(all, stream);
+        return;
+    }
+    C10_CUDA_CHECK(cudaEventRecord(sd->fork, stream));
+    C10_CUDA_CHECK(cudaStreamWaitEvent(sd->stream.stream(), sd->fork, 0));
+    launch(side, sd->stream.stream());
+    launch(all & ~side, stream);
+    C10_CUDA_CHECK(cudaEventRecord(sd->join, sd->stream.stream()));
+    C10_CUDA_CHECK(cudaStreamWaitEvent(stream, sd->join, 0));
+}
+}  // namespace
+
 void exl3x_prompt_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
                        const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& items, const at::Tensor& counts,
                        const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
@@ -368,10 +420,13 @@ void exl3x_prompt_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Ten
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         return;
     }
-    if (cb == 0) tf_exl3x::prompt_launch<0>(a, (int)widths, stream);
-    else if (cb == 1) tf_exl3x::prompt_launch<1>(a, (int)widths, stream);
-    else if (cb == 2) tf_exl3x::prompt_launch<2>(a, (int)widths, stream);
-    else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    TORCH_CHECK(cb >= 0 && cb <= 2, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    with_side(widths, stream, X0.get_device(), [&](int w, cudaStream_t st) {
+        if (cb == 0) tf_exl3x::prompt_launch<0>(a, w, st);
+        else if (cb == 1) tf_exl3x::prompt_launch<1>(a, w, st);
+        else tf_exl3x::prompt_launch<2>(a, w, st);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -392,10 +447,13 @@ void exl3x_prompt_down_cuda(const at::Tensor& X, const at::Tensor& TP, const at:
     a.K = (int)K; a.N = (int)N; a.P = (int)P; a.E = (int)E; a.seg = (int)seg; a.wps = (int)wps;
     a.items_max = (int)items_max; a.bf16 = Y.scalar_type() == at::kBFloat16 ? 1 : 0;
     auto stream = at::cuda::getCurrentCUDAStream();
-    if (cb == 0) tf_exl3x::prompt_down_launch<0>(a, (int)widths, stream);
-    else if (cb == 1) tf_exl3x::prompt_down_launch<1>(a, (int)widths, stream);
-    else if (cb == 2) tf_exl3x::prompt_down_launch<2>(a, (int)widths, stream);
-    else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    TORCH_CHECK(cb >= 0 && cb <= 2, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    with_side(widths, stream, X.get_device(), [&](int w, cudaStream_t st) {
+        if (cb == 0) tf_exl3x::prompt_down_launch<0>(a, w, st);
+        else if (cb == 1) tf_exl3x::prompt_down_launch<1>(a, w, st);
+        else tf_exl3x::prompt_down_launch<2>(a, w, st);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

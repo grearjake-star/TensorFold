@@ -82,9 +82,17 @@ class Exl3RoutedExperts:
     keep: list = field(default_factory=list, repr=False)
     widths_gu: int = 0        # a bit per K2 gate and up hold (bit k2): the prompt kernels' instances to launch
     widths_d: int = 0
+    main_gu: int = 0          # the bit of the K2 most experts hold (gate and up; down): the other instances (the
+    main_d: int = 0           # shared expert's width) may run on a side stream beside it (TF_EXL3_PROMPT_SIDE)
 
     def nbytes_read(self, ids: Sequence[int]) -> int:
         return int(self.trellis_bytes[list(ids)].sum())
+
+
+def main_width(k2s: Sequence[int]) -> int:
+    """The bit (1 << K2) of the width most of these matrices hold (ties: the narrowest); 0 for none."""
+
+    return 1 << max(sorted(set(k2s)), key=list(k2s).count) if len(k2s) else 0
 
 
 def prepare(gate: Sequence[tuple], up: Sequence[tuple], down: Sequence[tuple], codebook: int | str,
@@ -126,7 +134,7 @@ def prepare(gate: Sequence[tuple], up: Sequence[tuple], down: Sequence[tuple], c
     return Exl3RoutedExperts(gp, upp, dp, gk, uk, dk, stack(gate, 1, D), stack(up, 1, D), stack(gate, 2, I),
                              stack(up, 2, I), stack(down, 1, I), stack(down, 2, D), E, D, I, cb,
                              (min(gks + uks), max(gks + uks)), (min(dks), max(dks)), tb, keep, bits(gks + uks),
-                             bits(dks))
+                             bits(dks), main_width(gks + uks), main_width(dks))
 
 
 def prepare_stacked(gt: torch.Tensor, ut: torch.Tensor, dt: torch.Tensor, suh_g, suh_u, svh_g, svh_u, suh_d, svh_d,
@@ -204,6 +212,18 @@ PROMPT_ROWS = int(_ENV.get("TF_EXL3_PROMPT_ROWS", "64"))
 PROMPT_TILE = 64         # pairs a prompt item holds: 4 warps of 16
 PROMPT_NT = int(_ENV.get("TF_EXL3_PROMPT_NT", "4"))     # n tiles a prompt program (4 or 8; never a pair's bits)
 ITEM_ROWS = PROMPT_ROWS if PROMPT == "items" else 0     # kept for K's guard test (0: the item path off)
+# TF_EXL3_PROMPT_SIDE=1 (default; 0 off): a layer's prompt instances other than its main width's (the shared expert's
+# 6-bit beside the routed 4-bit) run on a side stream beside the main one instead of after it. Every pair is computed
+# by the same program of the same instance either way and writes only its own rows: the same bits.
+PROMPT_SIDE = _ENV.get("TF_EXL3_PROMPT_SIDE", "1").strip() != "0"
+
+
+def launch_widths(widths: int, main: int, side: bool | None = None) -> int:
+    """The prompt launchers' ``widths``: the instances (low 32 bits) and those to run on the side stream (high)."""
+
+    side = PROMPT_SIDE if side is None else side
+    rest = widths & ~main if side and main and widths & main else 0
+    return widths | rest << 32
 ITEM_TILES = 2           # member tiles an item holds (MTB in experts_grouped.cuh: 1, 2 or 4)
 ITEM_NT = {1: 8, 2: 8, 4: 4}      # n tiles a program at each MTB (the n tiles never change a pair's bits)
 
@@ -249,7 +269,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     nt, w, sk, pf = s.cfg_gu
     if mode == "prompt":
         ext.prompt(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, plan.items, plan.counts, plan.members,
-                   s.z, 2, D, I, P, E, (D // 16) // (sk * w), w, bound, ex.cb, PROMPT_NT, ex.widths_gu)
+                   s.z, 2, D, I, P, E, (D // 16) // (sk * w), w, bound, ex.cb, PROMPT_NT,
+                   launch_widths(ex.widths_gu, ex.main_gu))
         sk = 1                           # the kernel added the splits in order: one final slice
     elif mode == "items":
         ext.grouped_items(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, plan.items, plan.counts,
@@ -263,7 +284,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     if mode == "prompt" and sk == 1:                 # down and its epilogue in one kernel (one split: no Z)
         y = y_out if y_out is not None and wts is None else s.y
         ext.prompt_down(s.xd, ex.down_ptr, ex.down_k2, ex.svh_d, plan.items, plan.counts, plan.members, y.view(-1, D),
-                        I, D, P, E, (I // 16) // w, w, bound, ex.cb, ex.widths_d)
+                        I, D, P, E, (I // 16) // w, w, bound, ex.cb, launch_widths(ex.widths_d, ex.main_d))
         if wts is None:
             return y[:P]
         if out is None:
@@ -272,7 +293,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         return out
     if mode == "prompt":
         ext.prompt(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, plan.items, plan.counts,
-                   plan.members, s.z, 1, I, D, P, E, (I // 16) // (sk * w), w, bound, ex.cb, PROMPT_NT, ex.widths_d)
+                   plan.members, s.z, 1, I, D, P, E, (I // 16) // (sk * w), w, bound, ex.cb, PROMPT_NT,
+                   launch_widths(ex.widths_d, ex.main_d))
         sk = 1
     elif mode == "items":
         ext.grouped_items(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, plan.items, plan.counts,
