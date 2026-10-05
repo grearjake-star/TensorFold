@@ -2,12 +2,14 @@
 the head's chain product calibrated by live rounds, repays the ms it adds to the round; ``--mtp-lookahead`` drafts
 toward the depth with the most expected tokens per ms of the round. Drafts change speed only: drafted output equals
 serial output, greedy and sampled, at any price. ``--mtp-live-cost`` moves either stop's prices toward the rounds'
-measured times."""
+measured times; ``--mtp-calibration depth-confidence`` calibrates chances per depth and per draft-probability bucket."""
+
+import random
 
 import pytest
 import torch
 
-from tensorfold.families.qwen4_exp.cuda.draft_price import PRIOR, RATE, DraftPrice
+from tensorfold.families.qwen4_exp.cuda.draft_price import BUCKETS, PRIOR, RATE, SHRINK, DraftPrice, bucket
 
 
 def test_each_draft_is_priced_by_the_ms_it_adds() -> None:
@@ -110,6 +112,83 @@ def test_live_cost_stops_the_lookahead_where_dear_live_drafts_no_longer_pay() ->
     assert not marginal.pays(1, 0.25)                      # 0.02 x ~15 ms
 
 
+def _stream(price: DraftPrice, rounds: int, rates: dict, seed: int = 0, sampled: bool = False) -> list:
+    """Synthetic two-draft rounds: each draft's own probability from ``rates``' keys, kept at the key's rate times its
+    probability (draft 2 only once draft 1 is kept); returns the multipliers seen over the second half."""
+
+    rng, seen = random.Random(seed), []
+    confs = list(rates)
+    for i in range(rounds):
+        price.begin(sampled)
+        a, b = rng.choice(confs), rng.choice(confs)
+        price.confs, price.products = [a, b], [a, a * b]
+        first = rng.random() < rates[a] * a
+        second = first and rng.random() < rates[b] * b
+        price.observe(2, int(first) + int(second))
+        if i >= rounds // 2:
+            seen.append([price.multiplier(0, c) for c in confs])
+    return seen
+
+
+def test_confidence_buckets_converge_to_each_buckets_kept_rate() -> None:
+    assert [bucket(p) for p in (0.0, 0.49, 0.5, 0.69, 0.7, 0.89, 0.9, 1.0)] == [0, 0, 1, 1, 2, 2, 3, 3]
+    assert BUCKETS == (0.5, 0.7, 0.9)
+    rates = {0.3: 0.4, 0.6: 0.7, 0.8: 0.9, 0.95: 1.0}       # the head overrates its low-probability drafts
+    price = DraftPrice(0.0, (30.0, 33.0, 36.0), 1.0, 2, lookahead=True, calibration="depth-confidence")
+    seen = _stream(price, 8000, rates)
+    mean = [sum(s[i] for s in seen) / len(seen) for i in range(len(rates))]
+    for got, (p, want) in zip(mean, rates.items()):         # n >> SHRINK: each bucket at its own rate
+        assert got == pytest.approx(want, abs=0.12), (p, mean)
+    assert mean == sorted(mean)
+    depth = price.ratio(0)                                  # one ratio for all: between the extremes
+    assert mean[0] < depth < mean[-1]
+    price.begin(False)
+    price.confs = [0.3]
+    assert price.chance(0, 0.3) == pytest.approx(0.3 * price.multiplier(0, 0.3))
+    assert price.chance(0, 0.3) < 0.3 * depth               # a low-probability draft priced below its depth's ratio
+    assert price.multiplier(0, None) == depth                # a draft not yet sampled: the depth's ratio
+    assert price.bseen[True][0] == [0, 0, 0, 0]             # sampled rounds keep their own buckets
+    plain = DraftPrice(0.0, (30.0, 33.0, 36.0), 1.0, 2, lookahead=True)
+    _stream(plain, 2000, rates)
+    assert plain.multiplier(0, 0.3) == plain.multiplier(0, 0.95) == plain.ratio(0)   # depth: confidence ignored
+
+
+def test_a_bucket_with_few_rounds_is_shrunk_toward_its_depth() -> None:
+    price = DraftPrice(0.0, (30.0, 33.0, 36.0), 1.0, 2, calibration="depth-confidence")
+    for _ in range(200):                                    # depth 1 learns 0.5 from confident drafts
+        price.begin(False)
+        price.confs, price.products = [0.95], [0.9]
+        price.observe(1, int(_ % 2 == 0))
+    before = price.ratio(0)
+    price.begin(False)
+    price.confs, price.products = [0.2], [0.2]
+    price.observe(1, 0)                                     # one round in the low bucket, never kept
+    depth = price.ratio(0)
+    assert abs(depth - before) < 0.1 and price.bkept[False][0][0] / price.bsaid[False][0][0] < depth
+    k, s = price.bkept[False][0][0], price.bsaid[False][0][0]
+    assert price.bseen[False][0][0] == 1
+    assert price.multiplier(0, 0.2) == pytest.approx((k / s + SHRINK * depth) / (1 + SHRINK))
+    assert abs(price.multiplier(0, 0.2) - depth) < 0.1 * depth
+    with pytest.raises(ValueError, match="calibration"):
+        DraftPrice(0.0, (30.0, 33.0), 1.0, 1, calibration="confidence")
+
+
+def test_depth_confidence_stops_a_low_probability_draft_the_depth_ratio_would_verify() -> None:
+    table = (30.0, 31.0, 32.0, 33.0)
+    prices = {c: DraftPrice(0.03, table, 0.2, 3, calibration=c) for c in ("depth", "depth-confidence")}
+    for price in prices.values():
+        for i in range(600):                                # second drafts: kept when confident, lost when not
+            conf = 0.95 if i % 2 else 0.4
+            price.begin(False)
+            price.confs, price.products = [0.95, conf], [0.95, 0.95 * conf]
+            price.observe(2, 2 if conf > 0.9 else 1)
+    for c, price in prices.items():
+        price.begin(False)
+        price.confs, price.products = [0.95, 0.4], [0.95]
+        verified = price.keeps(1, 0.38)                      # 0.03 x 1.2 ms = 0.036 tokens to repay
+        assert verified == (c == "depth"), c                 # depth: 0.38 x ~0.78; the 0.4 bucket: ~0
+
+
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 
 
@@ -182,3 +261,32 @@ def test_drafts_priced_on_live_round_times_give_the_serial_tokens(sampling_seed)
                     got = mtp_decode(e, first, 32, sampling, depth=depth, confidence=confidence, price=price)
                     assert got.tokens == ref, (depth, confidence, cost)
                 assert price.rounds > 0 and price.verify[0] > table[0]   # rounds were timed and re-priced
+
+
+@cuda
+@pytest.mark.parametrize("sampling_seed", [None, 1234])
+def test_drafts_under_depth_confidence_calibration_give_the_serial_tokens(sampling_seed) -> None:
+    from test_flashnext_forward import _model
+
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.qwen4_exp.cuda.decode import Engine, mtp_decode, prefill, serial_decode
+
+    w = _model()
+    sampling = None if sampling_seed is None else Sampling(seed=sampling_seed, temperature=0.7, top_k=20, top_p=0.8)
+    prompt = [5, 17, 99, 250, 7, 64, 30, 11, 12, 13]
+    e = Engine(w, capacity=512, max_rows=8, prefill_rows=16)
+    first = prefill(e, prompt, sampling)
+    ref = serial_decode(e, first, 32, sampling).tokens
+    table = (0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1)
+    for depth in (1, 3, 6):
+        for confidence in (0.0, 0.7):
+            for cost in (0.0, 0.2):                         # 0.0: --mtp-lookahead
+                for live in (False, True):
+                    price = DraftPrice(cost, table, 0.05, depth, lookahead=cost == 0.0, live=live,
+                                       calibration="depth-confidence")
+                    for _ in range(3):                      # later replies run on calibrated buckets
+                        assert prefill(e, prompt, sampling) == first
+                        got = mtp_decode(e, first, 32, sampling, depth=depth, confidence=confidence, price=price)
+                        assert got.tokens == ref, (depth, confidence, cost, live)
+                    mode = sampling is not None
+                    assert sum(sum(b) for b in price.bseen[mode]) > 0   # rounds filled the buckets

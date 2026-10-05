@@ -357,6 +357,13 @@ to the gap between those times and the startup prices, in the round's draft coun
 rounds, with the startup table kept at a small weight), and prices drafts on the startup table plus that line. Live
 rounds also pay for the host's side of each MTP step and the sampling, which the startup windows leave out.
 
+`--mtp-calibration depth-confidence` refines either stop's chances. By default (`depth`) a draft's chance is the head's
+chain product times one ratio per depth: the drafts live rounds kept there over the head's product for them. With
+`depth-confidence` the same ratio is also kept per bucket of the draft's own probability, [0, 0.5), [0.5, 0.7),
+[0.7, 0.9) and [0.9, 1], greedy and sampled apart, and a sampled draft uses its bucket's ratio. A bucket starts at its
+depth's ratio and is shrunk toward it while it has few rounds: with n rounds, (n x bucket + 20 x depth) / (n + 20).
+Deeper drafts not yet sampled keep the depth's rate.
+
 ## Draft vocabulary provenance
 
 Both backends read the public list in `src/tensorfold/families/qwen4_exp/cuda/draft_vocab.txt`.

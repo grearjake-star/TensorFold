@@ -249,6 +249,8 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
         if confidence > 0 or price is not None:
             d, p = e.sample_draft(logits, position + j, sampling)
             chain *= p
+            if price is not None:
+                price.confs.append(p)                    # the draft's own probability: its calibration bucket
             low = p < confidence or (price is not None and not price.keeps(j, chain))
             if low and j > 0:
                 break

@@ -1,6 +1,7 @@
 """--mtp-cost: price a later MTP draft by its calibrated chance of being kept against the ms it adds to the round;
 --mtp-lookahead: draft toward the depth that gives the most expected tokens per ms of the whole round;
---mtp-live-cost: re-price either stop from the rounds' own times as decoding goes."""
+--mtp-live-cost: re-price either stop from the rounds' own times as decoding goes;
+--mtp-calibration depth-confidence: calibrate a sampled draft's chance per depth and per its own probability's bucket."""
 
 from __future__ import annotations
 
@@ -12,15 +13,28 @@ import torch
 
 RATE = 0.05          # EMA weight of one round's observation
 PRIOR = 0.01         # weight the startup table keeps under --mtp-live-cost (the live rounds' weight grows to 1)
+BUCKETS = (0.5, 0.7, 0.9)   # --mtp-calibration depth-confidence: a draft's own probability in [0, .5), [.5, .7), ...
+SHRINK = 20.0        # rounds a bucket needs before its ratio outweighs its depth's (a bucket with n rounds: n / (n + 20))
+CALIBRATIONS = ("depth", "depth-confidence")
+
+
+def bucket(p: float) -> int:
+    """The confidence bucket of a draft whose own (temperature-1) probability is ``p``."""
+
+    return sum(p >= b for b in BUCKETS)
 
 
 class DraftPrice:
     """The measured round costs and the head's chain product calibrated per depth by the kept/drafted counts of live
     rounds (greedy and sampled apart). ``lookahead`` replaces the marginal bar at ``cost`` by the round's best depth.
-    ``live`` corrects the startup prices by a line in the round's draft count, fitted to the rounds' measured times."""
+    ``live`` corrects the startup prices by a line in the round's draft count, fitted to the rounds' measured times.
+    ``calibration="depth-confidence"`` keeps the same kept/said ratio per depth and per bucket of the draft's own
+    probability, and uses it for drafts already sampled, shrunk toward the depth's ratio while a bucket has few rounds."""
 
     def __init__(self, cost: float, verify_ms: Sequence[float], draft_ms: float, depth: int,
-                 lookahead: bool = False, live: bool = False) -> None:
+                 lookahead: bool = False, live: bool = False, calibration: str = "depth") -> None:
+        if calibration not in CALIBRATIONS:
+            raise ValueError(f"MTP calibration: one of {', '.join(CALIBRATIONS)}, not {calibration!r}")
         ms = list(verify_ms)
         while len(ms) < depth + 3:                  # windows past the measured table repeat its last step
             ms.append(ms[-1] + (ms[-1] - ms[-2]) if len(ms) > 1 else ms[-1])
@@ -32,6 +46,11 @@ class DraftPrice:
         self.table, self.live = tuple(ms), bool(live)   # the startup prices; ``verify`` follows the live line
         self.sums = [0.0] * 5                       # EMA of 1, x, x^2, y, xy over timed rounds: x drafts, y live - table
         self.rounds = 0
+        self.calibration, self.confs = calibration, []    # the drafts' own probabilities, this chain
+        n = len(BUCKETS) + 1
+        self.bkept = {m: [[None] * n for _ in range(depth)] for m in (False, True)}   # as kept/said, per bucket
+        self.bsaid = {m: [[None] * n for _ in range(depth)] for m in (False, True)}
+        self.bseen = {m: [[0] * n for _ in range(depth)] for m in (False, True)}      # rounds in each bucket
 
     def table_ms(self, drafts: int) -> float:
         """The startup table's ms for a round of ``drafts`` verified drafts: its window plus their MTP steps."""
@@ -71,11 +90,28 @@ class DraftPrice:
 
         return self.verify[j + 1] - self.verify[j] + self.draft_ms
 
-    def chance(self, j: int, product: float) -> float:
+    def ratio(self, j: int) -> float:
+        """Depth j's calibration: kept over the head's product, 1 before rounds reach it."""
+
         kept, said = self.kept[self.sampled][j], self.said[self.sampled][j]
+        return 1.0 if kept is None or said <= 0 else kept / said
+
+    def multiplier(self, j: int, conf: float | None = None) -> float:
+        """The factor on the head's chain product for draft j; with depth-confidence and the draft's own probability
+        ``conf``, its bucket's ratio shrunk toward the depth's: (n x bucket + SHRINK x depth) / (n + SHRINK)."""
+
+        depth = self.ratio(j)
+        if self.calibration == "depth" or conf is None:
+            return depth
+        m, b = self.sampled, bucket(conf)
+        kept, said, n = self.bkept[m][j][b], self.bsaid[m][j][b], self.bseen[m][j][b]
         if kept is None or said <= 0:
-            return product
-        return min(1.0, product * kept / said)
+            return depth
+        return (n * kept / said + SHRINK * depth) / (n + SHRINK)
+
+    def chance(self, j: int, product: float) -> float:
+        conf = self.confs[j] if j < len(self.confs) else None     # sampled drafts carry their own probability
+        return min(1.0, product * self.multiplier(j, conf))
 
     def pays(self, j: int, product: float) -> bool:
         """Whether draft j, at head product ``product``, repays the ms it adds at ``cost`` tokens per ms."""
@@ -121,14 +157,23 @@ class DraftPrice:
     def begin(self, sampled: bool, limit: int | None = None) -> None:
         """A new chain of at most ``limit`` drafts (the depth by default)."""
 
-        self.sampled, self.products = sampled, []
+        self.sampled, self.products, self.confs = sampled, [], []
         self.limit = self.depth if limit is None else min(int(limit), self.depth)
 
     def observe(self, verified: int, kept: int) -> None:
         """One verified round: of its ``verified`` drafts the first ``kept`` were kept."""
 
-        k, s = self.kept[self.sampled], self.said[self.sampled]
+        m = self.sampled
+        k, s = self.kept[m], self.said[m]
         for j, p in enumerate(self.products[:verified]):
+            if j < len(self.confs):                 # each bucket's ratio, seeded at its depth's
+                b = bucket(self.confs[j])
+                bk, bs = self.bkept[m][j], self.bsaid[m][j]
+                if bk[b] is None:
+                    bk[b], bs[b] = p * self.ratio(j), p
+                bk[b] += RATE * (float(j < kept) - bk[b])
+                bs[b] += RATE * (p - bs[b])
+                self.bseen[m][j][b] += 1
             if k[j] is None:                        # seeded by the head's product: scale 1 until rounds say more
                 k[j] = s[j] = p
             k[j] += RATE * (float(j < kept) - k[j])
@@ -137,6 +182,8 @@ class DraftPrice:
     def describe(self) -> str:
         v = self.verify
         ahead = "look-ahead over every depth; " if self.lookahead else ""
+        if self.calibration != "depth":
+            ahead += f"chances calibrated per depth and draft probability ({', '.join(map(str, BUCKETS))}); "
         if self.live:
             ahead += "re-priced by live round times from: "
         return (f"{ahead}verify {v[0]:.1f}-{v[self.depth]:.1f} ms for 1-{self.depth + 1} rows, a draft step "

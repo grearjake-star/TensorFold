@@ -90,6 +90,13 @@ def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any =
                              f"{'CUDA' if backend == 'cuda' else 'MLX'} has no such rule")
         if not ((cost or 0) > 0 or getattr(args, "mtp_lookahead", None)):
             raise ValueError("--mtp-live-cost re-prices --mtp-cost or --mtp-lookahead: add one")
+    if getattr(args, "mtp_calibration", None):
+        engine = getattr(family.package, "cuda_engine", None) if backend == "cuda" else None
+        if engine is None or "mtp_calibration" not in inspect.signature(engine).parameters:
+            raise ValueError(f"--mtp-calibration calibrates a CUDA engine's MTP drafts; {family.title} on "
+                             f"{'CUDA' if backend == 'cuda' else 'MLX'} has no such rule")
+        if not ((cost or 0) > 0 or getattr(args, "mtp_lookahead", None)):
+            raise ValueError("--mtp-calibration calibrates --mtp-cost or --mtp-lookahead: add one")
     confidence = getattr(args, "mtp_confidence", None)
     if confidence is None:
         return

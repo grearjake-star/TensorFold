@@ -38,7 +38,8 @@ class FlashNextEngine:
                  context_explicit: bool | None = None, tp: int = 1, rank: int = 0, master: str = "", port: int = 29551,
                  prefetch: bool = True, graphs: bool = True, streams: int = 1, ple_on_ssd: bool = False,
                  kv_dtype: str = "bf16", share: float = 0.0, vision: bool = False, vision_urls: bool = False,
-                 cost: float = 0.0, lookahead: bool = False, live_cost: bool = False) -> None:
+                 cost: float = 0.0, lookahead: bool = False, live_cost: bool = False,
+                 calibration: str = "depth") -> None:
         import torch
 
         from .exl3_pack import admission, extra_files, is_exl3
@@ -80,6 +81,11 @@ class FlashNextEngine:
             raise ValueError("--mtp-cost and --mtp-lookahead are two draft stops: pick one")
         if live_cost and not (float(cost) > 0 or lookahead):
             raise ValueError("--mtp-live-cost re-prices --mtp-cost or --mtp-lookahead: add one")
+        from .draft_price import CALIBRATIONS
+        if calibration not in CALIBRATIONS:
+            raise ValueError(f"--mtp-calibration: one of {', '.join(CALIBRATIONS)}, not {calibration!r}")
+        if calibration != "depth" and not (float(cost) > 0 or lookahead):
+            raise ValueError("--mtp-calibration calibrates --mtp-cost or --mtp-lookahead: add one")
         if (float(cost) > 0 or lookahead) and (streams > 1 or tp > 1):
             raise ValueError("the expected-time draft stop prices one stream's rounds on one GPU: drop --mtp-cost "
                              "or --mtp-lookahead, or --parallel / --tp 2")
@@ -88,6 +94,7 @@ class FlashNextEngine:
         self.cost = float(cost) if self.depth else 0.0
         self.lookahead = bool(lookahead) and self.depth > 0
         self.live_cost = bool(live_cost)
+        self.calibration = calibration
         self.kv_dtype = check_kv(kv_dtype)
         self.comm = None
         self.vision = None                   # the image tower (``QwenCudaVision``) with --vision
@@ -203,7 +210,8 @@ class FlashNextEngine:
             warm(self.e)
             if self.cost > 0 or self.lookahead:       # the stop prices drafts with this engine's own round costs
                 self.price = DraftPrice(self.cost, *measure_round_costs(self.e, self.depth + 1), self.depth,
-                                        lookahead=self.lookahead, live=self.live_cost)
+                                        lookahead=self.lookahead, live=self.live_cost,
+                                        calibration=self.calibration)
         if self.vision is not None:
             self.vision.warm()
             torch.cuda.empty_cache()

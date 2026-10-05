@@ -89,6 +89,9 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
     speed.add_argument("--mtp-live-cost", action="store_true", default=None,
                        help="on CUDA, re-price --mtp-cost or --mtp-lookahead from the rounds' own measured times as "
                             "decoding goes, starting from the startup prices (default off)")
+    speed.add_argument("--mtp-calibration", choices=("depth", "depth-confidence"), default=None,
+                       help="on CUDA, calibrate --mtp-cost or --mtp-lookahead's draft chances by the drafts live "
+                            "rounds kept per depth (default), or per depth and per bucket of the draft's own probability")
     speed.add_argument("--lane-kernels", choices=("auto", "on", "off"), default="auto",
                        help="lane kernels for Qwen3.8 dense (auto: on GPUs with tensor units)")
     speed.add_argument("--prompt-cache-gib", type=float, default=None,

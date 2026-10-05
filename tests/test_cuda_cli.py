@@ -167,6 +167,11 @@ def test_serve_parses_the_kv_cache_flag():
     assert cli.build_parser().parse_args(["serve", "owner/model"]).mtp_lookahead is None
     assert cli.build_parser().parse_args(["serve", "owner/model", "--mtp-live-cost"]).mtp_live_cost is True
     assert cli.build_parser().parse_args(["serve", "owner/model"]).mtp_live_cost is None
+    assert cli.build_parser().parse_args(
+        ["serve", "owner/model", "--mtp-calibration", "depth-confidence"]).mtp_calibration == "depth-confidence"
+    assert cli.build_parser().parse_args(["serve", "owner/model"]).mtp_calibration is None
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["serve", "owner/model", "--mtp-calibration", "confidence"])
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["serve", "owner/model", "--kv-dtype", "fp8"])
 
@@ -219,6 +224,9 @@ def test_kv_dtype_reaches_only_the_families_that_declare_it(tmp_path, monkeypatc
     (["--mtp-live-cost", "--mtp-cost", "0.06"], "cuda", "glm5_next", "on CUDA has no such rule"),
     (["--mtp-live-cost"], "cuda", "qwen4_exp", "add one"),
     (["--mtp-live-cost", "--mtp-cost", "0"], "cuda", "qwen4_exp", "add one"),
+    (["--mtp-calibration", "depth-confidence", "--mtp-lookahead"], "mlx", "qwen4_exp", "on MLX has no such rule"),
+    (["--mtp-calibration", "depth-confidence", "--mtp-cost", "0.06"], "cuda", "glm5_next", "on CUDA has no such rule"),
+    (["--mtp-calibration", "depth-confidence"], "cuda", "qwen4_exp", "add one"),
     (["--prefill-fp8"], "mlx", "qwen3_5", "Qwen3.8 dense on MLX has none"),
     (["--prefill-fp8"], "cuda", "nemotron_h", "on CUDA has none"),
     (["--prefill-fp8"], "cuda", "glm5_next", "on CUDA has none"),
@@ -248,7 +256,9 @@ def test_cache_and_confidence_options_are_refused_before_any_download(tmp_path, 
                                    ["--mtp-confidence", "0"], ["--mtp-confidence", "1"], ["--mtp-cost", "0.06"],
                                    ["--mtp-cost", "0", "--parallel", "2"], ["--mtp-lookahead"],
                                    ["--mtp-lookahead", "--mtp-cost", "0"], ["--mtp-lookahead", "--mtp-live-cost"],
-                                   ["--mtp-cost", "0.06", "--mtp-live-cost"]])
+                                   ["--mtp-cost", "0.06", "--mtp-live-cost"],
+                                   ["--mtp-lookahead", "--mtp-calibration", "depth-confidence"],
+                                   ["--mtp-cost", "0.06", "--mtp-calibration", "depth"]])
 def test_flash_next_on_cuda_takes_both_options(tmp_path, flags):
     from tensorfold.families import qwen4_exp
 
@@ -311,6 +321,9 @@ def test_no_cuda_engine_serves_one_token_a_round_by_default(tmp_path, monkeypatc
     assert made[-1]["live_cost"] is False                                  # startup prices unless asked
     qwen4_exp.cuda_engine(tmp_path, mtp_lookahead=True, mtp_live_cost=True)
     assert made[-1]["live_cost"] is True
+    assert made[-1]["calibration"] == "depth"                              # one ratio per depth unless asked
+    qwen4_exp.cuda_engine(tmp_path, mtp_lookahead=True, mtp_calibration="depth-confidence")
+    assert made[-1]["calibration"] == "depth-confidence"
     assert made[-1]["share"] == 0.0                                        # whole prompt passes unless asked
     assert qwen4_exp.cuda_engine(tmp_path, decode_share=0.25).share == 0.25
 
