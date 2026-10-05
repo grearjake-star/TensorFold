@@ -260,7 +260,9 @@ def test_drafts_priced_on_live_round_times_give_the_serial_tokens(sampling_seed)
                     assert prefill(e, prompt, sampling) == first
                     got = mtp_decode(e, first, 32, sampling, depth=depth, confidence=confidence, price=price)
                     assert got.tokens == ref, (depth, confidence, cost)
-                assert price.rounds > 0 and price.verify[0] > table[0]   # rounds were timed and re-priced
+                # rounds were timed and re-priced: the drafted rows (at depth 1 every round has one draft, so the
+                # table's weight at 0 drafts holds the 0-draft price and only the slope moves)
+                assert price.rounds > 0 and price.verify[depth] > table[depth]
 
 
 @cuda
