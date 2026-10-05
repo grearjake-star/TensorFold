@@ -267,9 +267,16 @@ class Times:
         self.prep = self.draft = 0.0
         self.t0 = self.mark = None
         self.replay = False
+        self.stage, self.majflt = 0.0, 0         # D4: stage's share of prep and its major page faults (replayed)
+        self._staged = None
 
     def start(self) -> None:
-        self.t0, self.mark = time.perf_counter(), None
+        self.t0, self.mark, self._staged = time.perf_counter(), None, None
+
+    def staged(self, seconds: float, faults: int) -> None:
+        """This round's ``stage`` took ``seconds`` with ``faults`` major page faults (charged if its graph replays)."""
+
+        self._staged = (seconds, faults)
 
     def launched(self, replay: bool) -> None:
         """The main graph is about to launch (``replay``: its graph is kept)."""
@@ -280,7 +287,10 @@ class Times:
         if replay:
             self.prep += time.perf_counter() - self.t0
             self.rounds += 1
-        self.t0 = None
+            if self._staged is not None:
+                self.stage += self._staged[0]
+                self.majflt += self._staged[1]
+        self.t0, self._staged = None, None
 
     def picked(self) -> None:
         self.mark = time.perf_counter() if self.replay else None
@@ -295,4 +305,5 @@ class Times:
         """Cumulative since start: host ms before replayed main launches, host ms between draft read-backs and
         replayed MTP launches in those rounds, and their counts (a log reader diffs two done lines)."""
 
-        return f"host_ms=prep:{self.prep * 1e3:.1f},draft:{self.draft * 1e3:.1f},rounds:{self.rounds},steps:{self.steps}"
+        return (f"host_ms=prep:{self.prep * 1e3:.1f},draft:{self.draft * 1e3:.1f},rounds:{self.rounds},steps:{self.steps}"
+                f",stage:{self.stage * 1e3:.1f},majflt:{self.majflt}")

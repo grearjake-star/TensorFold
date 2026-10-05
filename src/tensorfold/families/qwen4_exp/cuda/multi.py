@@ -20,7 +20,7 @@ from tensorfold.engine.grammar import GrammarError
 
 from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _gathered_fits, cost_bars, choose_gathered_streams,
                      entry_end, prefill_begin, tp_sample_rows)
-from . import attn_multi, gdn_multi, heads, image_rows, prefixes
+from . import attn_multi, decode_ahead, gdn_multi, heads, image_rows, prefixes
 from .draft_cost import joint_bars, joint_settings
 from .multi_graphs import RoundGraphs, bucket, fold
 from .forward import commit, compute, compute_mixed, converges, stage
@@ -414,7 +414,11 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             times.start()
         t0 = time.perf_counter()
         windows = [(s.st, [s.out[-1]] + list(s.drafts)) for s in live]
+        if times is not None:
+            t_stage, f_stage = time.perf_counter(), decode_ahead.faults()
         segs = stage(self.w, self.buf, windows)
+        if times is not None:
+            times.staged(time.perf_counter() - t_stage, decode_ahead.faults() - f_stage)
         # a pass shares the round's forward only where their experts share a launch; else _fill ran it between rounds
         width = self.pass_width if self.w.comm is not None else self._pass_rows()
         pieces, psegs = (self._pieces(width) if self.filling and self.converged else []), None
@@ -495,8 +499,12 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                     s.error = exc
             last = s.error is not None or len(s.out) + len(new) >= s.count or end in self._ends(s)
             kept.append((s, a0, rows[:len(path)], new, last))
+        # D4: the next windows' n-gram pages are asked for row by row while the draft chain runs (residency only)
+        ahead = decode_ahead.rows(self.w) if self.w.comm is None else None
+        decode_ahead.start(ahead, [(s.sid, s.st, new[-1]) for s, _, _, new, last in kept
+                                   if not last and s.error is None])
         self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last],
-                        rows=sum(1 for *_, last in kept if not last))
+                        rows=sum(1 for *_, last in kept if not last), ahead=ahead)
         for s, _, _, new, _ in kept:
             if s.error is not None:
                 s.done = True
@@ -511,7 +519,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             self.held.pop(s.sid, None)
         return failed + done + ended
 
-    def _draft_all(self, streams: list, rows: int | None = None) -> None:
+    def _draft_all(self, streams: list, rows: int | None = None, ahead=None) -> None:
         """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth.
 
         ``rows``: the streams the next round verifies (each its pending row), drafting or not; with joint pricing
@@ -523,6 +531,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         room = {s.sid: min(self.depth, s.count - len(s.out) - len(keep)) for s, _, keep in streams}
         todo = [(s, a0, keep) for s, a0, keep in streams if room[s.sid] > 0 and self.mbuf is not None]
         if not todo:
+            if ahead is not None:
+                ahead.send()
             return
         for s, _, _ in todo:
             st = s.st
@@ -530,6 +540,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                 st.set_mtp_len(st.mtp_len - st.mtp_drafted)
                 st.mtp_drafted = 0
         logits, prevs = self._mtp_windows([(s.st, keep, self.buf.streams[a0:a0 + len(keep)]) for s, a0, keep in todo])
+        if ahead is not None:
+            ahead.send()                             # rows 0, while the first MTP step runs
         for s, _, keep in todo:
             s.st.set_mtp_len(s.st.mtp_len + len(keep))
         active = [(s, prev) for (s, _, _), prev in zip(todo, prevs)]
@@ -554,14 +566,20 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                 if low and j > 0:
                     continue
                 s.drafts.append(d)
+                if ahead is not None:
+                    ahead.add(s.sid, d)
                 if joint is not None:
                     joint.take()                     # the round verifies one more row
                 after = joint.bar() if joint is not None else bars[j + 1] if bars is not None else None
                 if not low and j + 1 < room[s.sid] and not (after is not None and c < after):
                     nxt.append((s, prev, d))
             if not nxt:
+                if ahead is not None:
+                    ahead.send()                     # the last drafts: no MTP step left to hide behind
                 return
             logits, prevs = self._mtp_windows([(s.st, [d], prev) for s, prev, d in nxt])
+            if ahead is not None:
+                ahead.send()                         # this depth's drafts, while the next MTP step runs
             for s, _, _ in nxt:
                 s.st.set_mtp_len(s.st.mtp_len + 1)
                 s.st.mtp_drafted += 1

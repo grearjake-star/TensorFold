@@ -11,6 +11,7 @@ from tensorfold.cuda.logprobs import capture
 from tensorfold.cuda.memory_gate import NoRoom
 from tensorfold.cuda.streams import Stream, accept
 
+from . import decode_ahead
 from .decode import Engine, draft
 from .forward import commit
 from .state import Buffers
@@ -224,10 +225,17 @@ class Alone:
         last = len(s.out) + len(new) >= s.count or end in self._ends(s)
         s.drafts = []
         room = min(self.depth, s.count - len(s.out) - len(path))
+        # D4: the next window's n-gram pages are asked for row by row while the draft chain runs (residency only)
+        ahead = decode_ahead.rows(self.w) if not last and getattr(self.w, "comm", None) is None else None
+        decode_ahead.start(ahead, [(0, st, end)])
         if not last and room > 0:
             more = {"cost": self.cost} if self.cost > 0 else {}
+            if ahead is not None:
+                more["ahead"] = ahead
             s.drafts = draft(e, e.buf.streams[:len(path)], rows[:len(path)], st.pos + 1, room, s.sampling,
                              self.confidence, **more)
+        elif ahead is not None:
+            ahead.send()
         s.take(new, self._ends(s))
         self._timed(time.perf_counter() - t0, 0)    # a prompt arriving next sizes its passes by this round's time
         return [s] if s.done else []

@@ -266,16 +266,19 @@ def absorb(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int]) -> torc
 
 
 def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position: int, count: int,
-          sampling: Sampling | None, confidence: float = 0.0, cost: float = 0.0) -> list[int]:
+          sampling: Sampling | None, confidence: float = 0.0, cost: float = 0.0, ahead=None) -> list[int]:
     """Absorb kept rows and chain drafts, always retaining the first even below ``confidence``, then stopping before later drafts below it or after a low-confidence first draft.
 
     ``cost`` > 0 (tokens per ms) also stops before a later draft whose chance of being reached and kept, the product
     of the head's probabilities of drafts 1..j, is under its bar (``cost_bars``): a long chain of middling drafts
     costs verify rows it rarely repays. The MTP step of a draft the product already fails is skipped (products only
-    fall). Speed only: drafts never change the output."""
+    fall). Speed only: drafts never change the output. ``ahead`` (decode_ahead.Rows, key 0): each draft's n-gram
+    pages are asked for once the next MTP step is launched (residency only)."""
 
     st = e.st
     logits = absorb(e, streams, next_tokens)
+    if ahead is not None:
+        ahead.send()                                     # row 0 while the absorb step runs
     drafts: list[int] = []
     bars = cost_bars(cost, count, getattr(e, "timing", None)) if cost > 0 else None
     chain = 1.0
@@ -290,14 +293,20 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
         else:
             d = e.sample(logits[:1], [position + j], sampling, draft=True)[0]
         drafts.append(d)
+        if ahead is not None:
+            ahead.add(0, d)
         if low or (bars is not None and chain < bars[j + 1]):
             break
         if j + 1 < count:
             prev = e.mbuf.streams[len(next_tokens) - 1:len(next_tokens)] if j == 0 else e.mbuf.streams[:1]
             logits = e.mtp_forward([d], prev)
+            if ahead is not None:
+                ahead.send()
             st.set_mtp_len(st.mtp_len + 1)
             st.mtp_drafted += 1
             next_tokens = [d]
+    if ahead is not None:
+        ahead.send()
     return drafts
 
 
