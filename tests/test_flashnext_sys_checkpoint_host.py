@@ -5,7 +5,7 @@ count against ``keep``, are capped, are never recorded as warm starts, and resum
 import pytest
 
 from tensorfold.cuda import markers
-from tensorfold.cuda.markers import MIN_GAP, snapshot_points
+from tensorfold.cuda.markers import MIN_GAP, checkpoint_rows, snapshot_points
 from tensorfold.families.qwen4_exp.cuda import prefixes
 
 OPEN, ASSISTANT = 900, 901
@@ -17,7 +17,7 @@ def _prompt(system: int, user: int, tail: int = 0) -> list[int]:
 
 def test_the_checkpoint_is_the_last_granule_at_least_min_gap_before_the_block_end(monkeypatch):
     monkeypatch.delenv("TF_SYS_CHECKPOINT", raising=False)
-    points = snapshot_points((OPEN,), (OPEN, ASSISTANT))
+    points = snapshot_points((OPEN,), (OPEN, ASSISTANT), checkpoint_rows())
     ids = _prompt(13123, 600)                        # the second message starts at 13124 (Hermes-sized)
     assert points.checkpoint(ids) == 12288
     assert points(ids) == [12288, 13124, len(ids) - 3]
@@ -26,10 +26,10 @@ def test_the_checkpoint_is_the_last_granule_at_least_min_gap_before_the_block_en
     assert points.checkpoint(_prompt(2000, 600)) is None         # shorter than a granule + MIN_GAP: none
     assert points.checkpoint([5] * 30000) is None                # no second message
     monkeypatch.setenv("TF_SYS_CHECKPOINT", "0")
-    off = snapshot_points((OPEN,), (OPEN, ASSISTANT))
+    off = snapshot_points((OPEN,), (OPEN, ASSISTANT), checkpoint_rows())
     assert off.checkpoint(ids) is None and off(ids) == [13124, len(ids) - 3]
     monkeypatch.setenv("TF_SYS_CHECKPOINT", "4096")
-    assert snapshot_points((OPEN,), (OPEN, ASSISTANT)).checkpoint(ids) == 12288
+    assert snapshot_points((OPEN,), (OPEN, ASSISTANT), checkpoint_rows()).checkpoint(ids) == 12288
     monkeypatch.setenv("TF_SYS_CHECKPOINT", "100")
     with pytest.raises(ValueError):
         markers.checkpoint_rows()
@@ -37,7 +37,7 @@ def test_the_checkpoint_is_the_last_granule_at_least_min_gap_before_the_block_en
 
 def test_two_blocks_differing_only_near_the_end_share_the_checkpoint(monkeypatch):
     monkeypatch.delenv("TF_SYS_CHECKPOINT", raising=False)
-    points = snapshot_points((OPEN,), (OPEN, ASSISTANT))
+    points = snapshot_points((OPEN,), (OPEN, ASSISTANT), checkpoint_rows())
     a = _prompt(12600, 300, tail=500)
     b = [OPEN] + [5] * 12600 + [7] * 500 + [OPEN] + [6] * 300 + [OPEN, ASSISTANT, 8]
     assert points.checkpoint(a) == points.checkpoint(b) == 12800 // 2048 * 2048

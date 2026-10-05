@@ -12,7 +12,7 @@ if torch.cuda.get_device_capability()[0] != 12:
 
 from test_flashnext_forward import V, _model  # noqa: E402
 
-from tensorfold.cuda.markers import snapshot_points  # noqa: E402
+from tensorfold.cuda.markers import checkpoint_rows, snapshot_points  # noqa: E402
 from tensorfold.cuda.streams import Stream  # noqa: E402
 from tensorfold.engine.exact_sampling import Sampling  # noqa: E402
 from tensorfold.families.qwen4_exp.cuda.decode import Engine, prefill, serial_decode  # noqa: E402
@@ -37,7 +37,7 @@ def test_a_block_with_a_new_tail_resumes_from_the_checkpoint_with_a_fresh_prefil
     tail_b = torch.randint(1, V - 2, (75,), generator=g).tolist()            # a different "date line"
     user = torch.randint(1, V - 2, (20,), generator=g).tolist()
     a, b = _chat(fixed + tail_a, user), _chat(fixed + tail_b, user[:12])
-    points = snapshot_points((OPEN,), (OPEN, ASSISTANT))
+    points = snapshot_points((OPEN,), (OPEN, ASSISTANT), checkpoint_rows())
     cp = points.checkpoint(a)
     assert cp == points.checkpoint(b) == 512 and a[:cp] == b[:cp]
 
@@ -63,7 +63,7 @@ def test_a_block_with_a_new_tail_resumes_from_the_checkpoint_with_a_fresh_prefil
 
     monkeypatch.setenv("TF_SYS_CHECKPOINT", "0")                 # off: the same replies, no checkpoint kept
     off = MultiDecoder(w, slots=3, capacity=1024, depth=3, confidence=0.3, kv_dtype=kv_dtype,
-                       points=snapshot_points((OPEN,), (OPEN, ASSISTANT)))
+                       points=snapshot_points((OPEN,), (OPEN, ASSISTANT), checkpoint_rows()))
     assert run(off, a, 10).out == first.out
     b_off = run(off, b, 10)
     assert b_off.cached < cp and b_off.out == second.out and not getattr(off, "checkpoints", set())

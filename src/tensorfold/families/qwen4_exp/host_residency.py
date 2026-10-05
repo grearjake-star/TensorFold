@@ -185,10 +185,12 @@ class _Residency:
         self._locked = locked
         return total
 
-    def lock_next(self, names: tuple[str, ...], budget: int, guard=None) -> int:
+    def lock_next(self, names: tuple[str, ...], budget: int, guard=None, keep=None) -> int:
         """Re-pin (TF_NGRAM_REPIN): mlock the first array of ``names`` (``lock_parts`` order) not locked now, if the
         locked total stays within ``budget``; bytes locked (0: none left or fits, or mlock refused). ``guard`` (a lock)
-        covers only the reads and the append, not the mlock: a concurrent ``release`` never waits on page reads."""
+        covers only the reads and the append, not the mlock: a concurrent ``release`` never waits on page reads.
+        ``keep`` (called under ``guard`` once the mlock is done): False unpins the run again and returns 0, for a
+        release that ran during the mlock (a growing cache needed the memory this run now holds)."""
 
         import contextlib
 
@@ -204,6 +206,9 @@ class _Residency:
         if _libc().mlock(*pick) != 0:
             return 0
         with guard:
+            if keep is not None and not keep():
+                _libc().munlock(*pick)              # never appended: no release could have unpinned it
+                return 0
             self._locked = getattr(self, "_locked", [])
             self._locked.append(pick)               # the latest locked is the first ``release`` unpins again
         return pick[1]

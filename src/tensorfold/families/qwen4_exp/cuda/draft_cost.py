@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 
 # Verify windows of 1, 2, ... rows at an 8K context on DGX Spark, ms (0.3.6.2 kernels, real reply tokens, CUDA graphs;
@@ -69,14 +70,21 @@ def joint_settings(env=os.environ) -> dict | None:
         return None
     rate = None
     if env.get("TF_JOINT_RATE", "").strip():
-        rate = float(env["TF_JOINT_RATE"])
-        if rate <= 0:
-            raise ValueError("TF_JOINT_RATE: tokens per ms over all streams, more than 0")
+        try:
+            rate = float(env["TF_JOINT_RATE"])
+        except ValueError:
+            rate = math.nan
+        if not math.isfinite(rate) or rate <= 0:              # nan / inf priced every draft as free or never
+            raise ValueError(f"TF_JOINT_RATE: tokens per ms over all streams, more than 0, not {env['TF_JOINT_RATE']!r}")
     verify = None
     if env.get("TF_JOINT_VERIFY_MS", "").strip():
-        verify = tuple(float(x) for x in env["TF_JOINT_VERIFY_MS"].split(","))
-        if len(verify) < 2 or any(b < a for a, b in zip(verify, verify[1:])) or verify[0] <= 0:
-            raise ValueError("TF_JOINT_VERIFY_MS: at least two positive, non-decreasing window times (ms)")
+        try:
+            verify = tuple(float(x) for x in env["TF_JOINT_VERIFY_MS"].split(","))
+        except ValueError:
+            verify = ()
+        if (len(verify) < 2 or not all(math.isfinite(x) for x in verify)
+                or any(b < a for a, b in zip(verify, verify[1:])) or verify[0] <= 0):
+            raise ValueError("TF_JOINT_VERIFY_MS: at least two positive, finite, non-decreasing window times (ms)")
     return {"rate": rate, "verify": verify}
 
 

@@ -23,7 +23,17 @@ def _tile(m: int) -> int:
 # S1-ROUTE experiment: TF_ROUTER_BE (default 32) = experts a router program takes for <= 16 rows (decode). 16 doubles
 # the programs on the 2.6 MB read (17 -> 33 for 513 rows); each logit keeps its K order (BK steps, the same MMA
 # shape): kept only if tests/cuda/test_moe_route_fused.py shows the same bits.
-ROUTER_BE = int(__import__("os").environ.get("TF_ROUTER_BE", "32"))
+def router_be(env=None) -> int:
+    """TF_ROUTER_BE: 16, 32 (default) or 64 (a power of two the router's tl.arange takes; anything else used to fail
+    at the first decode round instead of at start-up)."""
+
+    raw = (__import__("os").environ if env is None else env).get("TF_ROUTER_BE", "").strip() or "32"
+    if raw not in ("16", "32", "64"):
+        raise ValueError(f"TF_ROUTER_BE: 16, 32 or 64, not {raw!r}")
+    return int(raw)
+
+
+ROUTER_BE = router_be()
 
 
 @triton.jit

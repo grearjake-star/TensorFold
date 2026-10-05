@@ -113,6 +113,7 @@ class Residency:
         """Pin back one released run if every condition holds (see the class note); bytes re-pinned."""
 
         now = self.clock() if now is None else now
+        seen = self._last_release                # a release after this (during the mlock) cancels the run
         if not self.target or now - self._last_release < self.COOLDOWN or now - self._last_repin < self.PERIOD:
             return 0
         if self.busy is not None and self.busy():
@@ -126,7 +127,10 @@ class Residency:
                 continue
             names = t.DENSE if self.names == "dense" else tuple(t.parts())
             mine = t.locked_bytes()
-            got = t.lock_next(names, mine + min(self.target - held, afford), self._guard)
+            got = t.lock_next(names, mine + min(self.target - held, afford), self._guard,
+                              keep=lambda: self._last_release == seen)
+            if not got and self._last_release != seen:
+                break                                # a cache grew meanwhile: no run this period
             if got:
                 self._last_repin = now
                 self.repinned += got

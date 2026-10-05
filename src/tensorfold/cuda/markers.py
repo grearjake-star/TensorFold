@@ -41,13 +41,18 @@ class TemplateTokens:
         return self.tok.encode(text, add_special_tokens=False).ids if tokenize else text
 
 
-def snapshot_points(openers: Sequence[int], assistant: Sequence[int]) -> Callable[[Sequence[int]], list[int]]:
-    """Where a prefill keeps states: the second message's start (a shared system block) and the last assistant start."""
+def snapshot_points(openers: Sequence[int], assistant: Sequence[int],
+                    checkpoint: int = 0) -> Callable[[Sequence[int]], list[int]]:
+    """Where a prefill keeps states: the second message's start (a shared system block) and the last assistant start.
+    ``checkpoint`` rows (0: none; Flash Next passes ``checkpoint_rows()``): also the system-block checkpoint, which
+    ``points.checkpoint`` returns. Other engines keep no checkpoint: their kept-state policies do not know one."""
 
     from tensorfold.engine.prefill_plan import PrefillPlan
 
     plan = PrefillPlan(openers=openers, assistant=assistant, min_chunk=max(MIN_GAP, len(assistant)))
-    granule = checkpoint_rows()
+    granule = int(checkpoint)
+    if granule < 0 or 0 < granule < MIN_GAP:
+        raise ValueError(f"checkpoint: 0 (none) or at least {MIN_GAP} rows, not {granule}")
 
     def checkpoint(ids: Sequence[int]) -> int | None:
         """The system-block checkpoint: the last multiple of the granule at least MIN_GAP before the second message's
@@ -79,8 +84,9 @@ def snapshot_points(openers: Sequence[int], assistant: Sequence[int]) -> Callabl
     return points
 
 
-def resume_points(model_dir: str | Path) -> Callable[[Sequence[int]], list[int]] | None:
-    """``snapshot_points`` for this checkpoint's chat template, or None when it marks no message starts."""
+def resume_points(model_dir: str | Path, checkpoint: int = 0) -> Callable[[Sequence[int]], list[int]] | None:
+    """``snapshot_points`` for this checkpoint's chat template (``checkpoint``: its system-block checkpoint rows, 0
+    none), or None when it marks no message starts."""
 
     from tokenizers import Tokenizer
 
@@ -96,4 +102,4 @@ def resume_points(model_dir: str | Path) -> Callable[[Sequence[int]], list[int]]
         openers, assistant = message_markers(tokens)
     except (OSError, ValueError, KeyError):
         return None
-    return snapshot_points(openers, assistant) if openers or assistant else None
+    return snapshot_points(openers, assistant, checkpoint) if openers or assistant else None

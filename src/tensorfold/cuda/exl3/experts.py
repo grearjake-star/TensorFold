@@ -216,7 +216,36 @@ ITEM_ROWS = PROMPT_ROWS if PROMPT == "items" else 0     # kept for K's guard tes
 # TF_EXL3_PROMPT_SIDE=1 (default; 0 off): a layer's prompt instances other than its main width's (the shared expert's
 # 6-bit beside the routed 4-bit) run on a side stream beside the main one instead of after it. Every pair is computed
 # by the same program of the same instance either way and writes only its own rows: the same bits.
-PROMPT_SIDE = _ENV.get("TF_EXL3_PROMPT_SIDE", "1").strip() != "0"
+
+
+def env_choice(name: str, default: str, extra: tuple[str, ...] = (), env=None) -> str:
+    """A switch knob: "1" (1/on/true/yes), "0" (0/off/false/no) or one of ``extra``; unset or empty: ``default``.
+    Anything else refuses to start with the knob's name (before this, "off" read as on)."""
+
+    raw = (_ENV if env is None else env).get(name, "").strip().lower() or default
+    if raw in ("1", "on", "true", "yes"):
+        return "1"
+    if raw in ("0", "off", "false", "no"):
+        return "0"
+    if raw in extra:
+        return raw
+    raise ValueError(f"{name}: 0 or 1{''.join(f' or {x}' for x in extra)}, not {raw!r}")
+
+
+def env_rows(name: str, default: int, env=None) -> int:
+    """A row-count knob: a whole number, 0 or more; unset or empty: ``default``."""
+
+    raw = (_ENV if env is None else env).get(name, "").strip()
+    try:
+        rows = int(raw) if raw else default
+    except ValueError:
+        raise ValueError(f"{name}: a whole number of rows, not {raw!r}") from None
+    if rows < 0:
+        raise ValueError(f"{name}: 0 or more rows, not {rows}")
+    return rows
+
+
+PROMPT_SIDE = env_choice("TF_EXL3_PROMPT_SIDE", "1") == "1"
 
 
 def launch_widths(widths: int, main: int, side: bool | None = None) -> int:
@@ -243,12 +272,12 @@ def _mode(R: int, group: bool) -> str:
 # grouping and rot_in as one launch (``route``) after the router, for windows the grouping kernel takes (rows <=
 # TF_EXL3_PROMPT_ROWS) up to TF_MOE_ROUTE_ROWS rows. The kernel repeats each step's arithmetic in the same order: the
 # same picks, weights, groups and rotated rows, bit for bit (tests/cuda/test_moe_route_fused.py).
-_ROUTE = _ENV.get("TF_MOE_ROUTE_FUSED", "1").strip().lower()
+_ROUTE = env_choice("TF_MOE_ROUTE_FUSED", "1", ("single",))
 ROUTE_FUSED = _ROUTE != "0"
 # "1" (default): top-k + weights + grouping in one block (select_group), then rot_in's own unchanged launch: 3 launches
 # -> 2. "single": all three in one grid (route_kernel; redoes each pair's top-k: measured slower, kept for the bench).
 ROUTE_SINGLE = _ROUTE == "single"
-ROUTE_ROWS = int(_ENV.get("TF_MOE_ROUTE_ROWS", "64"))
+ROUTE_ROWS = env_rows("TF_MOE_ROUTE_ROWS", 64)
 
 
 def route_ok(R: int, x: torch.Tensor, ex: Exl3RoutedExperts, s: Scratch, top_k: int, experts: int,
