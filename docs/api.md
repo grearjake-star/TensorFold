@@ -1,5 +1,8 @@
 # Compatible APIs
 
+> This fork (spark-exl3) ships the CUDA server only. Sentences below about the MLX server describe upstream's Apple
+> Silicon engine and do not apply here.
+
 The base URL is `http://127.0.0.1:8080/v1` with the default server settings.
 
 ## API keys
@@ -132,7 +135,7 @@ When a client disconnects, its CUDA request stops at the next round, and a reque
 another in one-at-a-time serving does not start; two-rank Flash Next, Nemotron and GLM requests finish on
 both ranks. A background request (`priority: background`, or a session-title request) waits behind foreground
 ones. One decoding yields to a foreground request that waits (between rounds when one request runs at a time; its lane
-under `--parallel` when every lane is taken), then replays from its prompt later, as the Mac does: the tokens
+under `--parallel` when every lane is taken), then replays from its prompt later: the tokens
 it already sent come again and are checked, not sent twice, so its reply equals its solo run; a foreground
 prompt prefills before a background one. Under `--parallel`, the 27B and Qwen3.6 prefill a background prompt 1,024
 rows a step, so a foreground prompt arriving meanwhile waits less: on one Spark, a short foreground request 0.3 s into
@@ -175,9 +178,9 @@ decodes on from the reply. The model writes the arguments; a malformed call retu
 
 Every model on both backends enforces `response_format` (`{"type": "json_schema", "json_schema": {"schema": ...}}`
 or `{"type": "json_object"}`) and vLLM's `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar` (EBNF) and
-`structured_outputs` (`json`, `json_object`, `regex`, `choice` or `grammar`): on the Mac, and on CUDA with one or two
+`structured_outputs` (`json`, `json_object`, `regex`, `choice` or `grammar`): on CUDA with one or two
 GPUs, alone or under `--parallel N`. It needs xgrammar on the server: `pip install 'tensorfold[grammar]'`, which also
-installs torch, Macs included. Drafting stays on. Before each verify forward the engine cuts the drafts the grammar
+installs torch. Drafting stays on. Before each verify forward the engine cuts the drafts the grammar
 rejects, then masks each remaining row's logits to the tokens the grammar allows after that row's path, so a
 constrained reply equals its `"draft": false` reply and its solo run. Two GPUs compile the same grammar and mask
 their own vocabulary columns. With thinking on, the grammar starts after the think end (`</think>`, or Gemma 4's
@@ -209,8 +212,7 @@ token budget. With thinking off, GLM-5.3's prompt is its thinking-off template's
 empty think block. GLM-5.3 keeps every earlier assistant turn's reasoning in the prompt, as zai-org's template does by
 default (`clear_thinking` false), also on checkpoints whose template still clears it before the last user message, so
 a new user message leaves the earlier turns' tokens, and their kept prompt states, as they were. A request's
-`chat_template_kwargs.clear_thinking: true` drops it, as the model card advises for plain chat (on CUDA; on a Mac,
-`TF_GLM_CLEAR_THINKING=1` sets it for the server).
+`chat_template_kwargs.clear_thinking: true` drops it, as the model card advises for plain chat.
 
 A tool call written before the think block closes is the reply's tool call when the reply ends inside the block,
 on both backends; the reasoning stops where the call starts, and streamed reasoning never carries the call's markup.
@@ -288,7 +290,7 @@ The scrape carries `requests_running`, `requests_waiting`, `prompt_tokens_total`
 `kv_cache_usage_ratio` (one `pool` label per live stream cache), `mtp_drafted_total` and `mtp_accepted_total`
 (draft tokens verified and kept on finished requests; the engines keep one draft counter, so copies and chain
 drafts share it), `request_latency_seconds`, `time_to_first_token_seconds` and `request_decode_seconds` (each
-finished request's decode time: the CUDA engine's own figure, or first token to end on the Mac server; its `_sum`
+finished request's decode time: the CUDA engine's own figure; its `_sum`
 over `generation_tokens_total` is the decode rate) and `request_time_per_output_token_seconds` (vLLM's TPOT: the
 server's clock from a reply's first generated token to its last, over its tokens less one, in buckets from 2.5 ms
 to 1 s; a one-token reply has no gap and adds no sample, where vLLM records 0), all under the `tensorfold:` prefix. Every reading is repeated under a vLLM-compatible name (`num_requests_running`, `num_requests_waiting`,

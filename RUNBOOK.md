@@ -1,36 +1,8 @@
 # Installation runbook
 
-Use the backend that matches the host. TensorFold needs Python 3.11 or newer, Apple Silicon for MLX,
-or a supported NVIDIA CUDA environment. Choose one checkpoint from the [model table](README.md#models)
+This fork (spark-exl3) serves on NVIDIA GPUs only. It needs Python 3.11 or newer and a supported NVIDIA CUDA
+environment (NVIDIA's PyTorch container). Choose one checkpoint from the [model table](README.md#models)
 and check disk space and available memory before downloading it.
-
-## Apple Silicon
-
-Create an environment and install the package:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install git+https://github.com/ashhart/TensorFold.git
-tensorfold --version
-tensorfold models
-```
-
-Choose a model explicitly. This example uses Nemotron with its included MTP head:
-
-```bash
-tensorfold info TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit
-tensorfold pull TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit
-tensorfold serve TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit --name local-model --context 8192
-```
-
-`info` reads configuration only. `pull` downloads weights; `serve` completes a missing download.
-The server prints whether Nemotron's MTP head is active. A failed row check disables drafting without
-changing the serial reference; keep MLX within the package requirements.
-
-For Qwen3.8-27B, optionally pull `z-lab/Qwen3.8-27B-DFlash2` too. M1 through M4 use the 4-bit row-exact
-simdgroup decoder; the M5 tensor-unit path also reads the documented lower and higher affine widths.
-Model-specific requirements are in the [recipes](docs/recipes/README.md).
 
 ## Check the endpoint
 
@@ -129,21 +101,9 @@ compute capability 8.9 are refused at startup. WSL2 runs the Linux engine instea
 
 ## Memory and context
 
-Omit `--context` on MLX to fit the default window to the model and memory budget, then inspect the
-reported capacity. CUDA targets the affordable native capacity for Qwen, 2,051 tokens for GLM,
-and 16,384 for Nemotron; the capacity estimate can lower these defaults. On CUDA, `--context 0` targets the affordable native capacity; on MLX it
-removes the metadata cap while memory admission still applies. A positive context that cannot fit
-is refused at startup.
-
-On MLX, `TENSORFOLD_MEMORY_LIMIT_GB` sets the process budget in GiB in place of the default 70% of RAM.
-It can raise or lower the budget, within physical RAM and the GPU's recommended working set:
-
-```bash
-TENSORFOLD_MEMORY_LIMIT_GB=110 tensorfold serve TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP
-```
-
-On a 128 GiB M4 Max this gives 110 GiB to the process and 107 GiB to MLX after the 3 GiB reserve.
-The same budget reaches concurrent admission; context and request memory checks still apply.
+CUDA targets the affordable native capacity for Qwen, 2,051 tokens for GLM, and 16,384 for Nemotron; the capacity
+estimate can lower these defaults. `--context 0` also targets the affordable native capacity. A positive context that
+cannot fit is refused at startup.
 
 On CUDA, a discrete card's admission budget is its own free memory; on a unified GPU it is the host's
 available memory less a floor of a tenth of RAM, at least 4 GiB. `TENSORFOLD_CUDA_MEMORY_LIMIT_GB` caps that
@@ -180,6 +140,6 @@ to refresh installed metadata and dependencies. Update inside the container when
 | Two-rank startup waits | Link reachability, rendezvous port, NCCL devices and matching settings |
 | CUDA start stops after `loading …`, GPU idle | `kill -USR1 <pid>` prints every thread's Python stack. A wait in the extension build is a build lock, whose path the start log names: when no other build is running, stop the start, delete the lock and start again |
 
-Unsupported architectures or formats need a family implementation. See [adding a family](docs/recipes/adding-a-family.md)
-or [adding a CUDA family](docs/recipes/adding-a-cuda-family.md); forcing an unsupported checkpoint to load
+Unsupported architectures or formats need a family implementation. See
+[adding a CUDA family](docs/recipes/adding-a-cuda-family.md); forcing an unsupported checkpoint to load
 is not an installation fix.

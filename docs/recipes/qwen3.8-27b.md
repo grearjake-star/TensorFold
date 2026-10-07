@@ -14,40 +14,20 @@ DFlash2 is used automatically once pulled. On MLX, `--drafter none` disables tha
 `--no-drafts` disables all drafts on either backend. CUDA requires DFlash2 unless `--no-drafts` is set.
 The target verifies every proposed token against its own serial sample.
 
-## MLX
-
-M5 tensor-unit GPUs run the lane decoder with draft trees. M1 through M4 use `row_forward` and the
-packed row decoder with windows of up to 16 rows by default. Its existing 4-bit formats use `simd_qmm`,
-and other supported affine formats use the general packed kernel. Both paths use the same arithmetic for serial
-and drafted calls. Load-time checks determine usable window widths and shared-forward support.
-
-The engine can share a round across requests while keeping each stream's attention, recurrent state and
-sampling independent. DeltaNet commits replay the accepted path; attention commits retain only its keys.
-Prompt chunks start at detected assistant-message boundaries and the second message when these are at
-least 256 tokens beyond the previous chunk start, or after 2,048 tokens if no earlier boundary qualifies.
-Prefix reuse resumes only at these chunk starts, so a follow-up can reuse the state before its previous
-reply. The plan comes from rendered tokens; a template without detected markers uses 2,048-token chunks.
-
 ## Weights other than 4-bit
 
-The M5 lane kernels accept MLX affine 2-, 3-, 4-, 5-, 6- and 8-bit projections in groups of 64.
-They widen packed values for the tensor operations without changing those values. Mixed-width stacks
-keep separate calls where a fused projection needs one width. Examples include
-`TensorFold/Qwen3.8-27B-oQ2` and `TensorFold/Qwen3.8-27B-oQ4`.
-
-The packed row readers on Apple Silicon and the CUDA readers cover MLX affine 2/3/4/5/6/8-bit projections
-with groups of 32/64/128, including mixed layers. CUDA also reads [EXL3 packs](#exl3-checkpoints-experimental).
-A fused projection keeps its members separate where their bit width or group size differs. Unsupported formats
-and tied embedding heads are refused from `config.json` before weight downloads and again at load; loaded
-projections must also be covered by the selected decoder. `--lane-kernels on` requires M5 tensor units and
-formats they read; `auto` falls back to the packed row decoder for the rest.
+The CUDA readers cover MLX affine 2/3/4/5/6/8-bit projections with groups of 32/64/128, including mixed layers
+(for example `TensorFold/Qwen3.8-27B-oQ2` and `TensorFold/Qwen3.8-27B-oQ4`). CUDA also reads
+[EXL3 packs](#exl3-checkpoints-experimental). A fused projection keeps its members separate where their bit width or
+group size differs. Unsupported formats and tied embedding heads are refused from `config.json` before weight
+downloads and again at load.
 Lower weight precision does not guarantee faster decode or a fitting context. Release memory and
 quality comparisons are TBD [release-0.3.5].
 
 ## CUDA
 
-On CUDA the 27B serves NVFP4 and EXL3 checkpoints, and the MLX 4-bit checkpoint as the portable option: the same
-files a Mac serves, and the only format two ranks read. `tensorfold serve` loads the checkpoint you name; it picks
+On CUDA the 27B serves NVFP4 and EXL3 checkpoints, and the MLX 4-bit checkpoint, the only format two ranks
+read. `tensorfold serve` loads the checkpoint you name; it picks
 none by itself. Use the [CUDA container setup](../../RUNBOOK.md#dgx-spark) for any of them. Prompts take bf16
 activations by default; what that costs against the FP8 prompt path (`--prefill-fp8`) depends on the format
 ([prompt precision](cuda.md#prompt-precision)):
@@ -184,50 +164,6 @@ Reproduce the workload with the checkpoint above, default drafting and the
 [public benchmark command](README.md#measurements). Its fixed prompts, 64-token replies, seeds 1234
 through 1238 and sampling settings define these cells. For one rank, omit the tensor-parallel flags. Record the runtime
 and model revision with any new result; these historical rates are not predictions for another runtime.
-
-### A 64 GB M5 Pro on 0.3.5.1
-
-@benwilson measured these on real 64 GB hardware for issue #70. They describe TensorFold 0.3.5.1, not a later
-release; the issue's first comment has the archive of logs, request bodies and the fixture builder.
-
-| | |
-| --- | --- |
-| Machine | MacBook Pro Mac17,9, Apple M5 Pro, 20-core GPU, 64 GB, macOS 26.5.2 (25F84), on AC power |
-| Budget | 44.8 GiB: 70% of 64 GB, under the 55 GiB Metal working set (`iogpu.wired_limit_mb=56320`) |
-| Runtime | TensorFold 0.3.5.1 (`beddbb7`, from the tag), Python 3.12.13, mlx and mlx-metal 0.31.2, mlx-lm 0.31.3 |
-| Checkpoints | `TensorFold/Qwen3.8-27B-MLX-4bit@70ae7fac`, `z-lab/Qwen3.8-27B-DFlash2@50307d4c`, `TensorFold/Qwen3.8-27B-oQ2@8cf0a7da` |
-| Launch | `tensorfold serve <model> --name bench`, plus `--drafter none` or `--no-drafts` where named |
-| Peak memory | `ri_lifetime_max_phys_footprint` from `proc_pid_rusage` |
-
-| Configuration | Fitted context | Peak footprint | Workload that set the peak |
-| --- | ---: | ---: | --- |
-| Qwen3.8-27B + DFlash2 | 140,288 | 43.69 GiB | prompts up to 139,922 tokens, cold and resumed |
-| Qwen3.8-27B, `--drafter none` | 152,576 | 39.87 GiB | a 152,210-token prompt, cold and resumed |
-| Qwen3.8-27B-oQ2 + DFlash2 | 172,032 | 43.81 GiB | a 171,667-token prompt, cold and resumed |
-
-Long prompts used the source of `ggml-org/llama.cpp@90c26fcd` (`src/*.cpp`, then `ggml/src/*.c*`, sorted),
-tokenized by the served model and cut to N tokens behind a nonce line. Replies were 64 tokens, greedy, with
-`ignore_eos` and thinking off; the resumed request adds one assistant and one user turn.
-
-| Rendered prompt | Cold TTFT | Prefill | Decode at depth | Resumed: cached, TTFT |
-| ---: | ---: | ---: | ---: | --- |
-| 8,224 | 19.5 s | 423 tok/s | 25.5 tok/s | 8,192, 0.25 s |
-| 16,417 | 41.0 s | 401 tok/s | 29.8 tok/s | 16,384, 0.31 s |
-| 32,800 | 90.5 s | 363 tok/s | 24.4 tok/s | 32,768, 0.37 s |
-| 65,569 | 221.6 s | 296 tok/s | 20.5 tok/s | 65,536, 0.61 s |
-| 98,337 | 395.1 s | 249 tok/s | 15.8 tok/s | 98,304, 0.69 s |
-| 131,106 | 578.4 s | 227 tok/s | 15.7 tok/s | 0, 574 s (#71) |
-| 139,922 | 640.5 s | 219 tok/s | 16.3 tok/s | 0, 644 s (#71) |
-
-Decode medians from the [public benchmark command](README.md#measurements), in tok/s for code sampled, chat
-sampled, code greedy and chat greedy: 62.8, 45.9, 61.2 and 56.2 with DFlash2; 16.6, 16.1, 16.2 and 16.3 with
-`--no-drafts`; 16.2, 16.2, 16.6 and 16.4 with `--drafter none`; 41.8, 37.2, 92.1 and 47.9 for oQ2 with DFlash2.
-`tools/bench_concurrent.py --alone --serial` at 1, 2, 4 and 8 streams found all 180 concurrent replies equal to
-their solo runs and every solo run equal to `"draft": false` (60 of 60 for oQ2 at 1 and 4). Code greedy served
-78.9, 117.7, 158.2 and 201.4 tok/s in aggregate at 1, 2, 4 and 8 streams. The release checks (drafted against
-serial, resumed against fresh, by `token_sha`) matched on 8 of 8 short-prompt cells and 4 of 4 cells at 8,192
-tokens with a real resume, and replays after a restart matched too. A conversation grown by 6,144 tokens a turn
-to the 140,288 window kept swap at 653 to 656 MB, with a 43.57 GiB peak footprint.
 
 ## Calibration and checks
 

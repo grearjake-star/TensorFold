@@ -11,53 +11,10 @@ tensorfold serve TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP --name bench
 On MLX, a supported conversion without the head runs without MTP drafting. On CUDA, pass `--no-drafts`
 for such a conversion; the default positive draft depth otherwise refuses the missing head.
 
-## MLX execution
-
-N-gram tables stay in host file mappings when the checkpoint's model files exceed 75% of the GPU's
-recommended working set. `TF_NGRAM_HOST=1` forces this mode; `TF_NGRAM_HOST=0` keeps the tables in MLX.
-Startup admission uses the same choice as the loader and subtracts the mapped weights, scales and biases
-from the checkpoint's size. For the named 4-bit checkpoint, about 29.8 GiB of its 105.4 GiB is mapped,
-leaving a conservative 75.6 GiB resident-weight estimate. The default command selects host mode on an
-M4 Max with 128 GiB, whose process budget is 89.6 GiB, including the 3 GiB process reserve.
-
-Mapped pages still use RAM while cached. The loader prefetches them after its initial forwards; macOS
-can reclaim them, and subsequent lookups may read from disk. The remaining weights must fit the MLX
-budget, and the server sizes context from runtime cache and workspace needs. `TENSORFOLD_MEMORY_LIMIT_GB`
-can lower or raise the default budget, capped by physical RAM and the GPU's recommended working set.
-For example, `TENSORFOLD_MEMORY_LIMIT_GB=110` gives a 128 GiB M4 Max a 110 GiB process budget and
-107 GiB for MLX. An explicit context must still fit the startup estimate; a larger budget does not
-establish full-window inference or keep every mapped page resident.
-After measuring shared rounds, the runtime releases the probes' rollback buffers before sizing prompt
-memory, so those unused states do not reduce the available context.
-
-Fused kernels handle hyper-connections, routing, experts, recurrence and sparse attention. Row-exact
-projections and stable routing ties keep each verify row independent of the other rows. M5 GPUs use
-the lane matmul; M1 through M4 use the per-row projection and hyper-connection kernels by default. Rejected tails
-restore recurrent state, n-gram history and attention state, including incomplete pooled blocks.
-The load-time row check disables drafting when windows do not reproduce serial steps.
-
-The prefill path uses sparse selected-key attention, fused hyper-connections and n-gram lookups,
-stacked DeltaNet projections and sorted expert rows. It submits bounded groups of layers to limit live
-workspace. Compatible prefill matmul kernels check against MLX; unsupported paths use MLX's kernels.
-`TF_FLASH_PREFILL=0` selects the reference prefill path for comparison.
-
-Prefill and decode can round differently. The chunk planner uses detected assistant-message starts and
-the second message when at least 256 tokens follow the previous chunk start, otherwise cutting after
-the chunk chosen at startup: the largest of 8,192 (with tensor units), 4,096 and 2,048 tokens whose
-working memory leaves room for 128K tokens of context, or the model's window if smaller. Where none
-fits, the prompt path queues one layer at a time instead of two. Cold and resumed prompts use the same
-rendered-token boundaries, and reuse starts only at these cuts. Templates without detected markers use
-the same fixed chunks. A chunk's sorted expert rows reach MLX's gather in slices of at most 32,768
-(its M5 kernel keeps row offsets in 16 bits through MLX 0.32.2). Snapshots include the prefill
-path, resolved matmul route and GPU identity; changing arithmetic requires a fresh cache.
-
-Load-time shared-forward checks compare each stream with its own call. A failed check limits forwards
-to one stream, while successful checks allow the lane engine to combine requests.
-
 ## CUDA
 
-On CUDA Flash Next serves NVFP4 and EXL3 checkpoints, and the MLX 4-bit checkpoint as the portable option: the same
-files a Mac serves, and the only format two ranks and `--ple-on-ssd` read. `tensorfold serve` loads the checkpoint
+On CUDA Flash Next serves NVFP4 and EXL3 checkpoints, and the MLX 4-bit checkpoint, the only format two ranks and
+`--ple-on-ssd` read. `tensorfold serve` loads the checkpoint
 you name; it picks none by itself. Use the [container setup](../../RUNBOOK.md#nvidia-gpus) for any of them. Prompts
 take bf16 activations by default; what that costs against the FP8 prompt path (`--prefill-fp8`) depends on the
 format ([prompt precision](cuda.md#prompt-precision)):
@@ -295,25 +252,8 @@ allocations for RAM, so a checkpoint's GPU allocation alone does not describe it
 `--context` that leaves them no room is reported at startup; their lookups then page from disk, a cost of about 1.3x
 on prompts.
 
-`--ple-on-ssd` leaves the 29.8 GiB of n-gram tables in the checkpoint and reads each lookup's rows from SSD,
-so a 128 GB Mac can hold Flash Next. It is an opt-in trade. On an M3 Ultra, replies were the same tokens,
-decode was 3.5-8% slower across the four cells, prefill was unchanged, the peak footprint fell by 40 GiB
-(135.1 to 95.4 GiB) and start-up halved (35.7 s to 17.8 s).
-
-`--ssd-experts GIB` also leaves the routed experts (70.3 GiB) in the checkpoint and streams them into a GPU pool
-of that many GiB; with `--ple-on-ssd` as well, a 64 GB Mac can hold Flash Next (`python -m pip install
-"tensorfold[ssd]"` first: the pool's host side is a small MLX extension built on first use). The GPU hands each
-MoE layer's picks to the host and waits while missing experts are read into the pool; the expert kernels are the
-resident ones with only the weight address changed, so replies are the resident model's tokens.
-
-On an M3 Ultra, each flag was held to a smaller Mac's budget and compared on the same machine:
-- `--ple-on-ssd` at a 128 GB Mac's budget (89.6 GiB) peaked at 85.6 GiB. Decode was 0.91-1.03x the resident
-  run and prefill 0.84-0.91x.
-- Adding `--ssd-experts 24` at a 64 GB Mac's budget (44.8 GiB) peaked at 39.5 GiB. Replies were the same tokens as
-  with the experts resident: 36 of 36 requests, drafted and serial. Decode ran at 36.8-42.5 tok/s against
-  107.6-129.7 (0.31-0.39x), and prefill at 332-354 against 1,014-1,081 tok/s.
-- A smaller budget also halves the prompt chunk, to 2,048 tokens. Prompts past that length then reply
-  differently from a 256 GB Mac's run, whichever flags are set.
+`--ple-on-ssd` leaves the 29.8 GiB of n-gram tables in the checkpoint and reads each lookup's rows from SSD. It is
+an opt-in trade of some decode speed for about 40 GiB less at peak; replies are the same tokens.
 
 ### KV cache
 

@@ -23,7 +23,7 @@ downloading. The dense linear layer, its plan and its measured throughput are in
 ## Checkpoints
 
 On CUDA, TensorFold serves NVFP4 and EXL3 checkpoints, usually the ones Mia-AiLab's DGX Spark recipes run or your
-own exports, and MLX 4-bit checkpoints as the portable option: the same files a Mac serves. `tensorfold serve` loads
+own exports, and MLX 4-bit checkpoints. `tensorfold serve` loads
 the checkpoint you name; it picks none by itself.
 
 | Family | NVFP4 | EXL3 | MLX 4-bit |
@@ -217,7 +217,7 @@ Two-rank Flash Next, Nemotron and GLM requests finish on both ranks after a clie
 collective sequence aligned. MLX disk snapshots and cache-budget flags do not configure these CUDA
 caches. The CUDA CLI also does not apply `--alias`; use `--name` for the served model ID. `--thinking`,
 `--reasoning-effort` and `--thinking-budget` set the defaults a request's `chat_template_kwargs.enable_thinking`,
-`reasoning_effort` and `thinking_budget` override, as on the Mac.
+`reasoning_effort` and `thinking_budget` override.
 
 ## Measuring
 

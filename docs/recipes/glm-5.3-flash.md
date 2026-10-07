@@ -1,7 +1,6 @@
 # GLM-5.3-Flash
 
-The `glm5_next` family serves `TensorFold/GLM-5.3-Flash-MLX-4bit-MTP` on two-rank CUDA and, on a Mac with
-256 GB, on the MLX lane engine ([Apple Silicon](#apple-silicon-mlx)).
+The `glm5_next` family serves `TensorFold/GLM-5.3-Flash-MLX-4bit-MTP` on two-rank CUDA.
 The checkpoint uses affine 4-bit weights in groups of 64 and includes its MTP layer.
 Kimi delta attention, sparse MLA and MoE blocks mix four residual streams.
 
@@ -9,7 +8,7 @@ Kimi delta attention, sparse MLA and MoE blocks mix four residual streams.
 
 On CUDA GLM-5.3-Flash runs on two ranks from Brandon M. Music's EXL3/TR3 checkpoint
 (`brandonmusic/GLM-5.3-Flash-tr3-4bpw`, re-hosted as `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`; experimental;
-[EXL3](#exl3)) or from the MLX 4-bit checkpoint, the portable option that a 256 GB Mac serves too.
+[EXL3](#exl3)) or from the MLX 4-bit checkpoint.
 No NVFP4 checkpoint of it is read. `tensorfold serve` loads the checkpoint you name; it picks none by itself. Prompt
 precision does not change here: neither checkpoint has an FP8 prompt kernel, so `--prefill-fp8` is refused.
 
@@ -123,144 +122,6 @@ Short prompts, with the recipe's default drafting (DFlash2, `auto`), decode at 5
 (code and chat, sampled and greedy, 64 tokens, median of 5 seeds) against 0.3.6's 53.4 / 44.1 / 63.7 / 45.5. The
 latent path rounds attention differently, so some replies differ from 0.3.6 (the greedy cells' texts, hence their
 speeds); `TF_GLM_LATENT=0` gives 0.3.6's replies exactly.
-
-## Apple Silicon (MLX)
-
-On a Mac with 256 GB and MLX 0.32.2 or later (`serve` refuses an older MLX):
-
-```bash
-tensorfold pull TensorFold/GLM-5.3-Flash-MLX-4bit-MTP
-tensorfold serve TensorFold/GLM-5.3-Flash-MLX-4bit-MTP
-```
-
-The chat template names `low`, `high` and `max`. GLM's default is Max, and `high` suits agent and coding work.
-`medium` is heard as `high`. `max` stays `max`. `xhigh` stays `xhigh`, and this template renders both as Max.
-`--reasoning-effort high` selects High, and `--reasoning-effort low` selects Low.
-
-The model decodes through the lane engine's family rounds with the checkpoint's MTP head. A round's drafted rows
-are verified in one forward, and every row of a window gets its one-row call's bits, so drafted replies equal
-`"draft": false`. A load-time check sets the widest exact window (up to 16 rows) and a second one whether several
-streams' rows can share a forward; concurrent requests share rounds when it passes. The family sets
-`MLX_ENABLE_TF32=0`, so M5-generation GPUs keep fp32 matmuls in fp32. Prompts prefill in the engine's chunks and a
-resumed prompt gets a fresh prompt's bits.
-
-The weights take about 170 GiB, so the family states an 85% memory allowance on Macs of 256 GB or less, for a
-machine with nothing else loaded; concurrent streams are still admitted within it less what other programs hold.
-Prompt admission counts the latent cache's growth and a prompt chunk's indexer workspace.
-
-The load-time checks narrow the window or stop sharing forwards where bits would differ (on the CPU, where
-nothing serves, a mixed-bit checkpoint's window narrows to 7 rows). Real-weight qualification on the 0.3.5 line,
-against mlx-vlm 0.7.3's server (mlx_lm has no GLM-5.3-Flash), is TBD [release-0.3.5.1].
-
-### Experts on SSD
-
-`--ssd-experts GIB` leaves the decoder layers' routed experts (159.5 GiB of the 169.2) in the checkpoint and
-streams them into a GPU pool of that many GiB. Everything else stays resident, the MTP layer included. With it,
-a 128 GB Mac can serve GLM-5.3-Flash:
-
-```bash
-python -m pip install "tensorfold[ssd]"       # cmake and nanobind, to build a small MLX extension on first use
-tensorfold serve TensorFold/GLM-5.3-Flash-MLX-4bit-MTP --ssd-experts 64
-```
-
-- After each layer's router, the GPU signals the host through a shared Metal event and waits.
-- The host reads the picks and copies any expert missing from the pool from SSD into a free slot. It then
-  updates the slot table and lets the GPU go on.
-- The expert kernels are the resident ones with only the weight address changed, so replies are the
-  resident model's tokens.
-- A prompt chunk loads each layer's picked experts in turn.
-- The pool keeps the most recently used experts, and reads bypass the page cache.
-- The extension builds against the installed MLX with the Xcode command line tools.
-
-On an M3 Ultra held to a 128 GB Mac's budget (TENSORFOLD_MEMORY_LIMIT_GB=89.6) with `--ssd-experts 64`, the
-streamed run was compared with the resident one on the same machine:
-- Replies were the same tokens: 36 of 36 serial and cell requests, plus the 2k prompt.
-- Two concurrent streams each matched their solo reply, and resumed prompts matched fresh ones.
-- The footprint peaked at 87.6 GiB against 184.0 resident.
-- Decode ran at 8.9-10.5 tok/s against 62.8-73.6 resident.
-- A 2k prompt prefilled at 144 tok/s against 451.
-
-### Mixed-bit checkpoints
-
-The loader reads two layouts of the same weights: the original one (`TensorFold/GLM-5.3-Flash-MLX-4bit-MTP`) and the
-one mlx-lm's converter writes (`language_model.model.*`, one fused `conv1d`, `forget_gate.*`, the absorbed
-`embed_q` / `unembed_out` pair in place of `kv_b_proj`, the MTP layer as `mtp.0.*` with a bf16 `eh_proj`). Such
-conversions usually store per-tensor overrides: routed experts at 4 bits, attention, shared experts and the head at
-8, some layers at 5 or 6. `layouts.py` maps the names, a stack of parts at different widths runs part by part, and
-8-, 6- and 5-bit tensors take row kernels transcribed from MLX's one-row `qmv_fast` / `qmv_quad` loops, so verify
-windows keep one-row bits. On grant-ai's abliterated conversion, on a 256 GB M3 Ultra, the contributor measured
-46.3 tok/s drafted, equal to `"draft": false`.
-
-### Float32 activations
-
-Set `"tensorfold_activation_dtype": "float32"` in a checkpoint's `config.json` to run the residual stream, the MLA
-latent and indexer caches and the KDA states in float32 instead of bf16. The hyper-connection split, the gated-delta
-recurrence and the templated one-row GEMVs (`matmul_rows`) run their Metal kernels in float32. Quantized `qmv_rows`
-stays on its bf16 kernel, so a float32 row uses MLX's one-row call. The fused KDA step, the sparse-decode attention
-and the fused bf16 matrix kernels step aside for their MLX-op paths. Rows keep their bits, so drafted replies still
-equal `"draft": false`, and without the key nothing changes (bf16 logits are byte-identical to before).
-
-On an M3 Ultra with the resident 4-bit checkpoint, float32 activations decode at about 6-9 tok/s against
-48-57 for bf16, and prefill is about 1.2-1.4x slower, so the mode is for quality work, not speed.
-
-Measured on a 512 GB M3 Ultra with GLM-5.3-Flash converted losslessly from a Q8_0 GGUF, against a float64
-reference of the same weights on 579 held-out items (MMLU-Pro 200, BBH 200, HumanEval 50, MBPP 129; per-item
-token-weighted RMS difference of mean NLL):
-
-| activations | BBH | HumanEval | MBPP | MMLU-Pro answers equal to the reference | prefill 4k / 32k tok/s | decode @32k tok/s |
-| --- | --- | --- | --- | --- | --- | --- |
-| bf16 | 0.219 | 0.016 | 0.038 | 187 / 200 | 365 / 338 | 20.4 |
-| float32 | 0.011 | 0.002 | 0.003 | 199 / 200 | 371 / 312 | 19.6 |
-
-llama.cpp's Metal path on the same Q8_0 weights (F32 KV cache) measured 0.073 / 0.016 / 0.035 and 190 / 200.
-Memory: the caches double in size and admission counts them at 4 bytes a value; the weights are unchanged.
-The CUDA engine refuses the key. `--ssd-experts` stays on the bf16 expert kernels and refuses this mode.
-
-### 8-bit from a Q8_0 GGUF, without loss
-
-A Q8_0 block (32 int8 values, one fp16 scale d) is exactly MLX's affine 8-bit format in groups of 32 with
-q + 128, scale d and bias −128·d. `tools/glm5_q8_0_gguf_to_mlx.py` converts llama.cpp's `glm5next` Q8_0 GGUF this
-way; the tensors llama.cpp keeps unquantised (the indexer and KDA low-rank projections) stay unquantised, and the KDA
-decay rate is stored as `A`. The Mac engine reads the result: fp16 scales are widened to float32 once at load, and
-every projection returns its input's dtype.
-
-```bash
-python tools/glm5_q8_0_gguf_to_mlx.py --gguf 'GLM-5.3-Flash-Q8_0-*.gguf' \
-    --config zai-org-GLM-5.3-Flash/config.json --tokenizer-dir zai-org-GLM-5.3-Flash --out GLM-5.3-Flash-q8_0 --verify
-tensorfold serve GLM-5.3-Flash-q8_0
-```
-
-On a 512 GB M3 Ultra, a 310 GiB Q8_0 GGUF became 328.5 GiB in 85 shards in about six minutes; `--verify` found every
-one of its 1,383 tensors equal to the GGUF's values. The weights take 365 GiB resident; the GGUF has no MTP layer, so
-the model decodes without drafts. The group-32 8-bit layers run MLX's one-row calls, not the fused 4-bit kernels.
-
-### Prefill
-
-Prompt chunks attend as decode does: each query reads its own selected keys from the latent cache, so prefill cost
-and memory stay flat with context. The contributor measured 336 / 334 / 309 tok/s at 10k / 35k / 103k tokens on a
-256 GB M3 Ultra, against 331 / 260 / 143 for the previous prefill.
-
-### Scripts that load the backbone directly
-
-`tensorfold serve` wires the weights (`mx.set_wired_limit`, `server/residency.py`) and caps MLX's cache of freed
-buffers. A script that calls `families.glm5_next.weights.load_backbone` directly, such as a scorer reading logits
-or a profiler, should do the same: without wiring, macOS pages parts of a 170-365 GiB checkpoint out between steps, and
-on a 512 GB M3 Ultra each MoE layer then took about 0.1 s per call (4.3 s per decode step instead of 0.1 s); with the
-wired limit set to the whole working set and no cache cap, the cache of per-request buffers was wired too and grew
-past 440 GiB. Wire what is resident after loading, cap the cache, and clear it between requests:
-
-```python
-import mlx.core as mx
-from tensorfold.families.glm5_next.weights import load_backbone
-from tensorfold.server.residency import wire_resident
-
-info = mx.device_info()
-mx.set_wired_limit(int(info["max_recommended_working_set_size"]))   # as the family's load() does
-model = load_backbone(model_dir)
-wire_resident(mx, int(info["max_recommended_working_set_size"]))   # then only the weights stay wired
-mx.set_cache_limit(8 * 2**30)                                       # the server's --mlx-cache-gib default
-# ... per request: run, then mx.clear_cache()
-```
 
 ## Responses and exactness
 

@@ -1,5 +1,8 @@
 # Contributing to TensorFold
 
+> **This is the spark-exl3 fork** (CUDA only, DGX Spark / GB10 first). The rules below are upstream's and apply here
+> too, except that Apple Silicon is out of scope. A fix that would help upstream TensorFold is welcome there as well.
+
 Thank you for wanting to make TensorFold faster. This page says what a pull request needs to land in the next
 release, and what happens to it after you open it. A small pull request with its measurements attached lands
 fastest.
@@ -25,8 +28,8 @@ fastest.
    A precision mode that a checkpoint format defines is a separate conversation, so open an issue.
 4. **Prompt processing no slower.** Measure cold prompts against the last release for any change that touches
    prefill, a kernel, the engine, a family or the server.
-5. **Every platform it touches.** That is Metal on Apple Silicon from M1 to M5, and CUDA. Say which you ran and
-   which you could not.
+5. **Every platform it touches.** That is CUDA: a DGX Spark (GB10) at least, and any other card the change affects.
+   Say which you ran and which you could not.
 6. **Lean code.** One job to a module, files under about 600 lines, and one-line comments and docstrings that say
    what the code can't. Measurements, history and benchmark tables belong in the pull request, not in the source.
 
@@ -68,11 +71,11 @@ a 2% change from a warm machine.
 TensorFold needs Python 3.11 or newer.
 
 ```
-python -m pip install -e '.[test,tui]'
+python -m pip install -e '.[test]'
 python -m pytest -q tests
 ```
 
-On a Mac that is the host suite. The CUDA tests are `tests/cuda` and `tests/test_cuda_*.py`. Those that need PyTorch
+Without a GPU that is the host suite. The CUDA tests are `tests/cuda` and `tests/test_cuda_*.py`. Those that need PyTorch
 or a GPU skip without one.
 
 A new test skips cleanly where its dependency is missing. Use `pytest.importorskip`, so the suite still collects on
@@ -108,7 +111,7 @@ make it rare.
 
 ## What we can check ourselves
 
-We test on an M3 Ultra, an M5 Max, one DGX Spark and two together, and an RTX PRO 6000. A change for other hardware
+This fork is tested on one DGX Spark (GB10). A change for other hardware
 needs a complete receipt, because we cannot rerun it, and it takes longer to land. Keep such a change in its own
 files where you can, so it cannot affect the paths we do test.
 
