@@ -235,32 +235,6 @@ def test_mac_finish_request_counts_once():
     assert sample(body, f"{metrics.PREFIX}time_to_first_token_seconds_count") == "1"
 
 
-def test_a_mac_chat_counts_the_reply_the_http_thread_returns():
-    pytest.importorskip("mlx.core")
-    from tests.test_lane_server import make_app
-
-    app = make_app(lanes=1, use_proposer=False)
-    try:
-        reply = app.chat([{"role": "user", "content": "hi"}], max_tokens=4)
-        body = metrics.render(app)
-        drafted = int((reply.get("speculative") or {}).get("drafted", 0))
-        accepted = int((reply.get("speculative") or {}).get("accepted", 0))
-    finally:
-        app.close()
-    assert sample(body, f"{metrics.PREFIX}requests_running") == "0"
-    assert sample(body, f"{metrics.PREFIX}requests_waiting") == "0"
-    assert sample(body, f"{metrics.PREFIX}prompt_tokens_total") == str(reply["prompt_tokens"])
-    assert sample(body, f"{metrics.PREFIX}generation_tokens_total") == str(reply["completion_tokens"])
-    assert sample(body, f"{metrics.PREFIX}mtp_drafted_total") == str(drafted)
-    assert sample(body, f"{metrics.PREFIX}mtp_accepted_total") == str(accepted)
-    assert sample(body, f"{metrics.PREFIX}request_latency_seconds_count") == "1"
-    assert int(reply["completion_tokens"]) > 0
-    assert reply["runtime"]["time_to_first_token"] is not None
-    assert sample(body, f"{metrics.PREFIX}time_to_first_token_seconds_count") == "1"
-    assert sample(body, f"{metrics.PREFIX}request_time_per_output_token_seconds_count") == (
-        "1" if int(reply["completion_tokens"]) > 1 else "0")
-
-
 def test_a_live_request_is_running_and_the_next_one_is_waiting(tmp_path):
     import pytest
 

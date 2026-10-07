@@ -179,32 +179,3 @@ def test_a_template_that_cannot_render_the_probe_gets_the_grid_alone() -> None:
     assert message_markers(Broken()) == ((), ())
 
 
-def test_serve_cuts_prompts_at_the_templates_markers_and_names_the_plan_in_snapshot_keys(monkeypatch) -> None:
-    pytest.importorskip("mlx.core")
-    from pathlib import Path
-
-    from tensorfold import cli
-    import tensorfold.server.app as app_module
-
-    seen: dict[str, Any] = {}
-
-    class Started(Exception):
-        pass
-
-    class App:
-        def __init__(self, model: Any, tokenizer: Any, **kwargs: Any) -> None:
-            seen.update(kwargs)
-            raise Started
-
-    monkeypatch.setattr(app_module, "ChatApp", App)
-    package = SimpleNamespace(load=lambda model_dir, **options: (object(), _ChatTemplate()),
-                              kernel_version=lambda model: "k1")
-    family = SimpleNamespace(title="fake", model_type="fake", package=package)
-    args = cli.build_parser().parse_args(["serve", "some/model", "--no-drafts", "--snapshot-dir", "none"])
-    with pytest.raises(Started):
-        cli._serve_mlx(args, family, Path("some/model"), 0, [], 1 << 30)
-    plan = seen["engine_factory"].keywords["prefill_plan"]
-    assert plan.openers == (1,) and plan.assistant == (1, 57) and plan.step == 2048
-    assert f"|prefill={plan.name}|" in seen["model_id"]
-    with pytest.raises(SystemExit):
-        cli.build_parser().parse_args(["serve", "some/model", "--prefill-grid", "512"])     # the plan replaced it

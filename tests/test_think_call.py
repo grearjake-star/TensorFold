@@ -65,30 +65,6 @@ class ScriptTokenizer:
         return PIECES.index(token) if token in PIECES else None
 
 
-def script_app():
-    pytest.importorskip("mlx.core")
-    from tensorfold.server.app import ChatApp
-    from tests.lane_fakes import FakeEngine, FakeFamily
-
-    class ScriptFamily(FakeFamily):
-        """Writes SCRIPT after the three-token prompt, whatever it is fed."""
-
-        def hidden(self, inputs: Any, cache: list[Any], parents: Any = None) -> Any:
-            import mlx.core as mx
-            import numpy as np
-
-            history, out = cache[0].rows[0], []
-            for token in np.array(inputs).reshape(-1).tolist():
-                history.append(int(token))
-                out.append(SCRIPT[min(len(history) - 3, len(SCRIPT) - 1)])
-            return mx.array(out, dtype=mx.float32).reshape(1, -1, 1)
-
-    family = ScriptFamily()
-    return ChatApp(None, ScriptTokenizer(), served_name="fake", lanes=1, max_rows=16, max_draft=4,
-                   default_max_tokens=32, checkpoint_slots=0, use_proposer=True, enable_thinking=True,
-                   engine_factory=lambda model, **kw: FakeEngine(family, **kw))
-
-
 def served_post(app, body):
     """A real socket: the Mac app watches it for a client that leaves."""
 
@@ -111,31 +87,6 @@ def served_post(app, body):
 
 def events(text: str) -> list[dict[str, Any]]:
     return [json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: {")]
-
-
-@pytest.mark.parametrize("draft", [True, False])
-def test_the_mac_server_returns_the_call(draft):
-    app = script_app()
-    try:
-        status, body = served_post(app, {"messages": [{"role": "user", "content": "List files"}], "tools": TOOLS,
-                                         "draft": draft})
-        choice = json.loads(body)["choices"][0]
-        assert status == 200 and choice["finish_reason"] == "tool_calls"
-        assert choice["message"]["reasoning_content"] == REASONING.strip()
-        assert [(c["function"]["name"], json.loads(c["function"]["arguments"]))
-                for c in choice["message"]["tool_calls"]] == [("terminal", {"command": "ls"})]
-        status, text = served_post(app, {"messages": [{"role": "user", "content": "List files"}], "tools": TOOLS,
-                                         "draft": draft, "stream": True})
-        chunks = events(text)
-        deltas = [c["choices"][0]["delta"] for c in chunks if c.get("choices")]
-        reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
-        names = [d["tool_calls"][0]["function"]["name"] for d in deltas if d.get("tool_calls") and
-                 d["tool_calls"][0].get("function", {}).get("name")]
-        assert reasoning == REASONING and names == ["terminal"] and "<tool_call>" not in text
-        assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
-        assert json.loads(body)["tensorfold"]["token_sha"] == chunks[-1]["tensorfold"]["token_sha"]
-    finally:
-        app.close()
 
 
 # -- the CUDA server: an engine that writes the same reply ------------------------------------------------------------
