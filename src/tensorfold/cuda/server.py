@@ -254,9 +254,10 @@ class App:
         spec = grammar.request_spec(body)
         top = probability_options(body, supported=bool(getattr(self.engine, "supports_logprobs", False)))
         if top is not None:
-            if not chat or body.get("stream") or thinking or tools or stop or spec is not None or budget:
-                raise RequestError("logprobs support nonstreamed text chat with thinking off, without tools, "
-                                   "stop strings or structured output")
+            unsplit = thinking and self.tok.token_to_id("</think>") is None    # no token to find the answer by
+            if not chat or body.get("stream") or unsplit or tools or stop or spec is not None or budget:
+                raise RequestError("logprobs support nonstreamed text chat without tools, stop strings, structured "
+                                   "output or a thinking budget")
             if not hasattr(self, "_probability_decoder"):
                 self._probability_decoder = TokenBytes(self.tok)
         compiled = (spec, self._grammars().compile(spec)) if spec is not None else None
@@ -585,8 +586,12 @@ class App:
                    graphs=rounds.summary() if hasattr(rounds, "summary") else None)
         if body.get("return_token_ids"):              # the reply's ids in the "tensorfold" block, for exactness checks
             stats = {**(stats or {}), "token_ids": [int(t) for t in out]}
-        logprobs = (self._probability_decoder.format(probabilities.emitted(out), ends)
-                    if probabilities is not None else None)
+        logprobs = None
+        if probabilities is not None:               # a thinking reply's rows are its answer's, as ``content`` is
+            rows = probabilities.emitted(out)
+            if chat and thinking:
+                rows = self._probability_decoder.answer(rows, self.tok.token_to_id("</think>"))
+            logprobs = self._probability_decoder.format(rows, ends)
         # the calls already sent as deltas; the handler sends the rest (a call the streamer could not follow)
         streamed = calls_stream.index + 1 if calls_stream is not None and calls_stream.streamed else 0
         return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
