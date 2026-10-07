@@ -298,9 +298,14 @@ drafts share it), `request_latency_seconds`, `time_to_first_token_seconds` and `
 finished request's decode time: the CUDA engine's own figure; its `_sum`
 over `generation_tokens_total` is the decode rate) and `request_time_per_output_token_seconds` (vLLM's TPOT: the
 server's clock from a reply's first generated token to its last, over its tokens less one, in buckets from 2.5 ms
-to 1 s; a one-token reply has no gap and adds no sample, where vLLM records 0), all under the `tensorfold:` prefix. Every reading is repeated under a vLLM-compatible name (`num_requests_running`, `num_requests_waiting`,
+to 1 s; a one-token reply has no gap and adds no sample, where vLLM records 0), all under the `tensorfold:` prefix. The figures `/health` also
+reports are there too: `generation_tokens_running` (the running replies' tokens so far; added to
+`generation_tokens_total` it counts tokens as they are generated), `prompt_tokens_cached_total` (prompt tokens read
+from a kept prompt state; vLLM's name too), `decode_rounds_total` (`generation_tokens_total` over it is the tokens a round),
+`request_prefill_seconds` (each finished request's prompt pass: the CUDA engine's own figure) and, where the engine has a limit to read, `requests_running_max`. Every reading is repeated under a
+vLLM-compatible name (`num_requests_running`, `num_requests_waiting`,
 `kv_cache_usage_perc`, `spec_decode_num_draft_tokens_total`, `spec_decode_num_accepted_tokens_total`,
-`e2e_request_latency_seconds`, `request_decode_time_seconds`) with identical values, so a dashboard copied from vLLM fills by swapping the
+`e2e_request_latency_seconds`, `request_decode_time_seconds`, `request_prefill_time_seconds`) with identical values, so a dashboard copied from vLLM fills by swapping the
 `tensorfold:` prefix for the metric name. `client_disconnections_total` (requests the client walked away from)
 and `preemptions_total` (background work that gave up a lane to a later request) are published where the
 server counts those events, and never at a fabricated zero.
