@@ -363,6 +363,11 @@ class GlmEngine:
         self.kept_counts["hits" if best is not None else "misses"] += 1
         return best
 
+    def check_policy(self, spec: str) -> None:
+        """Raise ValueError for a request's draft policy this engine cannot parse (``app.policy_problem``: a 400)."""
+
+        encode_policy(spec)
+
     def _drop(self, snap, why: str | None = None) -> None:
         """Forget a kept snapshot and free its saved rows now, even while a caller still holds the object."""
         snap.rows, snap.nbytes, snap.drafter_rows = None, 0, None
