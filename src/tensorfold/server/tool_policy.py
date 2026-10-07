@@ -3,6 +3,8 @@ from typing import Any
 
 from tensorfold.server.errors import RequestError
 
+_WHOLE_ENVELOPE_RE = re.compile(r"<((?:[A-Za-z_][\w.-]*:)?tool_call)>.*?</\1>", re.IGNORECASE | re.DOTALL)
+
 
 class _ToolTextFilter:
     """Hide tool envelopes while retaining only a partial tag between prose deltas."""
@@ -95,14 +97,25 @@ class ToolCallPolicy:
             return filtered.feed(text) + (filtered.finish() if finished else "")
         return text
 
+    def parsed_content(self, text: str) -> str:
+        """A parsed reply's content: an unclosed envelope hidden, the whole blocks the parser left as text kept."""
+        if not self.single:
+            return text
+        out, cursor = [], 0
+        for block in _WHOLE_ENVELOPE_RE.finditer(text):
+            out += [self.content(text[cursor:block.start()]), block.group(0)]
+            cursor = block.end()
+        return "".join(out) + self.content(text[cursor:])
+
     def finish(self, reply, tools, parse):
         if not tools:
             return reply
         content, calls = parse(str(reply.get("content") or ""), tools, max_calls=self.max_calls)
         calls = calls or reply.get("tool_calls")
         if not calls:
-            return {**reply, "content": self.content(content)} if self.single else reply
-        result = {**reply, "content": self.content(content), "tool_calls": self.limit(calls), "finish_reason": "tool_calls"}
+            return {**reply, "content": self.parsed_content(content)} if self.single else reply
+        result = {**reply, "content": self.parsed_content(content), "tool_calls": self.limit(calls),
+                  "finish_reason": "tool_calls"}
         if self.single:
             result["tool_calls_streamed"] = False
         return result

@@ -171,6 +171,45 @@ def test_single_call_ignores_a_malformed_extra_call(stream):
     assert len(calls) == 1
 
 
+UNOFFERED = '<tool_call><function=launch><parameter=when>now</parameter></function></tool_call>'
+MALFORMED = '<tool_call><function=launch><parameter=when>now</function></tool_call>'
+
+
+def reply_content(body, stream):
+    if not stream:
+        return json.loads(body)["choices"][0]["message"]["content"] or ""
+    return "".join(json.loads(line[5:])["choices"][0]["delta"].get("content") or ""
+                   for line in body.splitlines() if line.startswith("data:") and line != "data: [DONE]")
+
+
+def reply_calls(body, stream):
+    if stream:
+        return [(c["name"], json.loads(c["arguments"])) for _, c in sorted(stream_calls(body).items())]
+    calls = json.loads(body)["choices"][0]["message"].get("tool_calls") or []
+    return [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("parallel", [True, False])
+def test_an_unoffered_call_is_sent_under_its_own_name(stream, parallel):
+    def ask(content):
+        return request(PolicyApp(content="Launching. " + content), {"messages": [{"role": "user", "content": "Launch"}],
+            "tools": TOOLS, "stream": stream, "parallel_tool_calls": parallel})
+    (status, body), (_, offered) = ask(UNOFFERED), ask(CALL.format(1))
+    assert status == 200 and '"finish_reason": "tool_calls"' in body.replace('":"', '": "')
+    assert reply_calls(body, stream) == [("launch", {"when": "now"})]
+    assert reply_content(body, stream) == reply_content(offered, stream)      # answered as an offered call is
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_single_call_keeps_a_malformed_call_as_text(stream):
+    app = PolicyApp(content="Launching. " + MALFORMED)
+    status, body = request(app, {"messages": [{"role": "user", "content": "Launch"}],
+        "tools": TOOLS, "stream": stream, "parallel_tool_calls": False})
+    assert status == 200 and reply_calls(body, stream) == []
+    assert reply_content(body, stream) == "Launching. " + MALFORMED
+
+
 @pytest.mark.parametrize("options", [
     {"images": ["https://example.com/picture.png"]}, {"modalities": ["audio"]},
     {"messages": [{"role": "user", "content": [{"type": "text", "text": "Hi",

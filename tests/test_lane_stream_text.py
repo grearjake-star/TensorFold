@@ -110,8 +110,8 @@ def test_gemma_bare_colon_tool_call_is_structured():
     assert json.loads(calls[0]["function"]["arguments"]) == {"path": "."}
     prose, parsed = parse_tool_calls_from_content("Looking.\n" + leaked, tools)
     assert prose == "Looking." and json.loads(parsed[0]["function"]["arguments"]) == {"path": "."}
-    stayed, missed = parse_tool_calls_from_content(leaked, [tool("bash")])
-    assert missed is None and stayed == leaked
+    stayed, unoffered = parse_tool_calls_from_content(leaked, [tool("bash")])   # a call under its own name (#256)
+    assert stayed == "" and [c["function"]["name"] for c in unoffered] == ["list"]
 
 
 def test_glm_and_gemma_calls_parse_through_one_parser():

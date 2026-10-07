@@ -361,6 +361,7 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                     try:
                         if tools:
                             streamed = [False]
+                            prose = [""]                  # the content sent so far
 
                             def on_prose(delta: str | dict[str, Any]) -> None:
                                 delta = tool_policy.delta(delta)
@@ -369,6 +370,7 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                                 if not streamed[0]:
                                     streamed[0] = True
                                     emit(stream_chunk({"role": "assistant"}))
+                                prose[0] += delta if isinstance(delta, str) else str(delta.get("content") or "")
                                 emit(stream_chunk(delta))
 
                             extra = (
@@ -391,6 +393,7 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                                 if not streamed[0]:
                                     streamed[0] = True
                                     emit(stream_chunk({"role": "assistant"}))
+                                prose[0] += tail
                                 emit(stream_chunk(tail))
                             tool_calls = reply.get("tool_calls")
                             if tool_calls and not reply.get("tool_calls_streamed"):
@@ -400,6 +403,11 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                                     emit(stream_chunk(delta))
                             elif reply.get("content") and not streamed[0]:
                                 emit(stream_chunk(str(reply["content"])))
+                            elif str(reply.get("content") or "").startswith(prose[0].strip()):
+                                # what the stream's filter held back and the reply keeps as text (a malformed call)
+                                rest = str(reply["content"])[len(prose[0].strip()):]
+                                if rest.strip():
+                                    emit(stream_chunk(rest))
                         else:
                             if is_chat_completion:
                                 emit(stream_chunk({"role": "assistant"}))
