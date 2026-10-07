@@ -43,7 +43,11 @@ def test_env_default_is_on():
     import sys
 
     code = "from tensorfold.cuda.exl3 import experts; print(experts.PROMPT_SIDE)"
+    from pathlib import Path
+
     env = {k: v for k, v in os.environ.items() if k != "TF_EXL3_PROMPT_SIDE"}
+    src = str(Path(__file__).resolve().parents[1] / "src")             # this tree, not an installed tensorfold
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [src, env.get("PYTHONPATH", "")]))
     run = lambda e: subprocess.run([sys.executable, "-c", code], env=e, capture_output=True, text=True,  # noqa: E731
                                    check=True).stdout.strip()
     assert run(env) == "True" and run({**env, "TF_EXL3_PROMPT_SIDE": "0"}) == "False"
