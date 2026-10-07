@@ -1,4 +1,4 @@
-"""Host n-gram shards for CUDA and for Metal past GPU memory: memory-mapped here, or read from disk by SSDTable."""
+"""Host n-gram shards for CUDA: memory-mapped here, or read from disk by SSDTable."""
 
 from __future__ import annotations
 
@@ -18,23 +18,6 @@ _PARTS = ("weight", "scales", "biases")
 # a prompt chunk's gather copies big row runs on worker threads (GIL released); bytes stay the same as single-threaded
 GATHER_THREADS = 16
 GATHER_SPLIT = 512
-
-
-def ngrams_on_host(model_dir: Path, ssd: bool = False) -> bool:
-    """Host n-gram tables when read from SSD, else past the GPU working-set threshold (TF_NGRAM_HOST=0/1 overrides)."""
-
-    flag = os.environ.get("TF_NGRAM_HOST", "")
-    if ssd:
-        if flag == "0":
-            raise ValueError("--ple-on-ssd reads the n-gram tables on the host: unset TF_NGRAM_HOST=0")
-        return True
-    if flag in ("0", "1"):
-        return flag == "1"
-    import mlx.core as mx
-
-    size = sum(p.stat().st_size for p in Path(model_dir).glob("model*.safetensors"))
-    info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
-    return size > 0.75 * int(info["max_recommended_working_set_size"])
 
 
 def windows_lock_pages(arrays, kernel32=None):

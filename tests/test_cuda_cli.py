@@ -12,19 +12,18 @@ def _family(**members):
     return SimpleNamespace(title="Test family", package=SimpleNamespace(**members))
 
 
-def test_auto_backend_follows_the_platform(monkeypatch):
-    both = _family(load=lambda *a, **k: None, cuda_engine=lambda *a, **k: None)
-    monkeypatch.setattr(cli.sys, "platform", "darwin")
-    assert cli._backend("auto", both) == "mlx"
-    monkeypatch.setattr(cli.sys, "platform", "linux")
-    assert cli._backend("auto", both) == "cuda"
+def test_every_platform_serves_cuda(monkeypatch):
+    family = _family(cuda_engine=lambda *a, **k: None)
+    for platform in ("darwin", "linux", "win32"):
+        monkeypatch.setattr(cli.sys, "platform", platform)
+        assert cli._backend("auto", family) == cli._backend("cuda", family) == "cuda"
 
 
-def test_a_family_serves_only_the_backends_it_has():
+def test_mlx_is_refused_and_a_family_needs_a_cuda_engine():
+    with pytest.raises(ValueError, match="CUDA"):
+        cli._backend("mlx", _family(cuda_engine=lambda *a, **k: None))
     with pytest.raises(ValueError, match="no CUDA engine"):
         cli._backend("cuda", _family(load=lambda *a, **k: None))
-    with pytest.raises(ValueError, match="NVIDIA GPUs only"):
-        cli._backend("mlx", _family(cuda_engine=lambda *a, **k: None))
 
 
 def test_two_gpus_need_a_master_before_anything_loads(tmp_path):
@@ -193,16 +192,13 @@ def test_kv_dtype_reaches_only_the_families_that_declare_it(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("flags,backend,family,message", [
-    (["--kv-dtype", "int8"], "mlx", "qwen4_exp", "MLX path caches keys and values as bf16"),
     (["--kv-dtype", "int4"], "cuda", "qwen3_5", "KV cache, not --kv-dtype int4"),
     (["--kv-dtype", "int8"], "cuda", "nemotron_h", "KV cache, not --kv-dtype int8"),
-    (["--mtp-confidence", "0.6"], "mlx", "qwen4_exp", "on MLX has no such rule"),
-    (["--mtp-confidence", "0.6"], "cuda", "glm5_next", "on CUDA has no such rule"),
+    (["--mtp-confidence", "0.6"], "cuda", "glm5_next", "GLM-5.3-Flash has no such rule"),
     (["--mtp-confidence", "1.5"], "cuda", "qwen4_exp", "probability from 0 to 1"),
     (["--mtp-confidence", "-0.1"], "cuda", "qwen4_exp", "probability from 0 to 1"),
-    (["--prefill-fp8"], "mlx", "qwen3_5", "Qwen3.8 dense on MLX has none"),
-    (["--prefill-fp8"], "cuda", "nemotron_h", "on CUDA has none"),
-    (["--prefill-fp8"], "cuda", "glm5_next", "on CUDA has none"),
+    (["--prefill-fp8"], "cuda", "nemotron_h", "Nemotron 3.5 Lightning has none"),
+    (["--prefill-fp8"], "cuda", "glm5_next", "GLM-5.3-Flash has none"),
 ])
 def test_cache_and_confidence_options_are_refused_before_any_download(tmp_path, monkeypatch, flags, backend, family,
                                                                       message):
@@ -391,7 +387,6 @@ def test_27b_cuda_engine_takes_the_checkpoint_slots_as_its_kept_states(tmp_path,
 
 @pytest.mark.parametrize("flags,backend,message", [
     (["--vision-offload"], "cuda", "--vision-offload needs --vision"),
-    (["--vision", "--vision-offload"], "mlx", "--vision-offload is for the CUDA backend"),
 ])
 def test_vision_offload_is_a_cuda_option_that_needs_vision(tmp_path, flags, backend, message):
     from tensorfold.families import qwen3_5

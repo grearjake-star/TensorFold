@@ -73,28 +73,6 @@ def test_mac_metrics_is_prometheus_and_health_stays_json():
         thread.join(5)
 
 
-def test_the_footprint_gauge_is_served_where_the_platform_counts_it():
-    """A live process reading, so two scrapes can differ; each route must carry the family once."""
-
-    app = SimpleNamespace(served_name="test", model_ids=["test"], max_batch_size=1)
-    httpd, thread = serve(app)
-    try:
-        for path in ("/metrics", "/v1/metrics"):
-            body = get(httpd.server_port, path)[2]
-            lines = [line for line in body.splitlines()
-                     if line.startswith(f"{metrics.PREFIX}process_footprint_bytes")]
-            if metrics.process_footprint() is None:      # a platform that counts no footprint emits none
-                assert not lines and f"# TYPE {metrics.PREFIX}process_footprint_bytes" not in body
-            else:
-                assert len(lines) == 1
-                assert int(lines[0].split()[-1]) > 0
-                assert f"# TYPE {metrics.PREFIX}process_footprint_bytes gauge" in body
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join(5)
-
-
 def test_histogram_buckets_are_cumulative_and_a_missing_first_token_is_not_counted():
     app = SimpleNamespace()
     metrics.note(app, prompt=4, generation=1, drafted=3, accepted=1, latency=0.2, ttft=0.02)

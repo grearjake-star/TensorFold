@@ -319,14 +319,12 @@ class Constraint:
         return window
 
     def mask(self, logits, window: Window | None = None, offset: int = 0):
-        """``logits`` (columns from token ``offset``), constrained rows' other tokens -inf: torch in place, MLX new."""
+        """``logits`` (columns from token ``offset``), constrained rows' other tokens -inf, in place (torch)."""
 
         if window is None:                            # one row: the token after the chosen ones
             window = self.window([0], [-1])
         if not window.rows:
             return logits
-        if type(logits).__module__.startswith("mlx"):
-            return _mask_mlx(logits, window, offset)
         return self._mask_torch(logits, window, offset)
 
     def allowed(self, window: Window, width: int, device, offset: int = 0):
@@ -374,27 +372,6 @@ class Constraint:
             raise
         except Exception as exc:                      # noqa: BLE001
             raise GrammarError(f"the reply's grammar failed: {_message(exc)}") from None
-
-
-def _mask_mlx(logits, window: Window, offset: int = 0):
-    """The MLX form of ``Constraint.mask``: rows [R, V] (or [1, R, V]), the bits unpacked on the GPU."""
-
-    import mlx.core as mx
-
-    shape, width = logits.shape, logits.shape[-1]
-    rows = logits.reshape(-1, width)
-    words = mx.array(window.bits.view("uint32"))                          # [k, W]
-    allowed = ((words[:, :, None] >> mx.arange(32, dtype=mx.uint32)) & 1).reshape(len(window.rows), -1)
-    allowed = allowed[:, offset:offset + width]
-    if allowed.shape[1] < width:                      # logits past the grammar's vocabulary: never allowed
-        allowed = mx.pad(allowed, [(0, 0), (0, width - allowed.shape[1])])
-    floor = mx.array(float("-inf"), dtype=rows.dtype)
-    if window.rows == list(range(rows.shape[0])):
-        rows = mx.where(allowed.astype(mx.bool_), rows, floor)
-    else:
-        index = mx.array(window.rows)
-        rows[index] = mx.where(allowed.astype(mx.bool_), rows[index], floor)
-    return rows.reshape(shape)
 
 
 __all__ = ["Constraint", "EXTRA", "FIELDS", "GrammarError", "Grammars", "KINDS", "Spec", "Window", "compiler",

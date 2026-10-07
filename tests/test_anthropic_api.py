@@ -8,7 +8,6 @@ from tensorfold.server.anthropic_translate import Reply, translate, usage
 from tensorfold.server.errors import RequestError
 from tests.test_cuda_admission import http_server
 from tests.test_cuda_tool_choice import Engine, app_for
-from tests.test_lane_server import make_app
 from tests.test_responses_api import call, stream_events
 from tests.test_server_openai_compat import FakeApp, serve_fake
 
@@ -308,26 +307,6 @@ def test_tool_arguments_stream_before_completion():
                              "finish_reason": "tool_calls"}]})
     reply.chunk(None)
     assert reconstruct(events) == [{"type": "tool_use", "id": "a", "name": "write", "input": {"content": "hello"}}]
-
-
-@pytest.mark.parametrize("thinking", [{"type": "disabled"}, {"type": "adaptive"}])
-def test_mlx_token_count_renders_without_generation(thinking):
-    app = make_app(enable_thinking=False, reasoning_effort="medium")
-    def refuse_generation(*args, **kwargs):
-        raise AssertionError("token counting must not generate")
-    app.chat = refuse_generation
-    server = serve_fake(app)
-    try:
-        body = {**BASE, "max_tokens": 2, "thinking": thinking, "output_config": {"effort": "low"}}
-        status, raw = call(server.server_port, "POST", "/v1/messages/count_tokens", body)
-        assert status == 200
-        count = json.loads(raw)["input_tokens"]
-        # The model's char tokenizer renders Hi, one message delimiter and the two-token generation marker.
-        assert count == 5
-    finally:
-        server.shutdown()
-        server.server_close()
-        app.close()
 
 
 def test_thinking_token_usage_is_preserved():

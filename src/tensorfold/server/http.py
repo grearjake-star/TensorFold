@@ -30,19 +30,11 @@ _REQUEST_LOG = os.environ.get("TENSORFOLD_REQUEST_LOG", "")
 
 
 def _memory(reset_peak: bool, *, admission: Any = None) -> dict[str, int]:
-    """MLX's memory in bytes: live buffers, its cache of freed ones, and the peak (since the last reset)."""
+    """The admission's memory snapshot when the app has one, else nothing (the CUDA server reports its own)."""
 
     if admission is not None:
         return admission.memory_snapshot(reset_peak)
-    try:
-        import mlx.core as mx
-    except ImportError:          # the CUDA server
-        return {}
-    memory = {"active": int(mx.get_active_memory()), "cache": int(mx.get_cache_memory()),
-              "peak": int(mx.get_peak_memory())}
-    if reset_peak:
-        mx.reset_peak_memory()
-    return memory
+    return {}
 
 
 class Server(ThreadingHTTPServer):

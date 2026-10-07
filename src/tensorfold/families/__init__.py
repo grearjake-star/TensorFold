@@ -1,8 +1,7 @@
-"""Discover family packages by model_type and inspect checkpoint compatibility before loading weights or MLX."""
+"""Discover family packages by model_type and inspect checkpoint compatibility before loading weights."""
 
 from __future__ import annotations
 
-import hashlib
 import importlib
 import json
 import pkgutil
@@ -17,7 +16,6 @@ class Family:
     model_type: str
     title: str
     module: str
-    lanes: bool  # served by the lane engine
 
     @property
     def package(self) -> ModuleType:
@@ -41,8 +39,7 @@ def families() -> dict[str, Family]:
             for kind in getattr(package, "MODEL_TYPES", ()):
                 if kind in found:
                     raise ValueError(f"model_type {kind!r} claimed by {found[kind].module} and {module}")
-                found[kind] = Family(kind, str(getattr(package, "TITLE", info.name)), module,
-                                     bool(getattr(package, "LANES", False)))
+                found[kind] = Family(kind, str(getattr(package, "TITLE", info.name)), module)
         _found = found
     return _found
 
@@ -51,10 +48,10 @@ def read_config(model_dir: str | Path) -> dict[str, Any]:
     return json.loads((Path(model_dir) / "config.json").read_text())
 
 
-RECIPES_URL = "https://github.com/ashhart/TensorFold/blob/main/docs/recipes/README.md"
-RUNBOOK_URL = "https://github.com/ashhart/TensorFold/blob/main/RUNBOOK.md"
+RECIPES_URL = "https://github.com/grearjake-star/TensorFold/blob/spark-exl3/docs/recipes/README.md"
+RUNBOOK_URL = "https://github.com/grearjake-star/TensorFold/blob/spark-exl3/RUNBOOK.md"
 OWN_MODEL_HELP = (f"To run a model or checkpoint TensorFold has no recipe for, write one with the recipe book "
-                  f"({RECIPES_URL}: adding a family on a Mac, adding a CUDA family on NVIDIA GPUs), and read the "
+                  f"({RECIPES_URL}: adding a CUDA family on NVIDIA GPUs), and read the "
                   f"runbook first ({RUNBOOK_URL}).")
 MLX_QUANT = "mlx"
 EXL3_QUANT = "exl3"
@@ -123,25 +120,23 @@ def describe_quantization(config: dict[str, Any]) -> str:
 
 
 def backends_of(family: Family) -> tuple[str, ...]:
-    """The backends a family has an engine for: ``mlx`` (``load``) and ``cuda`` (``cuda_engine``)."""
+    """The backends a family has an engine for: ``cuda`` (``cuda_engine``), the only backend of this fork."""
 
-    package = family.package
-    return tuple(b for b, member in (("mlx", "load"), ("cuda", "cuda_engine")) if hasattr(package, member))
+    return ("cuda",) if hasattr(family.package, "cuda_engine") else ()
 
 
 def readable_quants(family: Family, backend: str) -> tuple[str | None, ...]:
     """Return formats supported by the backend, using the family QUANT_METHODS override when present."""
 
     declared = getattr(family.package, "QUANT_METHODS", {}) or {}
-    default = (MLX_QUANT, None) if backend == "mlx" else (MLX_QUANT,)
-    return tuple(declared.get(backend, default))
+    return tuple(declared.get(backend, (MLX_QUANT,)))
 
 
 def require_readable(family: Family, config: dict[str, Any], backend: str) -> None:
     """Reject unsupported storage formats or MLX quantization dimensions before downloading weights."""
 
     method = quant_method(config)
-    where = "NVIDIA GPUs (CUDA)" if backend == "cuda" else "Apple Silicon (MLX)"
+    where = "NVIDIA GPUs (CUDA)"
     tested = ", ".join(getattr(family.package, "MODELS", ())) or "none listed"
     accepted = readable_quants(family, backend)
     if method not in accepted:
@@ -187,36 +182,3 @@ def detect(model_dir: str | Path) -> Family:
     return family
 
 
-def load(model_dir: str | Path, **options: Any) -> tuple[Any, Any]:
-    family = detect(model_dir)
-    return family.package.load(Path(model_dir), **options)
-
-
-def kernel_version(family: Family, model: Any) -> str:
-    """Fingerprint the active family and versioned kernels for safe prefix-snapshot reuse."""
-
-    hook = getattr(family.package, "kernel_version", None)
-    if hook is not None:
-        return str(hook(model))
-    source = kernel_source_version(family)
-    prefill_key = getattr(model, "prefill_key", None)              # how prompts are prefilled changes the bits too
-    return f"{source}|{prefill_key}" if prefill_key else source
-
-
-def kernel_source_version(family: Family) -> str:
-    """Hash a family's source and kernel dependencies without invoking its runtime hook."""
-
-    digest = hashlib.sha256()
-    modules = (family.module, getattr(family.package, "KERNEL_PACKAGE", ""),
-               *getattr(family.package, "KERNEL_DEPENDENCIES", ()))
-    for module_name in filter(None, modules):
-        digest.update(module_name.encode())
-        module = importlib.import_module(module_name)
-        source = Path(str(module.__file__))
-        paths = sorted(source.parent.rglob("*.py")) if source.name == "__init__.py" else [source]
-        for path in paths:
-            digest.update(path.relative_to(source.parent).as_posix().encode())
-            digest.update(path.read_bytes())
-    version = getattr(family.package, "KERNEL_VERSION", "")
-    prefix = f"{family.model_type}-{version}-" if version else ""
-    return prefix + digest.hexdigest()[:12]

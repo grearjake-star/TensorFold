@@ -36,5 +36,5 @@ def test_glm_vision_rejects_cuda_before_reading_checkpoint(monkeypatch):
         raise AssertionError('unsupported backend must be rejected before reading checkpoint')
 
     monkeypatch.setattr(families, 'read_config', read_config)
-    with pytest.raises(ValueError, match='GLM.*MLX-only'):
+    with pytest.raises(ValueError, match='GLM-5.3-Flash image input is not served'):
         serve_options.check(Namespace(vision=True), SimpleNamespace(model_type='glm5_next'), 'cuda', 'unused')

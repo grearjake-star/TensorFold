@@ -7,7 +7,7 @@ from tensorfold.vision.images import ImageInputError, ImageSource, split_images
 from tensorfold.vision.qwen_processing import QwenImageProcessor, media_positions
 from tensorfold.vision.videos import (DEFAULT_VIDEO_LIMITS, VideoInput, VideoLimits, VideoSource, sample_indices,
                                       video_source)
-from tests.test_vision_qwen_mlx import CONFIG, ImageProcessor, Tokenizer, image
+from tests.test_vision_qwen import CONFIG, ImageProcessor, Tokenizer, image
 
 DATA = "data:video/mp4;base64,AAAA"
 

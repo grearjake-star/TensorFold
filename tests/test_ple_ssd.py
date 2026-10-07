@@ -10,7 +10,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -385,117 +385,11 @@ def _raise(exc: type[Exception]):
     raise exc
 
 
-def test_the_flag_reaches_the_metal_family_only_when_given(tmp_path, mlx_cpu):
-    class Reached(Exception):
-        pass
-
-    seen = []
-    family = SimpleNamespace(title="fixture", model_type="qwen4_exp",
-                             package=SimpleNamespace(load=lambda path, **k: seen.append(k) or _raise(Reached)))
-    for flag in ([], ["--ple-on-ssd"]):
-        args = cli.build_parser().parse_args(["serve", str(tmp_path), "--snapshot-dir", "none", *flag])
-        with pytest.raises(Reached):
-            cli._serve_mlx(args, family, tmp_path, 0, [], 1 << 30)
-    assert "ple_on_ssd" not in seen[0] and seen[1]["ple_on_ssd"] is True
-
-
 def test_cuda_admission_counts_no_mapped_pages_for_tables_on_ssd():
     info = {"dtype": "U32", "shape": [1000, 20], "data_offsets": [0, 80_000]}
     name = "language_model.model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"
     assert indexed_weights(1, True)(name, info) == (0, 80_000)
     assert indexed_weights(1, True, mapped_tables=False)(name, info) == (0, 0)
-
-
-def test_the_flag_reaches_the_metal_loader(tmp_path, monkeypatch):
-    seen = []
-    runtime = ModuleType("tensorfold.families.qwen4_exp.runtime")
-    runtime.load = lambda path, **k: seen.append(k) or ("model", "tokenizer")
-    monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
-    assert qwen4_exp.load(tmp_path, ple_on_ssd=True) == ("model", "tokenizer")
-    qwen4_exp.load(tmp_path)
-    qwen4_exp.load(tmp_path, ssd_experts=24.0)
-    assert seen == [{"drafts": 0, "ple_on_ssd": True, "ssd_experts": None},
-                    {"drafts": 0, "ple_on_ssd": False, "ssd_experts": None},
-                    {"drafts": 0, "ple_on_ssd": False, "ssd_experts": 24.0}]
-
-
-def _fake_mlx(monkeypatch) -> None:
-    core = ModuleType("mlx.core")
-    core.set_cache_limit = core.set_memory_limit = lambda value: None
-    core.device_info = lambda: {"max_recommended_working_set_size": 64 * GIB, "memory_size": 128 * GIB}
-    mlx = ModuleType("mlx")
-    mlx.core = core
-    monkeypatch.setitem(sys.modules, "mlx", mlx)
-    monkeypatch.setitem(sys.modules, "mlx.core", core)
-
-
-def test_tables_left_on_ssd_do_not_count_against_the_memory_budget(tmp_path, monkeypatch):
-    folder = _flash_next(tmp_path / "flash")
-    ple = "language_model.model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"
-    rows = 3 * GIB // 80
-    header = {ple: {"dtype": "U32", "shape": [rows, 20], "data_offsets": [0, rows * 80]},
-              "language_model.model.norm.weight": {"dtype": "BF16", "shape": [512],
-                                                   "data_offsets": [rows * 80, rows * 80 + 1024]}}
-    text = json.dumps(header).encode()
-    with open(folder / "model-00001-of-00001.safetensors", "wb") as f:
-        f.write(struct.pack("<Q", len(text)) + text)
-        f.truncate(8 + len(text) + rows * 80 + 1024)          # sparse: 3 GiB of tables, no blocks written
-    _fake_mlx(monkeypatch)
-    for key, value in qwen4_exp.MLX_ENV.items():
-        monkeypatch.setenv(key, os.environ.get(key, value))
-    monkeypatch.setenv("TENSORFOLD_MEMORY_LIMIT_GB", "5")      # 2 GiB for weights beside the 3 GiB process reserve
-    monkeypatch.setattr("faulthandler.register", lambda *a, **k: None)
-
-    class Reached(Exception):
-        pass
-
-    monkeypatch.setattr(cli, "_serve_mlx", lambda *a, **k: _raise(Reached))
-    args = cli.build_parser().parse_args(["serve", str(folder), "--no-update-check", "--backend", "mlx"])
-    with pytest.raises(ValueError, match="do not fit"):
-        cli.cmd_serve(args)
-    args.ple_on_ssd = True
-    with pytest.raises(Reached):
-        cli.cmd_serve(args)
-
-
-def test_routed_experts_left_on_ssd_count_as_their_pool(tmp_path, monkeypatch):
-    folder = _flash_next(tmp_path / "flash")
-    expert = "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
-    size = 3 * GIB
-    header = {expert: {"dtype": "U32", "shape": [512, size // 2048], "data_offsets": [0, size]},
-              "language_model.model.norm.weight": {"dtype": "BF16", "shape": [512], "data_offsets": [size, size + 1024]}}
-    text = json.dumps(header).encode()
-    with open(folder / "model-00001-of-00001.safetensors", "wb") as f:
-        f.write(struct.pack("<Q", len(text)) + text)
-        f.truncate(8 + len(text) + size + 1024)                 # sparse: 3 GiB of experts, no blocks written
-    _fake_mlx(monkeypatch)
-    for key, value in qwen4_exp.MLX_ENV.items():
-        monkeypatch.setenv(key, os.environ.get(key, value))
-    monkeypatch.setenv("TENSORFOLD_MEMORY_LIMIT_GB", "5")      # 2 GiB for weights beside the 3 GiB process reserve
-    monkeypatch.setattr("faulthandler.register", lambda *a, **k: None)
-
-    class Reached(Exception):
-        pass
-
-    monkeypatch.setattr(cli, "_serve_mlx", lambda *a, **k: _raise(Reached))
-    args = cli.build_parser().parse_args(["serve", str(folder), "--no-update-check", "--backend", "mlx"])
-    with pytest.raises(ValueError, match="--ssd-experts GIB"):
-        cli.cmd_serve(args)
-    args.ssd_experts = 2.5                                      # a 2.5 GiB pool: still past the 2 GiB left
-    with pytest.raises(ValueError, match="do not fit"):
-        cli.cmd_serve(args)
-    args.ssd_experts = 1.0
-    with pytest.raises(Reached):
-        cli.cmd_serve(args)
-
-
-@pytest.fixture
-def mlx_cpu():
-    mx = pytest.importorskip("mlx.core")
-    previous = mx.default_device()
-    mx.set_default_device(mx.cpu)
-    yield mx
-    mx.set_default_device(previous)
 
 
 TEXT = {
@@ -514,62 +408,3 @@ TEXT = {
 }
 
 
-def test_metal_loads_give_the_same_logits_with_the_tables_on_ssd(tmp_path, monkeypatch, mlx_cpu):
-    """A tiny Flash Next on the CPU device: GPU tables, memory-mapped host rows and rows from SSD agree bit for bit."""
-
-    mx = mlx_cpu
-    import mlx.nn as nn
-    import mlx_lm.utils
-    from mlx.utils import tree_flatten
-
-    from tensorfold.families.qwen4_exp import model as q4
-
-    config = {"model_type": "qwen4_exp", "text_config": TEXT, "quantization": {"group_size": 32, "bits": 4}}
-    mx.random.seed(0)
-    model = q4.Qwen4Exp(q4.Config.from_dict(config))
-    for shard in model.layers[1].ple.ple_embedding.shards:
-        shard.weight = shard.weight.astype(mx.bfloat16)          # bf16 scales and biases, as the checkpoint has
-    nn.quantize(model, group_size=32, bits=4, class_predicate=lambda path, _: ".ple_embedding.shards." in path)
-    params = {"language_model." + k.replace(".ple_embedding.shards.", ".ple_embedding.ngram_embedding.shard_"): v
-              for k, v in tree_flatten(model.parameters())}
-    owner = {n: int(n.split(".shard_")[1].split(".")[0]) if ".shard_" in n else i for i, n in enumerate(params)}
-    for f in range(2):                       # a shard's words, scales and biases share a file, as in the checkpoint
-        mx.save_safetensors(str(tmp_path / f"model-0000{f + 1}-of-00002.safetensors"),
-                            {n: a for n, a in params.items() if owner[n] % 2 == f}, metadata={"format": "mlx"})
-    (tmp_path / "config.json").write_text(json.dumps(config))
-    monkeypatch.setattr(mlx_lm.utils, "load_tokenizer", lambda *a, **k: "tokenizer")
-    monkeypatch.setenv("TF_FLASH_FUSED", "0")
-
-    def logits(**options) -> list:
-        loaded, _ = q4.load(tmp_path, **options)
-        cache = loaded.make_cache()
-        first = loaded(np.array([[11, 42, 5, 17, 42, 11, 60, 3, 5, 5, 90, 17]]), cache)
-        return [loaded.layers[1].ple.ple_embedding.host, first, loaded(np.array([[33]]), cache)]
-
-    monkeypatch.setenv("TF_NGRAM_HOST", "0")
-    on_gpu = logits()
-    monkeypatch.setenv("TF_NGRAM_HOST", "1")
-    mapped = logits()
-    monkeypatch.delenv("TF_NGRAM_HOST")
-    on_ssd = logits(ple_on_ssd=True)
-    assert on_gpu[0] is None and type(mapped[0].table) is HostTable and type(on_ssd[0].table) is SSDTable
-    for a, b, c in zip(on_gpu[1:], mapped[1:], on_ssd[1:]):
-        assert mx.array_equal(a, b).item() and mx.array_equal(a, c).item()
-    on_ssd[0].close()
-    monkeypatch.setenv("TF_NGRAM_HOST", "0")
-    monkeypatch.setattr(mx, "load", lambda *a, **k: pytest.fail("read weights before refusing"))
-    with pytest.raises(ValueError, match="unset TF_NGRAM_HOST=0"):
-        q4.load(tmp_path, ple_on_ssd=True)
-
-
-def test_tables_on_ssd_take_the_host_path_without_asking_the_gpu(tmp_path, monkeypatch, mlx_cpu):
-    from tensorfold.families.qwen4_exp import model as q4
-
-    monkeypatch.setattr(mlx_cpu, "device_info", lambda: pytest.fail("asked the GPU"), raising=False)
-    monkeypatch.delenv("TF_NGRAM_HOST", raising=False)
-    assert q4.ngrams_on_host(tmp_path, ssd=True)
-    monkeypatch.setenv("TF_NGRAM_HOST", "1")
-    assert q4.ngrams_on_host(tmp_path, ssd=True)
-    monkeypatch.setenv("TF_NGRAM_HOST", "0")
-    with pytest.raises(ValueError, match="unset TF_NGRAM_HOST=0"):
-        q4.ngrams_on_host(tmp_path, ssd=True)

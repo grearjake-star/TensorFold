@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import sys
-from types import ModuleType, SimpleNamespace as NS
 
 import pytest
 
@@ -23,7 +22,7 @@ def configuration(bits=4, group=64, **overrides):
 
 
 def qwen_family():
-    return families.Family("qwen3_5", qwen3_5.TITLE, qwen3_5.__name__, True)
+    return families.Family("qwen3_5", qwen3_5.TITLE, qwen3_5.__name__)
 
 
 @pytest.mark.parametrize("backend", ["mlx", "cuda"])
@@ -33,26 +32,6 @@ def test_qwen_affine_metadata_accepts_all_declared_combinations(backend, bits, g
     value = configuration(bits, group)
     qwen3_5.check_quantization(value, backend)
     families.require_readable(qwen_family(), value, backend)
-
-
-@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
-@pytest.mark.parametrize("group", [32, 64, 128])
-def test_native_tensor_unit_routing_is_narrower_than_format_admission(bits, group):
-    assert qwen3_5.native_lanes(configuration(bits, group)) is (group == 64 or (bits == 4 and group == 32))
-
-
-@pytest.mark.parametrize("entry,native", [({"bits": 8, "group_size": 128}, False),
-                                         ({"bits": 5}, True), ({"group_size": 32}, True),
-                                         ({}, True), (False, True), (True, True)])
-def test_native_routing_resolves_language_projection_overrides(entry, native):
-    value = configuration(**{"model.layers.0.self_attn.q_proj": entry})
-    assert qwen3_5.native_lanes(value) is native
-
-
-def test_embedding_and_vision_format_overrides_do_not_force_language_rows():
-    value = configuration(**{"model.embed_tokens": {"bits": 8, "group_size": 128},
-                             "vision_tower.blocks.0.proj": {"bits": 5, "group_size": 32}})
-    assert qwen3_5.native_lanes(value)
 
 
 def test_family_metadata_prioritizes_modern_quantization_and_skips_empty_overrides():
@@ -83,7 +62,7 @@ def test_qwen_family_validates_per_module_overrides(backend):
 @pytest.mark.parametrize("package,group", [(nemotron_h, 64), (qwen4_exp, 32)])
 @pytest.mark.parametrize("bits", [2, 3, 5, 6, 8])
 def test_moe_families_still_refuse_other_bit_widths_on_cuda(package, group, bits):
-    family = families.Family(package.MODEL_TYPES[0], package.TITLE, package.__name__, True)
+    family = families.Family(package.MODEL_TYPES[0], package.TITLE, package.__name__)
     with pytest.raises(ValueError, match="4-bit"):
         families.require_readable(family, configuration(bits, group), "cuda")
 
@@ -111,25 +90,3 @@ def test_flash_next_refuses_unquantized_and_non_affine_checkpoints(tmp_path):
             qwen4_exp.check(tmp_path)
 
 
-@pytest.mark.parametrize("lane_kernels", ["auto", "on", "off"])
-def test_cli_passes_kernel_choice_to_family_loader_without_allocating(tmp_path, monkeypatch, lane_kernels):
-    args = cli.build_parser().parse_args(["serve", str(tmp_path), "--lane-kernels", lane_kernels,
-                                          "--no-drafts", "--no-update-check"])
-    core, mlx = ModuleType("mlx.core"), ModuleType("mlx")
-    mlx.core = core
-    monkeypatch.setitem(sys.modules, "mlx", mlx)
-    monkeypatch.setitem(sys.modules, "mlx.core", core)
-    calls = []
-
-    class AtLoader(Exception):
-        pass
-
-    def load(path, **options):
-        calls.append((path, options))
-        raise AtLoader
-
-    family = NS(package=NS(load=load), title="Qwen dense", model_type="qwen3_5")
-    with pytest.raises(AtLoader):
-        cli._serve_mlx(args, family, tmp_path, 4096, (), 1024**3)
-    assert calls[0][0] == tmp_path and calls[0][1]["lane_kernels"] == lane_kernels
-    assert calls[0][1]["drafter"] == ""

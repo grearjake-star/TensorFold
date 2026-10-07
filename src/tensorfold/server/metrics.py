@@ -12,7 +12,6 @@ import threading
 import time
 from typing import Any
 
-from tensorfold.server.memory_budget import process_footprint
 
 PREFIX = "tensorfold:"
 # Request and time-to-first-token histograms share these upper edges. +Inf is added when rendered.
@@ -212,13 +211,6 @@ def render(app: Any) -> str:
     _histogram(lines, "request_time_per_output_token_seconds",
                "A finished request's first to last generated token over the tokens less one (vLLM's TPOT).",
                per_token)
-    # the process's own footprint, where the platform counts it (macOS): weights, caches and streams as one number
-    footprint = process_footprint()
-    if footprint is not None:
-        _family(lines, "process_footprint_bytes", "gauge",
-                "This process's physical footprint as the OS counts it, Metal buffers included; "
-                "only where the platform reports one (macOS).",
-                [f"{PREFIX}process_footprint_bytes {footprint}"])
     # vLLM names, identical values: a vLLM dashboard needs only the "tensorfold:" prefix swapped.
     _family(lines, "num_requests_running", "gauge",
             "Requests in prefill or decode. A mirror of tensorfold:requests_running.",

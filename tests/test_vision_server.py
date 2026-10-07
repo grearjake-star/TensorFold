@@ -8,24 +8,19 @@ import sys
 import threading
 from types import ModuleType, SimpleNamespace as NS
 
-import numpy as np
 import pytest
 
 from tensorfold.cuda.server import App
 from tensorfold.cuda.streams import PrefixCache
-from tensorfold.engine.family_prefill import FamilyPrefill
-from tensorfold.engine.lane_engine import LaneStream
-from tensorfold.engine.prefill_plan import PrefillPlan
 from tensorfold.families.qwen3_5.cuda.engine import Qwen27Engine
 from tensorfold.server.errors import RequestError
 from tensorfold.server.messages import normalize_messages
 from tensorfold.server.prompts import prepare_images, prepare_prompt
-from tensorfold.server.scheduler import ChatJob, Scheduler
 
 
 @pytest.fixture(autouse=True)
 def block_accelerators(monkeypatch):
-    for name in ("mlx", "mlx.core", "mlx.nn", "mlx_lm", "mlx_vlm", "torch", "triton"):
+    for name in ("torch", "triton"):
         monkeypatch.setitem(sys.modules, name, None)
 
 
@@ -321,175 +316,6 @@ class Checkpoints:
 
     def insert(self, *args, **kwargs):
         self.calls.append("insert")
-
-
-def scheduler_fixture(memory=None):
-    calls, checkpoints = [], Checkpoints()
-    engine = NS(prefill_guard=None, finished_caches={}, streams=[], prompt_chunks=PrefillPlan(2).chunks)
-    engine.model = NS(vision=NS(estimate_workspace_bytes=lambda prepared: 4096))
-
-    def add_stream(stream, **kwargs):
-        calls.append((stream, kwargs))
-        stream.cached_tokens = kwargs["cached_tokens"]
-        stream.history_checkpoints = [(stream.prompt_ids[:2], [object()])]
-        engine.streams.append(stream)
-
-    def begin_stream(stream, **kwargs):
-        add_stream(stream, **kwargs)               # the whole prefill in the first step
-        yield from ()
-
-    engine.add_stream, engine.begin_stream = add_stream, begin_stream
-    scheduler = Scheduler(engine, lanes=4, eos_ids=frozenset(), checkpoints=checkpoints, prompt_memory=memory)
-    scheduler._read_disk_block = lambda *args: checkpoints.calls.append("disk")
-    return scheduler, calls, checkpoints
-
-
-def test_scheduler_image_jobs_bypass_checkpoint_reads_and_writes():
-    scheduler, calls, checkpoints = scheduler_fixture()
-    for index in range(2):
-        job = ChatJob(str(index), [1, 2, 3, 4], 2, 0, history_len=2, shared_prefix_lens=(2,), vision=object())
-        scheduler._start_job(job)
-        stream, options = calls[-1]
-        assert job.error is None and stream.prompt_data is job.vision and not stream.retain
-        assert options == dict(cache=None, cached_tokens=0, checkpoints_at=[])
-        scheduler.engine.finished_caches[job.job_id] = ([1, 2, 3, 4, 5], [object()])
-        scheduler._retire(job)
-        assert job.done.is_set() and job.cached_tokens == 0
-    assert not checkpoints.calls
-
-
-def test_scheduler_text_jobs_keep_checkpoint_reuse_and_storage():
-    scheduler, calls, checkpoints = scheduler_fixture()
-    job = ChatJob("text", [1, 2, 3, 4], 2, 0, history_len=2, shared_prefix_lens=(2,))
-    scheduler._start_job(job)
-    stream, options = calls[-1]
-    assert job.error is None and stream.prompt_data is None and stream.retain
-    assert options["cache"] is checkpoints.cache and job.cached_tokens == 2
-    assert checkpoints.calls == ["disk", "peek", "peek", "match", "insert"]     # at its admission, then its start
-    scheduler.engine.finished_caches[job.job_id] = ([1, 2, 3, 4, 5], [object()])
-    scheduler._retire(job)
-    assert checkpoints.calls[-1] == "insert" and checkpoints.calls.count("insert") == 2
-
-
-def test_scheduler_admits_image_memory_before_starting_prefill():
-    admitted, workspace = [], []
-    memory = NS(begin=lambda *args, admit: admitted.append(admit), end=lambda: None,
-                require_workspace=lambda count: workspace.append(count))
-    scheduler, calls, _ = scheduler_fixture(memory)
-    scheduler._start_job(ChatJob("image", [1, 2, 3, 4], 2, 0, vision=object()))
-    assert calls and admitted == [True] and workspace == [4096]
-
-
-def test_scheduler_workspace_refusal_never_starts_image_prefill():
-    def refuse(count):
-        raise RequestError("image workspace does not fit")
-
-    ended = []
-    memory = NS(begin=lambda *args, **kwargs: "held", end=ended.append, require_workspace=refuse)
-    scheduler, calls, checkpoints = scheduler_fixture(memory)
-    job = ChatJob("image", [1, 2, 3, 4], 2, 0, vision=object())
-    scheduler._start_job(job)
-    assert isinstance(job.error, RequestError) and "workspace" in str(job.error)
-    assert job.done.is_set() and ended == ["held"] and not calls and not checkpoints.calls
-
-
-@pytest.fixture
-def numpy_mlx(monkeypatch):
-    core = ModuleType("mlx.core")
-    core.array, core.uint32, core.eval = np.array, np.uint32, lambda *args: None
-    mlx = ModuleType("mlx")
-    mlx.core = core
-    monkeypatch.setitem(sys.modules, "mlx", mlx)
-    monkeypatch.setitem(sys.modules, "mlx.core", core)
-    import tensorfold.engine.family_prefill as family_prefill
-    monkeypatch.setattr(family_prefill, "drop_spares", lambda cache: cache)
-
-
-def family_prefill_fixture():
-    calls = []
-
-    class Model:
-        def make_cache(self):
-            return [NS(state=None)]
-
-        def encode_vision(self, prepared, cache):
-            encoded = NS(prepared=prepared)
-            calls.append(("encode", encoded))
-            return encoded
-
-        def hidden(self, tokens, cache):
-            calls.append(("text", tokens.copy()))
-            return tokens.astype(np.float32)[..., None]
-
-        def prefill_vision(self, tokens, cache, prepared, begin, end):
-            calls.append(("vision", prepared, begin, end, tokens.copy()))
-            return tokens.astype(np.float32)[..., None]
-
-    class Engine(FamilyPrefill):
-        model, prefill_guard, prefill_chunks = Model(), None, 0
-        prefill_plan = PrefillPlan(2)
-        prompt_chunks = staticmethod(prefill_plan.chunks)
-        copy_single_cache = staticmethod(lambda cache: list(cache))
-
-        def _family_first(self, stream, cache, hidden, cached_tokens, row):
-            stream.cached_tokens = cached_tokens
-            return 65
-
-    return Engine(), calls
-
-
-def test_family_prefill_encodes_once_and_passes_each_image_chunk(numpy_mlx):
-    engine, calls = family_prefill_fixture()
-    prepared = object()
-    stream = LaneStream("image", [1, 2, 3, 4, 5], 2, prompt_data=prepared, retain=False)
-    engine._family_prefill(stream, cache=None, cached_tokens=0, checkpoints_at=[2, 4])
-    assert [call[0] for call in calls] == ["encode", "vision", "vision", "vision"]
-    assert all(call[1] is calls[0][1] for call in calls[1:])
-    assert [(call[2], call[3]) for call in calls[1:]] == [(0, 2), (2, 4), (4, 5)]
-    assert stream.history_checkpoints == [] and stream.emitted == [65] and stream.cached_tokens == 0
-
-
-def test_an_image_prompt_skips_the_message_cuts_a_text_prompt_keeps(numpy_mlx):
-    engine, calls = family_prefill_fixture()
-    engine.prefill_plan = PrefillPlan(4, openers=(7,), min_chunk=2)
-    engine.prompt_chunks = engine.prefill_plan.chunks
-    prompt = [7, 1, 2, 7, 3, 4]
-    assert engine.prompt_chunks(prompt).between(0, 6) == [(0, 3), (3, 6)]     # text: cut at the second message
-    engine._family_prefill(LaneStream("image", prompt, 2, prompt_data=object(), retain=False),
-                           cache=None, cached_tokens=0, checkpoints_at=[3])
-    assert [(call[2], call[3]) for call in calls if call[0] == "vision"] == [(0, 4), (4, 6)]      # image: the grid
-
-
-def test_family_prefill_refuses_any_cached_image_state(numpy_mlx):
-    engine, calls = family_prefill_fixture()
-    with pytest.raises(ValueError, match="fresh cache"):
-        engine._family_prefill(LaneStream("image", [1, 2, 3, 4], 2, prompt_data=object()),
-                               cache=engine.model.make_cache(), cached_tokens=2, checkpoints_at=[])
-    assert not calls
-
-
-def test_family_prefill_text_retains_checkpoint_path(numpy_mlx):
-    engine, calls = family_prefill_fixture()
-    stream = LaneStream("text", [1, 2, 3, 4, 5], 2)
-    engine._family_prefill(stream, cache=None, cached_tokens=0, checkpoints_at=[2])
-    assert [call[0] for call in calls] == ["text", "text", "text"]
-    assert [len(tokens) for tokens, cache in stream.history_checkpoints] == [2]
-
-
-def test_failed_image_prefill_does_not_keep_partial_checkpoint(numpy_mlx):
-    engine, calls = family_prefill_fixture()
-    original = engine.model.prefill_vision
-
-    def fail_second(tokens, cache, prepared, begin, end):
-        if begin > 0:
-            raise RuntimeError("interrupted image prefill")
-        return original(tokens, cache, prepared, begin, end)
-
-    engine.model.prefill_vision = fail_second
-    stream = LaneStream("image", [1, 2, 3, 4, 5], 2, prompt_data=object(), retain=False)
-    with pytest.raises(RuntimeError, match="interrupted"):
-        engine._family_prefill(stream, cache=None, cached_tokens=0, checkpoints_at=[2])
-    assert stream.history_checkpoints == [] and len(calls) == 2
 
 
 def test_prepare_images_fetches_urls_only_when_the_frontend_allows(monkeypatch):

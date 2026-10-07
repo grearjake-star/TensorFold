@@ -90,21 +90,6 @@ def test_the_cuda_server_takes_min_p_and_refuses_a_bad_one(tmp_path):
             assert status == 400 and "min_p must be between 0 and 1" in json.loads(text)["error"]["message"]
 
 
-def test_the_mac_server_reads_min_p():
-    from tests.test_request_reasoning import SamplingApp
-    from tests.test_server_openai_compat import post_json, serve_fake
-
-    app = SamplingApp()
-    http = serve_fake(app)
-    try:
-        payload = {"messages": [{"role": "user", "content": "hi"}], "min_p": 0.2, "temperature": 0.8}
-        assert post_json(http, "/v1/chat/completions", payload)[0] == 200 and app.sampling["min_p"] == 0.2
-        assert post_json(http, "/v1/chat/completions", {**payload, "min_p": -1})[0] == 400
-    finally:
-        http.shutdown()
-        http.server_close()
-
-
 def test_the_mac_app_resolves_min_p_into_the_draw():
     from tensorfold.server.request_options import RequestOptions
 

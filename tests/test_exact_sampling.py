@@ -54,17 +54,6 @@ def test_uniform_in_open_interval_and_seed_for_is_stable():
     assert seed_for([1, 2, 3]) == seed_for([1, 2, 3]) != seed_for([1, 2, 4])
 
 
-def test_sample_rows_matches_choose_on_the_gpu():
-    mx = pytest.importorskip("mlx.core")
-    from tensorfold.engine.exact_sampling import sample_rows
-
-    logits = (mx.random.normal((3, 5000)) * 3).astype(mx.bfloat16)
-    s = Sampling(seed=11)
-    rows = sample_rows(logits, [10, 11, 12], s)
-    alone = [sample_rows(logits[i:i + 1], [10 + i], s)[0] for i in range(3)]
-    assert rows == alone
-
-
 def test_choose_rows_matches_choose_row_by_row_alone_or_batched():
     from tensorfold.engine.exact_sampling import choose_rows
 
@@ -87,24 +76,3 @@ def test_choose_rows_matches_choose_row_by_row_alone_or_batched():
         assert [choose_rows(values[r:r + 1], ids[r:r + 1], positions[r:r + 1], s)[0] for r in range(rows)] == want
 
 
-def test_nucleus_without_top_k_matches_the_whole_vocabulary_draw():
-    """top_k 0: the fast nucleus (GPU candidates + normalizer) draws what sorting every logit draws."""
-
-    import mlx.core as mx
-
-    from tensorfold.engine import exact_sampling as es
-
-    rng = np.random.default_rng(5)
-    drawn = 0
-    for trial in range(60):
-        row = (mx.array(rng.normal(size=(1, 50_000)).astype(np.float32)) * 8.0).astype(mx.bfloat16)
-        s = es.Sampling(seed=int(rng.integers(1 << 62)), temperature=float(rng.choice([0.7, 1.0])), top_k=0,
-                        top_p=0.95)
-        fast = es._nucleus_rows(row, [trial], s)
-        full = es.choose_rows(np.array(row.astype(mx.float32)), np.arange(50_000, dtype=np.int64)[None], [trial], s)
-        if fast is not None:
-            drawn += 1
-            assert fast == full
-    assert drawn > 40
-    flat = mx.zeros((1, 50_000), dtype=mx.bfloat16)          # every token tied: the nucleus needs them all
-    assert es._nucleus_rows(flat, [0], es.Sampling(seed=1, top_k=0, top_p=0.95)) is None

@@ -9,7 +9,7 @@ from tensorfold.server.prompts import prepare_images
 from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
 from tensorfold.vision.qwen_cuda import MAX_PATCHES, TOKENS_PER_IMAGE, image_runs
 from tensorfold.vision.qwen_processing import QwenImageProcessor
-from tests.test_vision_qwen_mlx import CONFIG, ImageProcessor, Tokenizer, image
+from tests.test_vision_qwen import CONFIG, ImageProcessor, Tokenizer, image
 from tests.test_vision_server import Frontend, image_messages
 
 
@@ -66,8 +66,6 @@ def test_the_budget_needs_vision_and_cuda():
     family = NS(model_type="qwen3_5", package=NS())
     with pytest.raises(ValueError, match="needs --vision"):
         serve_options.check(NS(**{**vars(_args(vision_image_tokens=8192)), "vision": False}), family, "cuda")
-    with pytest.raises(ValueError, match="CUDA Qwen image budget"):
-        serve_options.check(_args(vision_image_tokens=8192), family, "mlx")
 
 
 def test_a_cuda_request_carries_the_servers_budget_to_the_frontend():

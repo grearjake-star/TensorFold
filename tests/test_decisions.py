@@ -8,7 +8,6 @@ import pytest
 from tensorfold.server.decisions import DecisionError, build_response, prepare, prompts_for, reduce_vocab_shards
 from tensorfold.server.errors import RequestError
 from tensorfold.server.http import make_handler
-from tensorfold.server.scheduler import ChatJob, Scheduler
 from tests.http_fakes import post
 
 
@@ -123,107 +122,6 @@ def test_http_decision_error_is_400_and_other_failures_are_500():
     assert json.loads(raw)["error"]["message"] == "engine broke"
 
 
-def test_scheduler_scores_on_the_engine_thread():
-    class Engine:
-        active_count = 0
-        prefill_chunks = 0
-
-        def score_labels(self, prompt, labels):
-            return [float(labels[0]), 0.0], 1.0
-
-    scheduler = Scheduler(Engine(), lanes=1, eos_ids=frozenset())
-    scheduler.start()
-    try:
-        logits, logsumexp = scheduler.on_engine(lambda engine: engine.score_labels([7], [4, 5]))
-    finally:
-        scheduler.stop()
-    assert logits == [4.0, 0.0]
-    assert logsumexp == 1.0
-
-
-def test_a_decision_fills_beside_a_live_stream():
-    class Engine:
-        active_count = 1
-        prefill_chunks = 0
-        streams: list = []
-        finished_caches: dict = {}
-        round_stats: list = []
-        seen = None
-
-        def prompt_chunks(self, ids):
-            return self
-
-        def floor(self, n):
-            return 0
-
-        def begin_stream(self, stream, **kwargs):
-            self.seen = (self.active_count, tuple(stream.label_ids))
-            stream.finished = True
-            stream.scored = ([4.0, 0.0], 1.0)
-            stream.cached_tokens = 0
-            stream.emitted = []
-            return iter(())
-
-        def step(self):
-            return {}
-
-        def discard_stream(self, stream):
-            pass
-
-    engine = Engine()
-    scheduler = Scheduler(engine, lanes=2, eos_ids=frozenset())
-    scheduler.start()
-    job = ChatJob(job_id="decision-1", prompt_ids=[7, 8], max_tokens=1, temperature=0.0,
-                  drafts=False, label_ids=(4, 5))
-    try:
-        scheduler.submit(job)
-        assert job.done.wait(2.0)
-    finally:
-        scheduler.stop()
-    assert job.error is None
-    assert job.scored == ([4.0, 0.0], 1.0)
-    assert engine.seen == (1, (4, 5))
-
-
-def test_a_decision_prefill_reads_the_last_row_and_draws_nothing():
-    pytest.importorskip("mlx.core")
-    import mlx.core as mx
-
-    from tensorfold.engine.family_prefill import FamilyPrefill, drain
-    from tensorfold.engine.lane_engine import LaneStream
-    from tensorfold.engine.prefill_plan import PromptChunks
-
-    class Engine(FamilyPrefill):
-        streams: list = []
-
-        def prompt_chunks(self, ids):
-            return PromptChunks(None, len(ids), step=max(len(ids), 1))
-
-        def _family_start(self, cache, cached_tokens, chunks):
-            return [], 0
-
-        def _family_feed_steps(self, tokens, cache, chunks, *args, **kwargs):
-            yield from ()
-            return mx.array([[1.0, 3.0, 0.0]])
-
-        def _family_first(self, *args, **kwargs):
-            raise AssertionError("a decision draws no token")
-
-        def copy_single_cache(self, cache):
-            return cache
-
-    engine = Engine()
-    engine.model = type("Model", (), {"head": staticmethod(lambda hidden: hidden)})()
-    stream = LaneStream(stream_id="d", prompt_ids=[7, 8], max_new_tokens=1)
-    stream.label_ids = (0, 1)
-    drain(engine._family_prefill_steps(stream, cache=None, cached_tokens=0, checkpoints_at=()))
-    assert stream.finished
-    assert stream.finish_reason == "decision"
-    assert stream.emitted == []
-    assert stream.scored[0] == pytest.approx([1.0, 3.0])
-    assert stream.scored[1] == pytest.approx(3.0 + math.log(math.exp(-2.0) + 1.0 + math.exp(-3.0)))
-
-
 class _KeepTokenizer:
     """One character a token, with a generation suffix a history boundary can sit in front of."""
 
@@ -254,52 +152,6 @@ def _long_choice(question: str) -> dict:
         }],
         "return_prompt_token_ids": True,
     }
-
-
-def test_a_decision_keeps_a_shared_input_and_a_later_chat_resumes_it():
-    pytest.importorskip("mlx.core")
-    from tensorfold.engine.prefill_plan import PrefillPlan
-    from tests.lane_fakes import FakeEngine
-    from tests.test_lane_server import make_app
-
-    class GridEngine(FakeEngine):
-        def __init__(self, model=None, **kwargs):
-            super().__init__(model, **kwargs)
-            self.prefill_plan = PrefillPlan(128)
-
-    def open_app():
-        return make_app(engine_factory=GridEngine, checkpoint_slots=8, lanes=1, tokenizer=_KeepTokenizer())
-
-    fresh = open_app()
-    resume = open_app()
-    chat_fresh = open_app()
-    try:
-        cold = fresh.decisions(_long_choice("North stair."))
-        cold_ids = cold["answers"]["q"]["prompt_token_ids"]
-        assert fresh.engine.prefill_calls[-1][1] == 0
-        other = resume.decisions(_long_choice("South stair."))
-        other_ids = other["answers"]["q"]["prompt_token_ids"]
-        warm = resume.decisions(_long_choice("North stair."))
-        warm_ids = warm["answers"]["q"]["prompt_token_ids"]
-        cached = resume.engine.prefill_calls[-1][1]
-        split = next(i for i, (left, right) in enumerate(zip(other_ids, warm_ids)) if left != right)
-        assert warm_ids == cold_ids
-        assert 0 < cached < split
-        assert split - cached <= 128
-        assert warm["answers"]["q"]["probabilities"] == cold["answers"]["q"]["probabilities"]
-        assert warm["answers"]["q"]["label_mass"] == cold["answers"]["q"]["label_mass"]
-        pinned = [len(entry.tokens) for entry in resume.checkpoints._entries if entry.pinned]
-        assert cached in pinned
-        messages = [{"role": "user", "content": ("a" * 600) + "\n\nSay ready."}]
-        resumed_chat = resume.chat(messages, max_tokens=4, sampling={"draft": False, "enable_thinking": False})
-        fresh_chat = chat_fresh.chat(messages, max_tokens=4, sampling={"draft": False, "enable_thinking": False})
-        assert resumed_chat["cached_tokens"] == cached
-        assert resumed_chat["runtime"]["token_sha"] == fresh_chat["runtime"]["token_sha"]
-        assert fresh_chat["cached_tokens"] == 0
-    finally:
-        fresh.close()
-        resume.close()
-        chat_fresh.close()
 
 
 def test_handler_without_decisions_is_not_found():

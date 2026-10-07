@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from tensorfold.vision import qwen_mlx, qwen_processing
+from tensorfold.vision import qwen_processing
 from tensorfold.vision.qwen_checkpoint import load_vision_weights, quantization_predicate, vision_tensors
 from tensorfold.vision.qwen_processing import QwenImageProcessor, _processor_options, image_positions
 
@@ -171,95 +171,6 @@ def test_quantization_uses_each_module_override_and_never_quantizes_float_weight
     assert pred("blocks.0", module) == {"bits": 8, "group_size": 32, "mode": "affine"}
     assert pred("blocks.1", module) == {"bits": 4, "group_size": 64, "mode": "affine"}
     assert pred("patch_embed.proj", module) is False
-
-
-def test_load_instantiates_only_tower_and_local_tokenizer(tmp_path, monkeypatch):
-    (tmp_path / "config.json").write_text(json.dumps(CONFIG))
-    write_shard(tmp_path / "model.safetensors", {
-        "model.visual.blocks.0.weight": ("U32", np.ones((1, 1), np.uint32)),
-        "model.visual.blocks.0.scales": ("F16", np.ones((1, 1), np.float16)),
-        "language_model.embed_tokens.weight": ("F32", np.ones((20, 3), np.float32))})
-    events = []
-
-    class Tower:
-        def __init__(self, config):
-            events.append(("tower", config))
-
-        def sanitize(self, weights):
-            return weights
-
-        def load_weights(self, weights, *, strict):
-            events.append(("weights", dict(weights), strict))
-
-        def eval(self):
-            events.append("eval")
-
-        def parameters(self):
-            return []
-
-        patch_embed = SimpleNamespace(proj=SimpleNamespace(weight=np.ones(1, np.float32)))
-
-        def __call__(self, pixels, grid):
-            events.append(("probe", pixels.shape, grid.tolist()))
-            memory["peak"] = memory["active"] + 3 * 1024**2
-            return np.zeros((1, 3), np.float32), None
-
-    memory = {"active": 5 * 1024**2, "peak": 0}
-
-    def tokenizer(path, **kwargs):
-        assert path == str(tmp_path) and kwargs == {"local_files_only": True, "trust_remote_code": False}
-        return Tokenizer()
-
-    def quantize(tower, *, class_predicate):
-        settings = class_predicate("blocks.0", SimpleNamespace(to_quantized=True))
-        events.append(("quantize", settings))
-
-    mx = SimpleNamespace(array=lambda value, dtype=None: np.array(value), eval=lambda *_: None, int32=np.int32,
-                         zeros=lambda shape, dtype=None: np.zeros(shape, np.float32), synchronize=lambda: None,
-                         clear_cache=lambda: None, get_active_memory=lambda: memory["active"],
-                         reset_peak_memory=lambda: memory.update(peak=memory["active"]),
-                         get_peak_memory=lambda: memory["peak"])
-    runtime = (mx, SimpleNamespace(quantize=quantize), SimpleNamespace(from_dict=lambda value: value), Tower)
-    monkeypatch.setattr(qwen_mlx, "_runtime", lambda: runtime)
-    monkeypatch.setattr(qwen_processing, "_processor_runtime",
-                        lambda: (SimpleNamespace(from_pretrained=tokenizer), ImageProcessor))
-    embed = object()
-    frontend = qwen_mlx.QwenVisionFrontend.load(tmp_path, embed)
-    assert frontend.embed_tokens is embed
-    assert len([e for e in events if isinstance(e, tuple) and e[0] == "tower"]) == 1
-    loaded = next(e for e in events if isinstance(e, tuple) and e[0] == "weights")
-    assert set(loaded[1]) == {"blocks.0.weight", "blocks.0.scales"} and loaded[2] is True
-    assert ("quantize", {"bits": 8, "group_size": 32, "mode": "affine"}) in events
-    # the workspace is measured once, on four images sharing the 4,096 visual tokens
-    probe = [e for e in events if isinstance(e, tuple) and e[0] == "probe"]
-    merge = CONFIG["vision_config"]["spatial_merge_size"]
-    assert len(probe) == 1 and probe[0][2] == [[1, 32 * merge, 32 * merge]] * 4
-    assert frontend.workspace_bytes == 3 * 1024**2
-
-
-def test_encode_uses_target_embeddings_and_replaces_only_visual_rows():
-    calls = []
-    features = np.arange(12, dtype=np.float32).reshape(4, 3)
-
-    class Tower:
-        patch_embed = SimpleNamespace(proj=SimpleNamespace(weight=np.ones(1, np.float32)))
-
-        def __call__(self, pixels, grid):
-            calls.append("vision")
-            return features, []
-
-    def embed(tokens):
-        calls.append("target-embedding")
-        return np.full((1, tokens.shape[1], 3), 1e10, dtype=np.float32)
-
-    front = qwen_mlx.QwenVisionFrontend(CONFIG, embed, Tower(), ImageProcessor(), Tokenizer(), np)
-    prepared = front.prepare("a<start><image><end>b", [image()])
-    assert calls == []
-    encoded = front.encode(prepared)
-    assert calls == ["target-embedding", "vision"]
-    np.testing.assert_array_equal(encoded.inputs_embeds[0, 2:6], features)
-    assert np.all(encoded.inputs_embeds[0, [0, 1, 6, 7]] == 1e10)
-    assert encoded.rope_delta == -2 and encoded.position_ids.shape == (3, 1, 8)
 
 
 def test_a_continued_image_prompt_extends_positions_as_a_fresh_prepare_would():

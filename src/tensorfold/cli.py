@@ -3,29 +3,24 @@
 from __future__ import annotations
 
 import argparse
-import functools
 import json
-import os
 from pathlib import Path
-import signal
 import sys
 import time
 from typing import Any
 
-from tensorfold import __version__
 from tensorfold import cli_args
 from tensorfold.server import stacks, thinking_notes
-from tensorfold.server.memory_budget import MEMORY_FRACTION
 from tensorfold.serve_options import check as _check_serve_options, vision_options as _vision_options
 
-COMMANDS = ("serve", "pull", "models", "info", "update", "service", "tui", "plan")
+COMMANDS = ("serve", "pull", "models", "info", "update", "service", "tui")
 
 
 def build_parser() -> argparse.ArgumentParser:
     """The ``tensorfold`` parser with this module's subcommand handlers."""
 
     return cli_args.build_parser({"serve": cmd_serve, "pull": cmd_pull, "models": cmd_models,
-                                  "update": cmd_update, "info": cmd_info, "plan": cmd_plan})
+                                  "update": cmd_update, "info": cmd_info})
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -106,9 +101,6 @@ def cmd_models(args: argparse.Namespace) -> int:
     for kind, family in sorted(families.families().items()):
         package = family.package
         print(f"{family.title} ({kind}; {_engines(family)})")
-        kernel_package = getattr(package, "KERNEL_PACKAGE", "")
-        if kernel_package:
-            print(f"  kernels  {kernel_package.removeprefix('tensorfold.kernels.').replace('.', '/')}")
         for repo in getattr(package, "MODELS", ()):
             print(f"  model    {repo}")
         drafter = getattr(package, "DRAFTER", "")
@@ -118,14 +110,9 @@ def cmd_models(args: argparse.Namespace) -> int:
 
 
 def _engines(family: Any) -> str:
-    """Which backends serve a family: MLX (its lane or serial engine) and CUDA."""
+    """Which backend serves a family: the CUDA engine."""
 
-    found = []
-    if hasattr(family.package, "load"):
-        found.append(f"MLX {'lane engine' if family.lanes else 'serial engine'}")
-    if hasattr(family.package, "cuda_engine"):
-        found.append("CUDA engine")
-    return ", ".join(found) or "no engine"
+    return "CUDA engine" if hasattr(family.package, "cuda_engine") else "no engine"
 
 
 def cmd_info(args: argparse.Namespace) -> int:
@@ -138,9 +125,6 @@ def cmd_info(args: argparse.Namespace) -> int:
     print(f"model_type   {family.model_type}")
     print(f"family       {family.title} ({family.module})")
     print(f"engine       {_engines(family)}")
-    kernel_package = getattr(family.package, "KERNEL_PACKAGE", "")
-    if kernel_package:
-        print(f"kernels      {kernel_package.removeprefix('tensorfold.kernels.').replace('.', '/')}")
     for key in ("num_hidden_layers", "hidden_size", "num_experts", "num_experts_per_tok", "n_routed_experts",
                 "vocab_size", "max_position_embeddings"):
         if key in text:
@@ -153,7 +137,7 @@ def cmd_info(args: argparse.Namespace) -> int:
     readers = [b for b in families.backends_of(family)
                if families.quant_method(config) in families.readable_quants(family, b)]
     if readers:
-        print(f"runs on      {', '.join('NVIDIA GPUs (CUDA)' if b == 'cuda' else 'Apple Silicon (MLX)' for b in readers)}")
+        print("runs on      NVIDIA GPUs (CUDA)")
     else:
         print(f"runs on      not yet: no {family.title} engine reads these weights. {families.OWN_MODEL_HELP}")
     generation = _generation_config(directory)
@@ -163,14 +147,6 @@ def cmd_info(args: argparse.Namespace) -> int:
     if check is not None:
         check(directory)
     return 0
-
-
-def cmd_plan(args: argparse.Namespace) -> int:
-    """Estimate local checkpoint weights without loading a model."""
-
-    from tensorfold.cli_plan import cmd_plan as plan
-
-    return plan(args)
 
 
 def _generation_config(model_dir: Path) -> dict[str, Any]:
@@ -193,7 +169,7 @@ def _model_context(model_dir: Path) -> int:
     return int(limit) if isinstance(limit, int) and limit > 0 else 0
 
 
-def _drafter(family: Any, choice: str, backend: str = "mlx") -> str:
+def _drafter(family: Any, choice: str, backend: str = "cuda") -> str:
     """The draft model directory for ``--drafter`` (auto: the family's draft model if it has been pulled)."""
 
     from tensorfold import hub
@@ -227,14 +203,13 @@ def _note_untested(family: Any, model: str) -> None:
 
 
 def _backend(choice: str, family: Any) -> str:
-    """mlx or cuda: auto picks MLX on macOS and CUDA elsewhere; a family serves only the backends it has."""
+    """Always cuda: this fork serves on NVIDIA GPUs only (``--backend auto`` and ``cuda`` both pick it)."""
 
-    backend = choice if choice != "auto" else ("mlx" if sys.platform == "darwin" else "cuda")
-    if backend == "cuda" and not hasattr(family.package, "cuda_engine"):
-        raise ValueError(f"{family.title} has no CUDA engine yet: serve it on Apple Silicon")
-    if backend == "mlx" and not hasattr(family.package, "load"):
-        raise ValueError(f"{family.title} runs on NVIDIA GPUs only (see docs/recipes)")
-    return backend
+    if choice not in ("auto", "cuda"):
+        raise ValueError(f"--backend {choice}: this build serves on NVIDIA GPUs (CUDA) only")
+    if not hasattr(family.package, "cuda_engine"):
+        raise ValueError(f"{family.title} has no CUDA engine")
+    return "cuda"
 
 
 def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context: int | None = None) -> int:
@@ -323,10 +298,6 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     return 0
 
 
-# a resume point begins a prompt chunk when at least this many tokens follow the last chunk start
-MIN_CHUNK = 256
-
-
 def _parallel(value: Any) -> int:
     """``--parallel``: "auto" is up to 8 requests at once; a number caps it."""
 
@@ -353,9 +324,6 @@ def cmd_serve(args: argparse.Namespace) -> int:
             print(news, flush=True)
     config_dir = _config_dir(args.model)
     family = families.detect(config_dir)
-    if args.ssd_experts is not None and (args.ssd_experts <= 0 or not hasattr(family.package, "expert_bytes")):
-        raise ValueError(f"--ssd-experts takes a positive GiB count for a family that streams experts; "
-                         f"{family.title} does not")
     if args.ple_on_ssd and not hasattr(family.package, "ple_bytes"):
         raise ValueError(f"--ple-on-ssd: {family.title} has no n-gram (PLE) tables to read from SSD")
     backend = _backend(args.backend, family)
@@ -379,179 +347,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         check(model_dir)                         # checks that need the complete index, such as an MTP head
 
     stacks.start()          # `kill -USR1 <pid>` prints every thread's Python stack: where a silent server waits
-    if backend == "cuda":
-        return _serve_cuda(args, family, model_dir, context)
-    for key, value in getattr(family.package, "MLX_ENV", {}).items():
-        os.environ.setdefault(key, value)       # before MLX starts: it reads them once
-    import mlx.core as mx
-
-    from tensorfold.server.memory_budget import PROCESS_BYTES, budget_ceiling, configure_mlx, model_fraction, raise_hint
-
-    fraction = model_fraction(family.package)
-    memory_limit = configure_mlx(mx, int(float(args.mlx_cache_gib) * 1024**3), fraction=fraction)
-    gib = 1024**3
-    note = f" ({fraction:.0%} of RAM, this model's allowance)" if fraction > MEMORY_FRACTION else ""
-    ceiling = budget_ceiling(mx)
-    more = f"; TENSORFOLD_MEMORY_LIMIT_GB can raise it to {ceiling / gib:.1f}" if ceiling > memory_limit + gib else ""
-    print(f"[tensorfold] memory budget {memory_limit / gib:.1f} GiB{note}: MLX's buffers up to "
-          f"{(memory_limit - PROCESS_BYTES) / gib:.1f} GiB, {PROCESS_BYTES / gib:.0f} GiB for the rest of the process"
-          f"{more}", flush=True)
-    checkpoint = sum(path.stat().st_size for path in Path(model_dir).glob("*.safetensors"))
-    estimate = getattr(family.package, "weight_bytes", None)
-    weights = checkpoint if estimate is None else estimate(model_dir, ple_on_ssd=args.ple_on_ssd)
-    if args.ssd_experts is not None:
-        weights += int(args.ssd_experts * gib) - family.package.expert_bytes(model_dir)   # the pool, not the stacks
-    if weights < checkpoint:
-        print(f"[tensorfold] weights: {weights / gib:.1f} GiB resident, "
-              f"{(checkpoint - weights) / gib:.1f} GiB file-backed", flush=True)
-    if weights >= memory_limit - PROCESS_BYTES:
-        stream = ("stream its routed experts from SSD with --ssd-experts GIB (slower), "
-                  if args.ssd_experts is None and hasattr(family.package, "expert_bytes") else "")
-        hint = raise_hint(weights + PROCESS_BYTES, ceiling)
-        raise ValueError(f"{family.title}'s weights ({weights / gib:.1f} GiB) do not fit this server's "
-                         f"{memory_limit / gib:.1f} GiB memory budget. {hint or 'Serve it'} on a Mac with more memory, "
-                         f"{stream}or use a smaller or more quantized checkpoint")
-    return _serve_mlx(args, family, model_dir, context, required_files, memory_limit, fraction)
-
-
-def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: int,
-               required_files: Any, memory_limit: int, fraction: float = MEMORY_FRACTION) -> int:
-    import mlx.core as mx
-    from tensorfold import families, hub
-    from tensorfold.engine.lane_engine import LaneEngine
-    from tensorfold.engine.prefill_plan import PrefillPlan, message_markers
-
-    started = time.perf_counter()
-    drafter = "" if args.no_drafts else _drafter(family, args.drafter)
-    parallel = _parallel(args.parallel)
-    options: dict[str, Any] = {"lane_kernels": args.lane_kernels, "drafter": drafter,
-                               "drafter_bits": args.drafter_bits, "parallel": parallel}
-    options.update(_vision_options(args))
-    if args.mtp_drafts is not None:
-        options["mtp_drafts"] = int(args.mtp_drafts)
-    if args.ple_on_ssd:
-        options["ple_on_ssd"] = True
-    if args.ssd_experts is not None:
-        options["ssd_experts"] = float(args.ssd_experts)
-    served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
-    print(f"[tensorfold] loading {served}: {family.title} ({family.model_type})", flush=True)
-    model, tokenizer = family.package.load(model_dir, **options)
-    engine_kwargs = dict(getattr(family.package, "engine_settings", lambda m: {})(model))
-    if required_files:
-        print(f"[tensorfold] {family.title} MTP head: "
-              f"{'active' if not args.no_drafts and getattr(model, 'mtp', None) is not None else 'inactive'}",
-              flush=True)
-    from tensorfold.engine import prefill_step
-    from tensorfold.server.memory_budget import PROCESS_BYTES
-    from tensorfold.server.prompt_memory import probe_tokens
-    from tensorfold.server.residency import unwire, wire_resident
-
-    getattr(model, "release_rounds", lambda: None)()       # load-time checks' rows go before the weights are wired
-    wired = wire_resident(mx, memory_limit - PROCESS_BYTES)
-    print(f"[tensorfold] {wired / 1024**3:.1f} GiB of weights kept resident", flush=True)
-    # prompt chunks start where replies begin too, so a follow-up resumes where its latest reply began
-    openers, assistant = message_markers(tokenizer)
-    steps = engine_kwargs.pop("prefill_steps", None) or (LaneEngine.prefill_step,)
-    step = prefill_step.choose(lambda grid: LaneEngine(model, prefill_plan=PrefillPlan(grid)), steps,
-                               memory_limit - PROCESS_BYTES, probe_tokens(tokenizer), context)
-    plan = PrefillPlan(step, openers, MIN_CHUNK, assistant)
-    print(f"[tensorfold] prompt chunks of up to {step:,} tokens, cut at replies {plan.min_chunk:,}+ tokens apart",
-          flush=True)
-
-    from tensorfold.server.app import ChatApp
-    from tensorfold.server.http import Server, make_handler
-
-    engine_factory = functools.partial(LaneEngine, prefill_plan=plan,        # every family decodes through lanes
-                                       prefill_pass=max(1, int(args.prefill_pass)),
-                                       pass_cache=int(float(args.pass_cache_gib) * 1024**3))
-    sampling = _generation_config(model_dir)
-    for key, value in (("temperature", args.temperature), ("top_p", args.top_p), ("top_k", args.top_k),
-                       ("min_p", args.min_p)):
-        if value is not None:
-            sampling[key] = value
-    snapshot_dir = None if str(args.snapshot_dir).lower() == "none" else Path(args.snapshot_dir).expanduser()
-    from importlib.metadata import version
-
-    resolve_prefill = getattr(model, "resolve_prefill_identity", None)
-    if resolve_prefill is not None:
-        resolve_prefill()  # the prefill mode's self-check runs at startup, before any snapshot key
-    # Both libraries, the active prompt kernels and how prompts are cut determine a snapshot's bits.
-    model_id = (f"{model_dir.resolve()}|mlx={mx.__version__}|mlx_lm={version('mlx-lm')}"
-                f"|kernels={families.kernel_version(family, model)}"
-                f"|prefill={plan.name}|tensorfold={__version__}")
-    gib = args.prompt_cache_gib
-    if gib is None:
-        ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        gib = min(16.0, ram / 8 / 1024**3)
-    budget = int(float(gib) * 1024**3)
-    app = ChatApp(
-        model,
-        tokenizer,
-        served_name=served, model_aliases=list(args.alias),
-        engine_factory=engine_factory, lanes=parallel,
-        memory_fraction=fraction if parallel > 1 else None,
-        max_rows=int(engine_kwargs.get("max_rows", 16)), max_draft=int(engine_kwargs.get("max_draft", 32)),
-        default_max_tokens=int(args.max_tokens),
-        context_window=context,
-        enable_thinking=bool(args.thinking),
-        reasoning_effort=args.reasoning_effort,
-        thinking_budget=int(args.thinking_budget),
-        default_sampling=sampling,
-        max_snapshots=int(args.max_snapshots),
-        checkpoint_slots=0 if budget <= 0 else args.checkpoint_slots,
-        checkpoint_budget_bytes=budget if budget > 0 else None,
-        spill_bytes=int(float(args.spill_gib) * 1024**3),
-        memory_budget_bytes=memory_limit,
-        fit_context=args.context is None,
-        use_proposer=not args.no_drafts,
-        snapshot_dir=snapshot_dir, model_id=model_id, model_dir=model_dir,
-        decode_share=0.25 if args.decode_share is None else float(args.decode_share),
-        grow_checkpoints=args.prompt_cache_gib is None,
-        vision_max_images=getattr(args, "vision_max_images", None),
-    )
-    if app.context_fitted:
-        print(f"[tensorfold] context window {app.context_window:,} tokens: the most one request can use in the "
-              f"{memory_limit / 1024**3:.1f} GiB memory budget and still keep its prompt for the next turn (the "
-              f"model's window is {context:,}); have clients compact before it", flush=True)
-    kept = getattr(getattr(app, "prompt_memory", None), "resumable", None)
-    if kept is not None and not app.context_fitted and (not app.context_window or kept < app.context_window):
-        print(f"[tensorfold] requests up to {kept:,} tokens keep their prompt for the next turn in the "
-              f"{memory_limit / 1024**3:.1f} GiB memory budget; a longer one is served, and its next turn prefills "
-              "again", flush=True)
-    hook = getattr(family.package, "setup", None)
-    if hook is not None:
-        hook(app, model, **options)
-    app.auth = getattr(args, "auth", None)
-    note = thinking_notes.startup(model_dir, bool(args.thinking))
-    if note:
-        print(note, flush=True)
-    server = Server((args.host, int(args.port)), make_handler(app))  # type: ignore[arg-type]
-    shown = "greedy" if float(sampling.get("temperature", 0.0) or 0.0) <= 0 else ", ".join(
-        f"{k} {v}" for k, v in sampling.items())
-    print(f"[tensorfold] serving {served} at http://{args.host}:{args.port}/v1 "
-          f"(sampling: {shown}; drafts: {'off' if args.no_drafts else 'on'}; "
-          f"context: {app.context_window or 'unlimited'}; loaded in {time.perf_counter() - started:.1f}s)", flush=True)
-
-    def _terminate(signum: int, frame: Any) -> None:
-        raise KeyboardInterrupt      # the cleanup below runs (a plain SIGTERM would skip it)
-
-    signal.signal(signal.SIGTERM, _terminate)
-    from tensorfold.server import live
-
-    line = live.start(app)      # connections and decode/prefill tok/s on one line, in a terminal only
-    try:
-        from contextlib import nullcontext
-        with app.auth.signals() if app.auth is not None else nullcontext():
-            server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        if line is not None:
-            line.stop()
-        server.server_close()
-        app.close()        # the engine thread saves the newest conversations as it stops
-        unwire(mx)
-    return 0
+    return _serve_cuda(args, family, model_dir, context)
 
 
 if __name__ == "__main__":

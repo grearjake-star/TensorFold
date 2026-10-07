@@ -18,23 +18,6 @@ from tests.test_server_openai_compat import FakeApp, post_json
 from tests.test_vision_server import Frontend, cuda_app, image_messages, prompt_app
 
 
-@pytest.mark.parametrize("limit", [None, 8])
-def test_mlx_app_count_reaches_request_preparation(limit, monkeypatch):
-    from tensorfold.server.app import ChatApp
-    from tensorfold.server.scheduler import Scheduler
-    from tests.test_lane_server import FakeTokenizer
-
-    # Preparation needs no engine rounds; don't start the model worker or watchdog.
-    monkeypatch.setattr(Scheduler, "start", lambda self: None)
-    app = ChatApp(NS(vision=Frontend()), FakeTokenizer(), served_name="fixture", checkpoint_slots=0,
-                  engine_factory=lambda *args, **kwargs: NS(), vision_max_images=limit)
-    accepted = 4 if limit is None else 8
-    prepared = prepare_prompt(app, image_messages() * accepted, [], False, None, {})
-    assert len(prepared.vision.image_hashes) == accepted
-    with pytest.raises(RequestError, match=f"at most {accepted}"):
-        prepare_prompt(app, image_messages() * (accepted + 1), [], False, None, {})
-
-
 @pytest.mark.parametrize("backend", ["mlx", "cuda"])
 def test_configured_count_applies_to_splitting_and_decoding(backend):
     app = prompt_app(Frontend()) if backend == "mlx" else cuda_app(Frontend())

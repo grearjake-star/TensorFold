@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import importlib
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -151,7 +149,8 @@ def test_context_override_cannot_exceed_model_window(tmp_path, monkeypatch, caps
     model = tmp_path / "model"
     model.mkdir()
     (model / "config.json").write_text(json.dumps({
-        "model_type": "nemotron_h", "max_position_embeddings": 4096}))
+        "model_type": "nemotron_h", "max_position_embeddings": 4096,
+        "quantization": {"bits": 4, "group_size": 64}}))
     monkeypatch.setattr(hub, "resolve", lambda *a, **kw: pytest.fail("should reject before loading weights"))
     assert main(["serve", str(model), "--context", "4097"]) == 1
     assert "exceeds this model's 4096-token window" in capsys.readouterr().err
@@ -258,26 +257,9 @@ def test_models_lists_the_tested_checkpoints(capsys):
     for repo in ("TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP", "local-inference-lab/Qwen3.8-Flash-Next-NVFP4",
                  "RadixArk/Qwen3.8-Flash-Next-NVFP4",
                  "TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit", "TensorFold/Qwen3.8-27B-MLX-4bit",
-                 "z-lab/Qwen3.8-27B-DFlash2", "mlx-community/gemma-4-26b-a4b-it-4bit"):
+                 "z-lab/Qwen3.8-27B-DFlash2", "turboderp/Qwen3.8-Flash-Next-exl3"):
         assert repo in out
-    for folder in ("qwen/dense/v1", "qwen/flash_next/v1", "nemotron/lightning/v1", "gemma/v1"):
-        assert f"kernels  {folder}" in out
-
-
-def test_every_family_names_an_importable_kernel_version():
-    for family in families.families().values():
-        package = family.package
-        if not hasattr(package, "load"):
-            continue                     # a CUDA-only family (its kernels live in its cuda/ package)
-        kernels = importlib.import_module(package.KERNEL_PACKAGE)
-        assert kernels.VERSION == package.KERNEL_VERSION == "v1"
-        assert family.lanes                 # every family decodes through the lane engine
-        if family.model_type == "qwen3_5":
-            model = SimpleNamespace(_tensorfold_lanes=True)
-            assert families.kernel_version(family, model).startswith(("qwen-dense-v1-", f"{family.model_type}-v1-"))
-        else:                               # an alias model_type (a newer export's name) keeps the package's own
-            names = getattr(package, "MODEL_TYPES", (family.model_type,))
-            assert families.kernel_version(family, None).startswith(tuple(f"{name}-v1-" for name in names))
+    assert "gemma" not in out and "kernels  " not in out and "MLX lane engine" not in out
 
 
 def test_info_reads_a_local_config(tmp_path, capsys):
@@ -285,7 +267,7 @@ def test_info_reads_a_local_config(tmp_path, capsys):
     assert main(["info", str(folder)]) == 0
     out = capsys.readouterr().out
     assert "Qwen3.8 Flash Next" in out
-    assert "kernels      qwen/flash_next/v1" in out
+    assert "engine       CUDA engine" in out and "runs on      NVIDIA GPUs (CUDA)" in out
     assert main(["info", str(write_checkpoint(tmp_path / "eight", 8, 64, mtp=True))]) == 0
 
 
@@ -307,15 +289,15 @@ def test_serve_finishes_a_config_only_cache_before_loading(tmp_path, monkeypatch
     class LoadReached(Exception):
         pass
 
-    def load(model_dir, **options):
+    def cuda_engine(model_dir, **options):
         assert (model_dir / "model.safetensors").is_file()
         raise LoadReached
 
     monkeypatch.setattr(hub, "cached", lambda repo_id, *, cache_dir=None: snapshot)
     monkeypatch.setattr(hub, "pull", finish)
-    monkeypatch.setattr(qwen4_exp, "load", load)
+    monkeypatch.setattr(qwen4_exp, "cuda_engine", cuda_engine)
     with pytest.raises(LoadReached):
-        main(["serve", "owner/model", "--snapshot-dir", "none"])
+        main(["serve", "owner/model", "--no-update-check"])
     assert pulled == ["owner/model"]
     assert "no MTP head" not in capfd.readouterr().out
 

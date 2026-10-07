@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 from typing import Callable
 
 from tensorfold import __version__
@@ -15,7 +14,7 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
 
     parser = argparse.ArgumentParser(
         prog="tensorfold",
-        description="Fast, exact LLM decoding on Apple Silicon and NVIDIA GPUs behind an OpenAI-compatible endpoint.",
+        description="Fast, exact LLM decoding on NVIDIA GPUs (DGX Spark / GB10 first) behind an OpenAI-compatible endpoint.",
     )
     parser.add_argument("--version", action="version", version=f"tensorfold {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -48,8 +47,7 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
 
     generation = serve.add_argument_group("generation (requests can override each of these)")
     generation.add_argument("--context", type=int, default=None,
-                            help="prompt plus reply window (default: model config; CUDA default/0: "
-                                 "affordable native capacity; Metal 0: remove metadata cap)")
+                            help="prompt plus reply window (default/0: the affordable native capacity)")
     generation.add_argument("--max-tokens", type=int, default=4096,
                             help="reply tokens when a request does not say")
     generation.add_argument("--temperature", type=float, default=None,
@@ -74,58 +72,32 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
     speed.add_argument("--drafter", default="auto",
                        help="a draft model (repo id or directory); auto: the family's draft model when it has been "
                             "pulled; none: no draft model")
-    speed.add_argument("--drafter-bits", type=int, default=4, help="quantize the draft model's linears (0: bf16)")
     speed.add_argument("--mtp-drafts", type=int, default=None,
-                       help="most MTP drafts a round (Qwen3.8 Flash Next: 3 on Mac; on CUDA 10, stopping under 50%% "
-                            "confidence; Nemotron on CUDA: 15, stopping where a row stops paying; Qwen3.6 MoE on Mac: "
-                            "4, each round's depth, plain included, from measured costs); 0: no MTP drafts (any family)")
+                       help="most MTP drafts a round (Qwen3.8 Flash Next: 10, stopping under 50%% confidence; "
+                            "Nemotron: 15, stopping where a row stops paying); 0: no MTP drafts (any family)")
     speed.add_argument("--mtp-confidence", type=float, default=None,
-                       help="on CUDA, stop an MTP chain before a later draft under this probability "
+                       help="stop an MTP chain before a later draft under this probability "
                             "(Flash Next default 0.50; Nemotron: by the row costs it measures at start)")
-    speed.add_argument("--lane-kernels", choices=("auto", "on", "off"), default="auto",
-                       help="lane kernels for Qwen3.8 dense (auto: on GPUs with tensor units)")
-    speed.add_argument("--prompt-cache-gib", type=float, default=None,
-                       help="memory for cached conversation prefixes (0: off; default on a Mac: what the weights, a "
-                            "whole-window request and a shared round leave idle, at least an eighth of RAM up to 16)")
     speed.add_argument("--checkpoint-slots", type=int, default=None,
-                       help="cached conversation prefixes kept in memory (default: 3 per parallel lane, at least 8); "
-                            "with long conversations this, not --prompt-cache-gib, is usually the limit. Qwen3.8-27B "
-                            "on CUDA with --parallel 2 or more: the prompt states its concurrent decoder keeps "
+                       help="Qwen3.8-27B with --parallel 2 or more: the prompt states its concurrent decoder keeps "
                             "(default 3; one GPU keeps them while memory lasts, two ranks reserve a window each)")
-    speed.add_argument("--spill-gib", type=float, default=0.0,
-                       help="write evicted conversation prefixes to disk, up to this many GiB, and read them back on "
-                            "demand instead of prefilling again (0: off; needs --snapshot-dir)")
-    speed.add_argument("--snapshot-dir", default=str(Path.home() / ".cache" / "tensorfold" / "prefix-snapshots"),
-                       help="where system-block and conversation snapshots are kept ('none': in memory only)")
-    speed.add_argument("--max-snapshots", type=int, default=3, help="system-block snapshots loaded at start")
     speed.add_argument("--parallel", default="auto",
                        help="requests decoded together, their windows sharing each round's forward: a number, or "
-                            "auto (Mac: up to 8, each started only while the projected memory fits the budget; "
-                            "CUDA: one at a time, the others waiting their turn)")
-    speed.add_argument("--decode-share", type=float, default=None, help="Mac: while prompts prefill, running replies "
-                       "keep moving for this share of each chunk's time, and a new prompt starts at the next chunk "
-                       "(default 0.25; 0: whole prompts first, in order, as 0.3.6.2). CUDA Flash Next --parallel: "
-                       "replies decode inside each prompt pass; a share sizes the passes so a round's decoding takes "
-                       "it (default 0: whole passes)")
-    speed.add_argument("--prefill-pass", type=int, default=8, help="Mac: prompt chunks one forward takes while a "
-                       "prompt fills alone, for models with a prompt pass (1: one chunk a forward, as 0.5.0)")
-    speed.add_argument("--pass-cache-gib", type=float, default=16.0, help="Mac: MLX's cache of freed buffers during "
-                       "such a pass, where the memory budget has room (at most --mlx-cache-gib: no change)")
-    speed.add_argument("--mlx-cache-gib", type=float, default=8.0, help="MLX's cache of freed buffers")
-    speed.add_argument("--ssd-experts", type=float, default=None, metavar="GIB",
-                       help="stream routed experts from the checkpoint into a GPU pool of this many GiB, for models "
-                            "past the memory budget (the rest stays resident; output is the resident model's)")
+                            "auto (one at a time, the others waiting their turn)")
+    speed.add_argument("--decode-share", type=float, default=None, help="Flash Next --parallel: replies decode inside "
+                       "each prompt pass; a share sizes the passes so a round's decoding takes it (default 0: whole "
+                       "passes)")
     speed.add_argument("--ple-on-ssd", action="store_true",
                        help="Flash Next: read the n-gram (PLE) tables from the checkpoint on SSD at each lookup "
                             "instead of holding them in memory. A trade: a few percent of decode speed for about "
-                            "40 GiB less at peak (the tables are 29.8 GiB); a 128 GB Mac needs it")
+                            "40 GiB less at peak (the tables are 29.8 GiB)")
 
     speed.add_argument("--no-update-check", action="store_true",
                        help="don't ask GitHub whether a newer release exists (also TENSORFOLD_NO_UPDATE_CHECK=1)")
 
-    cuda = serve.add_argument_group("NVIDIA GPUs (DGX Spark)")
-    cuda.add_argument("--backend", choices=("auto", "mlx", "cuda"), default="auto",
-                      help="auto: MLX on macOS, CUDA elsewhere")
+    cuda = serve.add_argument_group("NVIDIA GPUs (DGX Spark / GB10)")
+    cuda.add_argument("--backend", choices=("auto", "cuda"), default="auto",
+                      help="kept for scripts: this build serves on CUDA only")
     cuda.add_argument("--tp", type=int, choices=(1, 2), default=1,
                       help="GPUs (one per machine) the model is split over; run the same command on each")
     cuda.add_argument("--rank", type=int, choices=(0, 1), default=0,
@@ -148,7 +120,8 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                            "GPUs, FP8 x FP8 in FP8 layers from SM 8.9, under the checkpoint's static input scales; "
                            "layers a GPU has no mma for run W4A16, and the startup line says which); full runs bf16 "
                            "activations against the stored weights exactly. The weights never change, only the math; "
-                           "MLX checkpoints have one math. Replies equal this server's own serial decoding either way")
+                           "MLX-format checkpoints have one math. Replies equal this server's own serial decoding "
+                           "either way")
     serve.set_defaults(func=handlers["serve"])
 
     pull = commands.add_parser("pull", help="download models (or draft models) from Hugging Face")
@@ -170,12 +143,4 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
 
     register(commands)
 
-    plan = commands.add_parser("plan",
-                               help="estimate local checkpoint weights against MLX budgets without loading a model")
-    plan.add_argument("model", help="a local model directory or already cached Hugging Face repo id")
-    plan.add_argument("--memory-gb", type=float, default=None, metavar="GIB",
-                      help="also check this explicit budget, as TENSORFOLD_MEMORY_LIMIT_GB would set it")
-    plan.add_argument("--ram", type=int, action="append", default=[], metavar="GIB",
-                      help="also estimate this RAM class under the current GPU ceiling (repeatable)")
-    plan.set_defaults(func=handlers["plan"])
     return parser

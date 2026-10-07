@@ -4,7 +4,6 @@ Each test hands a module the answer a Windows host would give - a kernel32 that 
 peer hung up, a page-pinning answer that says no - and says what the engine must then do. A change that only works
 on one platform has to fail here on the other two; a change that bends the Unix answer to fit Windows fails here too."""
 
-import ctypes
 import os
 import socket
 import sys
@@ -38,24 +37,6 @@ def test_windows_dumps_stacks_through_a_python_handler(monkeypatch):
     signum, handler = seen["armed"]
     handler(signum, None)
     assert signum == stacks.DUMP and seen["all_threads"] is True
-
-
-def test_windows_sizes_ram_by_api_and_refuses_to_guess():
-    from tensorfold.server import memory_budget
-
-    with mock.patch.object(os, "name", "nt"), mock.patch.object(ctypes, "WinDLL", lambda *a, **k: Kernel32(),
-                                                                create=True):
-        assert memory_budget.physical_memory_bytes() == RAM
-    with mock.patch.object(os, "name", "nt"), mock.patch.object(ctypes, "WinDLL", lambda *a, **k: Kernel32(False),
-                                                                create=True):
-        with pytest.raises(RuntimeError, match="GlobalMemoryStatusEx"):
-            memory_budget.physical_memory_bytes()
-
-
-def test_the_unix_answer_stays_sysconf():
-    from tensorfold.server import memory_budget
-
-    assert memory_budget.physical_memory_bytes() == os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
 
 
 def test_a_hung_up_client_reads_as_cancelled():
