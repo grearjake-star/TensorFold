@@ -58,7 +58,7 @@ def test_the_system_blocks_slot_goes_last_even_when_it_keeps_fewer_tokens():
     assert st is b and [k[3] for k in owner.kept] == ["system"]
 
 
-def test_ties_keep_the_kept_order_and_busy_slots_are_never_taken():
+def test_within_the_slack_the_oldest_idle_slot_goes_and_busy_slots_are_never_taken():
     a, b, c = Slot("a"), Slot("b"), Slot("c")
     owner = Owner([entry(list(range(10, 60)), a, "a"), entry(list(range(100, 150)), b, "b"),
                    entry(list(range(200, 210)), c, "c")], busy=[c])
@@ -71,3 +71,15 @@ def test_no_idle_slot_still_raises():
     owner = Owner([entry(list(range(10, 60)), a, "a")], busy=[a])
     with pytest.raises(RuntimeError, match="no free stream slot"):
         prefixes.slot_for(owner, list(range(70000, 70100)), True)
+
+
+def test_a_conversation_that_just_started_keeps_its_end_beside_older_short_ones():
+    """The full-pool pattern of tests/cuda/test_flashnext_L7.py: older one-shot prompts' ends and a conversation's
+    first, shorter end. The next fresh request takes the oldest end, not the conversation's (kept order decides
+    among slots within FRESH_SLACK tokens of each other)."""
+
+    a, b, c = Slot("a"), Slot("b"), Slot("c")
+    owner = Owner([entry(list(range(100, 124)), a, "old-1"), entry(list(range(200, 225)), b, "old-2"),
+                   entry(list(range(300, 316)), c, "conversation")])
+    st, _, cached = prefixes.slot_for(owner, list(range(70000, 70006)), True)
+    assert st is a and cached == 0 and {k[3] for k in owner.kept} == {"old-2", "conversation"}

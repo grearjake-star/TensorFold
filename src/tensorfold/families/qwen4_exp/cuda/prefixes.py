@@ -145,9 +145,15 @@ def slot_for(owner, prompt: list[int], reuse: bool):
     return owner.free.pop(), None, 0
 
 
+FRESH_SLACK = 2048       # kept tokens a fresh request may cost beyond the cheapest idle slot's (about a second of prefill)
+
+
 def _cheapest_idle(owner, busy):
-    """A fresh request's slot when none is free: the idle slot that loses the fewest kept tokens (its longest chain),
-    a slot keeping a message-start state (a shared system block) last, ties in ``kept`` order."""
+    """A fresh request's slot when none is free: the oldest idle slot (``kept`` order, as before) among those whose
+    longest kept chain is within ``FRESH_SLACK`` tokens of the cheapest idle slot's. A long conversation is not
+    evicted while a much cheaper idle slot exists (#315), and among cheap slots recency still decides, so a
+    conversation that has just started keeps its end. A slot keeping a message-start state (a shared system block)
+    goes last."""
 
     longest, order = {}, []
     for k in owner.kept:
@@ -160,8 +166,9 @@ def _cheapest_idle(owner, busy):
     if not order:
         raise RuntimeError("no free stream slot")
     held = {id(k[1]) for k in owner.kept if _is_start(owner, k)}
-    rank = {id(st): i for i, st in enumerate(order)}
-    return min(order, key=lambda st: (id(st) in held, longest[id(st)], rank[id(st)]))
+    pool = [st for st in order if id(st) not in held] or order
+    floor = min(longest[id(st)] for st in pool)
+    return next(st for st in pool if longest[id(st)] <= floor + FRESH_SLACK)
 
 
 def remember(owner, ids, st, snap, tail, start: bool = False, checkpoint: bool = False) -> None:
