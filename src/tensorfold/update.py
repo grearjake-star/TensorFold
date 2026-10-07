@@ -14,7 +14,7 @@ from typing import Any
 
 from tensorfold import __version__
 
-REPO = "ashhart/TensorFold"
+REPO = "grearjake-star/TensorFold"   # the fork's releases, never upstream's: an update must not replace this build
 RELEASES_API = f"https://api.github.com/repos/{REPO}/releases/latest"
 REPO_URL = f"https://github.com/{REPO}.git"
 CACHE = Path.home() / ".cache" / "tensorfold" / "update-check.json"

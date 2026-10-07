@@ -1,7 +1,46 @@
-# What's new in TensorFold
+# What's new in TensorFold for DGX Spark (spark-exl3)
 
-`tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
-GitHub has the full notes and the measurements behind them.
+The fork's releases, newest first. Upstream TensorFold's own history, through the 0.6.5 release this fork is based on,
+follows below.
+
+## spark-exl3 0.1.0 (6 Oct 2026, not yet released)
+
+The first release of the fork: TensorFold 0.6.5 for NVIDIA DGX Spark (GB10), CUDA only, Qwen3.8 Flash Next from EXL3
+first. The engine version stays 0.6.5.
+
+**Added on top of 0.6.5** (each exact unless noted; details in the README, "What this fork adds"):
+- Kept prompt states per slot (`TF_KEEP`) with per-slot lone-stream CUDA graphs, and the graph-slot fixes from #337
+  (issue #317).
+- System-block checkpoint (`TF_SYS_CHECKPOINT`, #403) and warm starts (`TF_WARM_STARTS`, `TF_WARM_REPLAY`).
+- N-gram table pin budget, re-pin and read-back (`TF_NGRAM_LOCK`, `TF_NGRAM_REPIN`; from #254), prompt read-ahead
+  (`TF_NGRAM_AHEAD`, #252) and decode read-ahead (`TF_DECODE_AHEAD`, default on).
+- Batched n-gram stage gather (`TF_STAGE_BATCH`), shared-round CUDA graphs (`TF_MULTI_GRAPHS`) and host prep off the
+  critical path (`TF_MULTI_HOST_AHEAD`).
+- Joint draft pricing for `--parallel` (`TF_JOINT_PRICE`) and the expected-time draft stop with a measured verify table
+  (`TF_DRAFT_COST`, `TF_VERIFY_MS`, `TF_DRAFT_MS`; from #250).
+- Trained MTP draft-head support (`TF_MTP_HEAD`, `TF_MTP_HEAD_LONG`, `TF_HEAD_SWITCH_ROWS`, `TF_DRAFT_VOCAB`) and the
+  offline training pipeline in `tools/draft_head`. No head weights ship.
+- EXL3 prompt kernels: the prompt expert kernel (#212), the trellis ring for gate|up below 4 bits (#283, jschmied),
+  passes that converge with `--parallel` (#253), the shared expert on a side stream (`TF_EXL3_PROMPT_SIDE`), tall
+  tiles for 17-128-row windows (#260, BHCC2025), HC read-out fusion, a QSA prompt indexer, fused MoE routing
+  (`TF_MOE_ROUTE_FUSED`), and 4096-row prompt pieces (`TENSORFOLD_PREFILL_ROWS`, `TF_EXL3_MOE_WINDOW`).
+- Tunable pass sizes and graph-slot sizing (`TF_FIRST_PASS`, `TF_PASS_MIN`, `TF_SOLO_ROWS`), checked at start-up.
+- Slot choice without a free slot: a fork claims the idle slot that loses the fewest kept tokens (#315,
+  philip-pentatonic), and now so does a fresh request (scottleimroth's report on #315).
+- A TPOT histogram (#367, juliankang4) and how each request ended (#343, cshintov).
+- HC faces from MXFP8 copies (`TF_EXL3_HC_FP8=1`, off by default): changes output bits.
+
+**Removed from 0.6.5:** the MLX backend (lane engine, MLX drafters, SSD expert streaming, the Mac serve path and its
+flags), the Metal kernels, the macOS launchd control plane (`tensorfold service`, `tensorfold tui`), `tensorfold plan`,
+the MLX-only families (DeepSeek-V4-Flash, Gemma 4, Ternary Bonsai 2), the Apple-only dependencies and the Apple-only
+docs. MLX affine checkpoints stay readable: the CUDA engines read that format.
+
+**Updates** check this fork's GitHub releases, not upstream's.
+
+**Receipts:** see the README. The fork's own quick gate (GPU tests plus the house-config run) is pending; its result
+will be recorded here before release.
+
+# Upstream TensorFold history (through 0.6.5)
 
 ## 0.6.5 (3 Oct 2026)
 

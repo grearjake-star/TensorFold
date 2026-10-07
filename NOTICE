@@ -6,3 +6,8 @@ TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.
 Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
 MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
 THIRD_PARTY_NOTICES.md.
+
+This is a modified version of TensorFold: the spark-exl3 fork for NVIDIA DGX Spark (GB10),
+https://github.com/grearjake-star/TensorFold (branch spark-exl3). It is based on TensorFold
+0.6.5, adds the CUDA changes listed in its README and CHANGELOG, and removes the Apple Silicon
+(MLX and Metal) parts. Changes are Copyright 2026 the spark-exl3 contributors, Apache-2.0.
