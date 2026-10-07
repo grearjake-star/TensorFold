@@ -139,14 +139,29 @@ def slot_for(owner, prompt: list[int], reuse: bool):
         _touch(owner, best)
         return best[1], {"state": best[2], "tail": best[3]}, n
     if not owner.free:
-        idle = [k[1] for k in owner.kept if id(k[1]) not in busy]
-        if not idle:
-            raise RuntimeError("no free stream slot")
-        held = {id(k[1]) for k in owner.kept if _is_start(owner, k)}
-        idle = next((st for st in idle if id(st) not in held), idle[0])   # a kept system block's slot goes last
+        idle = _cheapest_idle(owner, busy)
         owner._drop_kept(idle)
         owner.free.append(idle)
     return owner.free.pop(), None, 0
+
+
+def _cheapest_idle(owner, busy):
+    """A fresh request's slot when none is free: the idle slot that loses the fewest kept tokens (its longest chain),
+    a slot keeping a message-start state (a shared system block) last, ties in ``kept`` order."""
+
+    longest, order = {}, []
+    for k in owner.kept:
+        key = id(k[1])
+        if key in busy:
+            continue
+        if key not in longest:
+            order.append(k[1])
+        longest[key] = max(longest.get(key, 0), len(k[0]))
+    if not order:
+        raise RuntimeError("no free stream slot")
+    held = {id(k[1]) for k in owner.kept if _is_start(owner, k)}
+    rank = {id(st): i for i, st in enumerate(order)}
+    return min(order, key=lambda st: (id(st) in held, longest[id(st)], rank[id(st)]))
 
 
 def remember(owner, ids, st, snap, tail, start: bool = False, checkpoint: bool = False) -> None:
