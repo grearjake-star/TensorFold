@@ -1,11 +1,11 @@
-# What's new in TensorFold for DGX Spark (spark-exl3)
+# What's new in SparkFold (the spark-exl3 fork of TensorFold)
 
-The fork's releases, newest first. Upstream TensorFold's own history, through the 0.6.5 release this fork is based on,
+SparkFold's releases, newest first. Upstream TensorFold's own history, through the 0.6.5 release this fork is based on,
 follows below.
 
-## spark-exl3 0.1.0 (6 Oct 2026, not yet released)
+## SparkFold 0.1.0 (spark-exl3), 7 Oct 2026
 
-The first release of the fork: TensorFold 0.6.5 for NVIDIA DGX Spark (GB10), CUDA only, Qwen3.8 Flash Next from EXL3
+The first release of SparkFold: TensorFold 0.6.5 for NVIDIA DGX Spark (GB10), CUDA only, Qwen3.8 Flash Next from EXL3
 first. The engine version stays 0.6.5.
 
 **Added on top of 0.6.5** (each exact unless noted; details in the README, "What this fork adds"):
@@ -38,8 +38,9 @@ docs. MLX affine checkpoints stay readable: the CUDA engines read that format.
 
 **Updates** check this fork's GitHub releases, not upstream's.
 
-**Receipts:** see the README. The fork's own quick gate (GPU tests plus the house-config run) is pending; its result
-will be recorded here before release.
+**Receipts:** see the README. SparkFold's own quick gate on 6431c1b (2026-10-07, one DGX Spark, EXL3 4.05): 14/14
+checks, 450 GPU tests passed, drafted == serial, c2/c4/c8 16/16 equal to solo, c8 145.2 tok/s aggregate, 24K arrival
+stall 1.12 s.
 
 # Upstream TensorFold history (through 0.6.5)
 

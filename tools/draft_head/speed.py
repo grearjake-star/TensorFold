@@ -44,7 +44,8 @@ tok = Tokenizer.from_file(str(M / "tokenizer.json"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import prompts_v1 as PV1  # noqa: E402
 
-TEXTS = {k: BENCH[f"bench-{k}"] for k in ("chat", "prose", "advice", "code", "reasoning", "agent")}
+TEXTS = {k: BENCH[f"bench-{k}"] for k in ("chat", "prose", "advice", "code", "reasoning", "agent")
+         if f"bench-{k}" in BENCH}   # the prompts file's ``bench`` entries (prompts_v1)
 for i, item in enumerate([x for x in PV1._bakeoff() if x["kind"] == "code" and "Workspace files" in
                           x["messages"][0]["content"]][:a.edit]):
     TEXTS[f"edit{i}"] = item["messages"][0]["content"]

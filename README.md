@@ -1,17 +1,18 @@
-# TensorFold for DGX Spark (spark-exl3)
+# SparkFold
 
-This is a maintained fork of [TensorFold](https://github.com/ashhart/TensorFold) for the NVIDIA DGX Spark (GB10).
-It serves Qwen3.8 Flash Next from EXL3 packs first, and it runs on CUDA only.
+SparkFold is a maintained fork of [TensorFold](https://github.com/ashhart/TensorFold) for the NVIDIA DGX Spark (GB10),
+on the `spark-exl3` branch. It serves Qwen3.8 Flash Next from EXL3 packs first, and it runs on CUDA only. The package
+and command keep TensorFold's names (`tensorfold serve ...`), so upstream's docs and flags apply.
 
-**Why this fork exists.** Upstream froze its Python engine at 0.6.5 and moved new work to a Zig engine
+**Why SparkFold exists.** Upstream froze its Python engine at 0.6.5 and moved new work to a Zig engine
 ([#286](https://github.com/ashhart/TensorFold/issues/286)). That engine targets Apple Silicon first. It serves Flash Next on
 Metal today, its CUDA path runs Nemotron, and it has no EXL3 reader yet. GB10 owners who serve Flash Next from EXL3
-packs still run the Python engine. This fork keeps that CUDA Python engine alive for them: it carries the GB10 work
+packs still run the Python engine. SparkFold keeps that CUDA Python engine alive for them: it carries the GB10 work
 below on top of 0.6.5 and drops the Apple-only parts. Every fix here is welcome back upstream at any time, in
 whatever form suits the project.
 
 Thank you to ashhart and every TensorFold contributor. The engine, the kernels, the exactness contract and the test
-suite this fork stands on are their work. Several changes here began as pull requests to TensorFold; ashhart read
+suite SparkFold stands on are their work. Several changes here began as pull requests to TensorFold; ashhart read
 each one carefully and closed them kindly when the Python engine froze.
 
 ```bash
@@ -26,9 +27,9 @@ The API, flags and recipes are upstream's, less the Apple Silicon parts: see the
 ## Receipts
 
 All numbers below come from one DGX Spark (GB10, 128 GB) serving Qwen3.8-Flash-Next EXL3 4.05 bpw (turboderp
-`4.05bpw_h6_ng6`) with a trained MTP head for 4.05, `--parallel 8 --context 262144`, measured 2026-10-06 on the build this branch
-was cut from (the same CUDA engine before the Apple parts were removed; the branch's own gate run is listed in
-[CHANGELOG.md](CHANGELOG.md) once it has run).
+`4.05bpw_h6_ng6`) with a trained MTP head for 4.05, `--parallel 8 --context 262144`. The first table and the board
+comparison were measured 2026-10-06 on the build this branch was cut from (the same CUDA engine before the Apple parts
+were removed); SparkFold's own gate, on this branch, follows them.
 
 | Check | Result |
 | --- | --- |
@@ -39,10 +40,15 @@ was cut from (the same CUDA engine before the Apple parts were removed; the bran
 | 128K needle | Recalled 3/3, TTFT 68.3 s |
 | Not run | c=16 (this build serves 8 seats), TP=2, vision |
 
+**SparkFold's own quick gate, 2026-10-07** (spark-exl3 at 6431c1b, same box and settings): 14 of 14 checks passed;
+450 GPU tests passed; drafted == serial and every stream == its solo reply (c2/c4/c8 16/16); lone 63.4 tok/s, c8 145.2
+aggregate; a 24K prompt arriving beside two decoding streams: longest gap 1.12 s, its first token in 19.3 s; 6K TTFT
+2.97 s; 128K needle 3/3.
+
 **Against a public DGX Spark board, 2026-10-06** (aggregate tok/s, thinking off, one full answer at c=1 and kept-busy
 streams at c>=2; the other columns are [My LLM Box](https://myllmbox.com)'s own published runs on one DGX Spark):
 
-| Prompt, streams | This fork (EXL3 4.05, all 10 experts, exact) | mbx v5.2 (INT4 A5B: 5 of 10 experts) | mbx v5.1 (hibrid48, all experts) | TensorFold 0.6.1 stock (their run) |
+| Prompt, streams | SparkFold (EXL3 4.05, all 10 experts, exact) | mbx v5.2 (INT4 A5B: 5 of 10 experts) | mbx v5.1 (hibrid48, all experts) | TensorFold 0.6.1 stock (their run) |
 | --- | --- | --- | --- | --- |
 | mixed c=1 | **69.4** | 64.7 | 55.6 | 58.6 |
 | JSON c=1 | **110.3** | 85.0 | 72.2 | 81.4 |

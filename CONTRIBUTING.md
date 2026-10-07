@@ -1,6 +1,6 @@
 # Contributing to TensorFold
 
-> **This is the spark-exl3 fork** (CUDA only, DGX Spark / GB10 first). The rules below are upstream's and apply here
+> **This is SparkFold**, the spark-exl3 fork (CUDA only, DGX Spark / GB10 first). The rules below are upstream's and apply here
 > too, except that Apple Silicon is out of scope. A fix that would help upstream TensorFold is welcome there as well.
 
 Thank you for wanting to make TensorFold faster. This page says what a pull request needs to land in the next
