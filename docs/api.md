@@ -21,8 +21,6 @@ valid file returns. Request logs and `tensorfold:requests_total` use labels, nev
 Unnamed keys receive `cli-N`, `env-N` or `file-N` labels. Labels contain at most 64 letters, digits, dots,
 underscores or hyphens; choose non-secret labels.
 
-`tensorfold service install MODEL --api-key-file PATH` forwards the file to its server.
-For the control room, `tensorfold tui --url URL --token-env VARIABLE` sends that variable's value as a bearer key.
 Prefer a restricted file over command-line keys, which can appear in the operating system's process list.
 
 | Route | Behavior |

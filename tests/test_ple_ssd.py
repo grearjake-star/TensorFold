@@ -6,7 +6,6 @@ import json
 import os
 import shutil
 import struct
-import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
@@ -203,13 +202,7 @@ def test_each_file_is_opened_once_with_one_cache_hint(tmp_path, monkeypatch, tab
     files, _ = _checkpoint(tmp_path)
     real_open, opened, hints = os.open, [], []
     monkeypatch.setattr(os, "open", lambda path, *a, **k: opened.append(Path(path).name) or real_open(path, *a, **k))
-    if sys.platform == "darwin":
-        import fcntl
-
-        real = fcntl.fcntl
-        hint = getattr(fcntl, "F_NOCACHE", 48)
-        monkeypatch.setattr(fcntl, "fcntl", lambda fd, cmd, arg=0: hints.append(cmd) or real(fd, cmd, arg))
-    elif hasattr(os, "posix_fadvise"):
+    if hasattr(os, "posix_fadvise"):
         real, hint = os.posix_fadvise, os.POSIX_FADV_RANDOM
         monkeypatch.setattr(os, "posix_fadvise", lambda fd, at, n, how: hints.append(how) or real(fd, at, n, how))
     else:

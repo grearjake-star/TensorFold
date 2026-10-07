@@ -73,7 +73,7 @@ class Config:
         if want not in (None, "bfloat16", "float32"):
             raise ValueError(f"tensorfold_activation_dtype {want!r}: bfloat16 or float32")
         if want == "float32":
-            raise ValueError("tensorfold_activation_dtype float32 is the Mac engine; the CUDA engine stays bf16")
+            raise ValueError("tensorfold_activation_dtype float32 is not served: the CUDA engine stays bf16")
         t = dict(raw.get("text_config") or raw)
         lin = dict(t.get("linear_attn_config") or {})
         quant = raw.get("quantization") or raw.get("quantization_config") or {}

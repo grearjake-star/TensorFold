@@ -13,7 +13,7 @@ from tensorfold import cli_args
 from tensorfold.server import stacks, thinking_notes
 from tensorfold.serve_options import check as _check_serve_options, vision_options as _vision_options
 
-COMMANDS = ("serve", "pull", "models", "info", "update", "service", "tui")
+COMMANDS = ("serve", "pull", "models", "info", "update")
 
 
 def build_parser() -> argparse.ArgumentParser:

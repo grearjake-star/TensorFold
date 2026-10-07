@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import struct
-import sys
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -17,13 +16,9 @@ _KINDS = (("weight", "U32", 4), ("scales", "BF16", 2), ("biases", "BF16", 2))
 
 
 def _no_cache(fd: int) -> None:
-    """Keep the file's pages out of the cache (macOS F_NOCACHE) or its readahead off (Linux FADV_RANDOM)."""
+    """Turn the file's readahead off (Linux FADV_RANDOM)."""
 
-    if sys.platform == "darwin":
-        import fcntl
-
-        fcntl.fcntl(fd, getattr(fcntl, "F_NOCACHE", 48), 1)       # 48: F_NOCACHE in <sys/fcntl.h>
-    elif hasattr(os, "posix_fadvise"):
+    if hasattr(os, "posix_fadvise"):
         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
 
 
