@@ -109,8 +109,10 @@ Every item is exact (replies equal serial decoding) unless marked. Knobs are env
 - **Prefix keep policy for tool-call sessions**: `--parallel` keeps a shared system block's state through long tool-call
   sessions, and eviction keeps every prompt's own end.
 - **Slot choice without a free slot**: a fork claims the idle slot that loses the fewest kept tokens (from
-  philip-pentatonic's #315), and so does a fresh request, so an unrelated task arriving between two long conversations'
-  turns no longer evicts one of them (scottleimroth's report on #315).
+  philip-pentatonic's #315), and with `TF_FRESH_SLACK=<tokens>` (opt-in, off by
+  default) a fresh request skips idle slots that would cost more than that many tokens beyond the cheapest, so an
+  unrelated task arriving between two long conversations' turns does not evict one of them (scottleimroth's report on
+  #315). Off, a fresh request takes the oldest idle slot, as on the build the receipts were measured on.
 - **Metrics** from other contributors' open pull requests: a TPOT histogram (juliankang4, #367) and how each request
   ended (cshintov, #343).
 - **HC faces from MXFP8 copies** (`TF_EXL3_HC_FP8=1`, off by default): changes output bits; see above.

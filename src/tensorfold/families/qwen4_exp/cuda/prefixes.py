@@ -145,15 +145,26 @@ def slot_for(owner, prompt: list[int], reuse: bool):
     return owner.free.pop(), None, 0
 
 
-FRESH_SLACK = 2048       # kept tokens a fresh request may cost beyond the cheapest idle slot's (about a second of prefill)
+def _fresh_slack() -> int | None:
+    """TF_FRESH_SLACK=<tokens> (opt-in, unset or "off": the house rule): a fresh request with no free slot does not
+    evict an idle slot whose longest kept chain is more than this many tokens beyond the cheapest idle slot's."""
+
+    import os
+
+    value = os.environ.get("TF_FRESH_SLACK", "").strip().lower()
+    if value in ("", "off", "0", "false", "no"):
+        return None
+    try:
+        return max(0, int(value))
+    except ValueError:
+        raise ValueError(f"TF_FRESH_SLACK={value!r}: a token count, or off") from None
 
 
 def _cheapest_idle(owner, busy):
-    """A fresh request's slot when none is free: the oldest idle slot (``kept`` order, as before) among those whose
-    longest kept chain is within ``FRESH_SLACK`` tokens of the cheapest idle slot's. A long conversation is not
-    evicted while a much cheaper idle slot exists (#315), and among cheap slots recency still decides, so a
-    conversation that has just started keeps its end. A slot keeping a message-start state (a shared system block)
-    goes last."""
+    """A fresh request's slot when none is free: the oldest idle slot (``kept`` order), a slot keeping a message-start
+    state (a shared system block) last. With ``TF_FRESH_SLACK`` set (#315: an unrelated task arriving between two long
+    conversations' turns), only idle slots whose longest kept chain is within that many tokens of the cheapest idle
+    slot's are eligible, so a long conversation is not evicted while a much cheaper idle slot exists."""
 
     longest, order = {}, []
     for k in owner.kept:
@@ -167,8 +178,11 @@ def _cheapest_idle(owner, busy):
         raise RuntimeError("no free stream slot")
     held = {id(k[1]) for k in owner.kept if _is_start(owner, k)}
     pool = [st for st in order if id(st) not in held] or order
+    slack = _fresh_slack()
+    if slack is None:
+        return pool[0]
     floor = min(longest[id(st)] for st in pool)
-    return next(st for st in pool if longest[id(st)] <= floor + FRESH_SLACK)
+    return next(st for st in pool if longest[id(st)] <= floor + slack)
 
 
 def remember(owner, ids, st, snap, tail, start: bool = False, checkpoint: bool = False) -> None:

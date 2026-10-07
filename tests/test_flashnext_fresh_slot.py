@@ -7,6 +7,13 @@ import pytest
 from tensorfold.families.qwen4_exp.cuda import prefixes
 from tests.test_flashnext_prefix_victim import Owner, Slot, entry
 
+
+@pytest.fixture(autouse=True)
+def fresh_slack(monkeypatch):
+    """These cases test the opt-in #315 rule (TF_FRESH_SLACK); the default is the house rule (test at the end)."""
+
+    monkeypatch.setenv("TF_FRESH_SLACK", "2048")
+
 SYSTEM = list(range(300))                                   # the shared system block (tools + instructions)
 
 
@@ -83,3 +90,20 @@ def test_a_conversation_that_just_started_keeps_its_end_beside_older_short_ones(
                    entry(list(range(300, 316)), c, "conversation")])
     st, _, cached = prefixes.slot_for(owner, list(range(70000, 70006)), True)
     assert st is a and cached == 0 and {k[3] for k in owner.kept} == {"old-2", "conversation"}
+
+
+@pytest.mark.parametrize("value", ["", "off", "0"])
+def test_without_tf_fresh_slack_the_oldest_idle_slot_goes_as_in_the_house(monkeypatch, value):
+    """Default: the house rule, the oldest idle slot in kept order (a system block's slot last), even a long chain."""
+
+    monkeypatch.setenv("TF_FRESH_SLACK", value)
+    owner, a, b, c = long_conversations()
+    st, _, _ = prefixes.slot_for(owner, list(range(70000, 70100)), True)
+    assert st is b and {k[3] for k in owner.kept} == {"system", "one", "short"}
+
+
+def test_a_bad_tf_fresh_slack_is_refused(monkeypatch):
+    monkeypatch.setenv("TF_FRESH_SLACK", "lots")
+    owner, *_ = long_conversations()
+    with pytest.raises(ValueError, match="TF_FRESH_SLACK"):
+        prefixes.slot_for(owner, list(range(70000, 70100)), True)

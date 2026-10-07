@@ -26,7 +26,8 @@ first. The engine version stays 0.6.5.
   (`TF_MOE_ROUTE_FUSED`), and 4096-row prompt pieces (`TENSORFOLD_PREFILL_ROWS`, `TF_EXL3_MOE_WINDOW`).
 - Tunable pass sizes and graph-slot sizing (`TF_FIRST_PASS`, `TF_PASS_MIN`, `TF_SOLO_ROWS`), checked at start-up.
 - Slot choice without a free slot: a fork claims the idle slot that loses the fewest kept tokens (#315,
-  philip-pentatonic), and now so does a fresh request (scottleimroth's report on #315).
+  philip-pentatonic), and, with `TF_FRESH_SLACK` (opt-in), a fresh request
+  skips idle slots far costlier than the cheapest (scottleimroth's report on #315).
 - A TPOT histogram (#367, juliankang4) and how each request ended (#343, cshintov).
 - HC faces from MXFP8 copies (`TF_EXL3_HC_FP8=1`, off by default): changes output bits.
 
