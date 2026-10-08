@@ -144,6 +144,17 @@ class PromptPasses:
 
         return entry_end(s.prompt) if s.draft and s.st.image_positions is None else None
 
+    def _message_start(self, s: Stream, pos: int) -> bool:
+        """A kept point that ends a shared system block (the second message's start), which eviction keeps longest
+        and resumes refresh. The last assistant start and the prompt end are the conversation's own states."""
+
+        if pos == self._keep_at(s):
+            return False
+        block_end = getattr(self.points, "block_end", None)
+        if block_end is None:                            # a points rule that marks no blocks: every point but the end
+            return True
+        return block_end(s.prompt[:pos + 1]) == pos
+
     def _point(self, s: Stream, start: int) -> int | None:
         """The next message-start or prompt-end snapshot this prompt piece can reach."""
 
@@ -218,7 +229,7 @@ class PromptPasses:
             if kept is not None and a < kept[0]["pos"] <= a + n:
                 cp = getattr(self.points, "checkpoint", None)
                 self._remember(list(s.prompt[:kept[0]["pos"]]), s.st, *kept,
-                               start=kept[0]["pos"] != self._keep_at(s),      # a message start, not the end
+                               start=self._message_start(s, kept[0]["pos"]),
                                checkpoint=cp is not None and cp(s.prompt) == kept[0]["pos"])
             self.fills[s.sid][3] = None                    # only the bounded cache owns a stored snapshot
             if a + n < len(s.prompt):

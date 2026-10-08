@@ -80,7 +80,18 @@ def snapshot_points(openers: Sequence[int], assistant: Sequence[int],
                 out.append(p)
         return out
 
+    def block_end(ids: Sequence[int]) -> int | None:
+        """The second message's start, where a shared system block ends (None: fewer than two messages). Of the kept
+        points only this one (and the checkpoint before it) is shared between conversations; the last assistant
+        start, like the prompt end, is one conversation's own state."""
+
+        if not plan.openers:
+            return None
+        starts = np.flatnonzero(np.isin(np.asarray(ids, dtype=np.int64), plan.openers))
+        return int(starts[1]) if len(starts) > 1 else None
+
     points.checkpoint = checkpoint
+    points.block_end = block_end
     return points
 
 
