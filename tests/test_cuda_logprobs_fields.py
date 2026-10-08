@@ -55,7 +55,9 @@ def test_mac_handler_also_refuses_unsupported_options(fields):
         server.server_close()
 
 
-def probability_app(tmp_path):
+def probability_app(tmp_path, reply=(1,), think_end=True):
+    """A target that writes ``reply`` (ids: 1 "A", 2 " B", 3 "r", 4 "</think>", 5 two newlines), a row for each."""
+
     from tokenizers import Tokenizer, decoders, models
     from tests.test_cuda_server_errors import Engine
 
@@ -64,14 +66,17 @@ def probability_app(tmp_path):
 
         def generate(self, prompt, max_tokens, sampling, on_tokens, draft=True, probabilities=None):
             self.calls.append(list(prompt))
+            out = list(reply)[:max_tokens]
             if probabilities is not None:
-                probabilities.add([len(prompt)], [1], [-0.25], [[1, 2]], [[-0.25, -1.5]])
-            on_tokens([1])
+                at = range(len(prompt), len(prompt) + len(out))
+                probabilities.add(at, out, [-0.25] * len(out), [[t, 2] for t in out], [[-0.25, -1.5]] * len(out))
+            on_tokens(out)
             return {}
 
+    vocab = {"[UNK]": 0, "A": 1, "ĠB": 2, "r": 3, **({"</think>": 4} if think_end else {}), "ĊĊ": 5}
     app = app_for(tmp_path)
     app.engine = Target()
-    app.tok = Tokenizer(models.WordLevel({"[UNK]": 0, "A": 1, "ĠB": 2}, unk_token="[UNK]"))
+    app.tok = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
     app.tok.decoder = decoders.ByteLevel()
     return app
 
@@ -89,14 +94,42 @@ def test_one_token_chat_exposes_the_target_probabilities(tmp_path):
                         {"token": " B", "bytes": [32, 66], "logprob": -1.5}]}]
 
 
-@pytest.mark.parametrize("fields", [{"stream": True}, {"stop": ["A"]},
-                                   {"chat_template_kwargs": {"enable_thinking": True}}])
-def test_unaligned_probability_modes_fail_before_generation(tmp_path, fields):
-    app = probability_app(tmp_path)
+THINK = {"chat_template_kwargs": {"enable_thinking": True}}
+
+
+@pytest.mark.parametrize("fields, think_end", [({"stream": True}, True), ({"stop": ["A"]}, True),
+                                              ({**THINK, "thinking_budget": 8}, True), (THINK, False)])
+def test_unaligned_probability_modes_fail_before_generation(tmp_path, fields, think_end):
+    app = probability_app(tmp_path, think_end=think_end)
     with http_server(app) as port:
         status, _, text = request(port, {"messages": HI, "logprobs": True, **fields})
     assert status == 400 and "logprobs" in json.loads(text)["error"]["message"]
     assert app.engine.calls == []
+
+
+def test_thinking_reply_reports_the_answer_rows_only(tmp_path):
+    app = probability_app(tmp_path, reply=(3, 3, 4, 5, 1, 2, 0))       # r r </think> \n\n A " B" end
+    with http_server(app) as port:
+        status, _, text = request(port, {"messages": HI, "max_tokens": 16, "logprobs": True, "top_logprobs": 2,
+                                        **THINK})
+    assert status == 200, text
+    reply = json.loads(text)
+    choice = reply["choices"][0]
+    assert choice["message"]["reasoning_content"] == "rr" and choice["message"]["content"] == "A B"
+    rows = choice["logprobs"]["content"]
+    assert [row["token"] for row in rows] == ["A", " B"]
+    assert rows[0]["top_logprobs"] == [{"token": "A", "bytes": [65], "logprob": -0.25},
+                                       {"token": " B", "bytes": [32, 66], "logprob": -1.5}]
+    assert reply["usage"]["completion_tokens_details"]["reasoning_tokens"] == 3
+
+
+def test_thinking_reply_cut_inside_its_block_reports_no_rows(tmp_path):
+    app = probability_app(tmp_path, reply=(3, 3, 3))
+    with http_server(app) as port:
+        status, _, text = request(port, {"messages": HI, "max_tokens": 3, "logprobs": True, **THINK})
+    assert status == 200, text
+    choice = json.loads(text)["choices"][0]
+    assert choice["message"]["content"] in ("", None) and choice["logprobs"]["content"] == []
 
 
 def test_split_utf8_probabilities_preserve_the_original_bytes():

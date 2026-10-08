@@ -72,9 +72,17 @@ def test_call_without_arguments_and_several_calls_in_one_reply(parser):
 
 
 @PARSERS
-def test_a_tool_the_client_did_not_offer_stays_in_the_reply(parser):
+@pytest.mark.parametrize("max_calls", [None, 1])
+def test_a_tool_the_client_did_not_offer_is_a_call_under_its_own_name(parser, max_calls):
     text = "<tool_call>launch_rocket<arg_key>when</arg_key><arg_value>now</arg_value></tool_call>"
-    assert _parse(parser, text) == (text, [])
+    assert _parse(parser, text, max_calls=max_calls) == ("", [("launch_rocket", {"when": "now"})])
+
+
+@PARSERS
+@pytest.mark.parametrize("max_calls", [None, 1])
+def test_a_call_whose_name_is_no_function_name_stays_in_the_reply(parser, max_calls):
+    text = '<tool_call>{"name": "launch rocket!", "arguments": {"when": "now"}}</tool_call>'
+    assert _parse(parser, text, max_calls=max_calls) == (text, [])
 
 
 @PARSERS

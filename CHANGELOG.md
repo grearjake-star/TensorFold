@@ -5,6 +5,30 @@ follows below.
 
 ## 0.6.5+spark.1 (SparkFold, release tag v0.6.5-spark.1), unreleased
 
+### Upstream harvest (from spark-next)
+
+Changes taken from upstream TensorFold's 0.6.6 release and from pull requests and issues closed unmerged when the
+Python engine was frozen (#286), each a commit crediting its author. None changes a reply's tokens on the house
+configuration; the CUDA kernels are untouched.
+- `--name-priority ID=background` (0.6.6, #445, philip-pentatonic).
+- A call to a tool the request did not offer is sent under its own name instead of vanishing with
+  `parallel_tool_calls: false` (#415, Alexbob0).
+- The server raises its open-file limit at start and logs when accepts run out (#294, plotarmordev).
+- A reply that writes its own `<think>` keeps the tag out of `reasoning_content` (#327, jschmied).
+- Admission counts n-gram tables named `shards.N` (#330, anvilsong).
+- Qwen3.6's MTP head embeds drafts at the embedding table's width (#332, BHCC2025).
+- No `gc.collect()` before each lone-stream graph capture (#422, tfolkman; issue #336).
+- `tools/prefill_cold.py` rejects incomplete measurements (#432, YvesLaRose).
+- The EXL3 vision converter reads a tower inside the pack's shards, and BF16 (#229, outcastofmusic).
+- `/metrics` carries `/health`'s running tokens, cached prompt tokens, rounds and prefill time (#407, MiaAI-Lab).
+- `/v1/models` reports `context_length` and `max_model_len` (#480, nullburn; #483's contract, akol1).
+- GLM-5.3-Flash: a malformed per-request draft policy is a 400 (#470, ss-cong); a stopped request ends on both ranks
+  (#301, MiaAI-Lab); `_take_over` decides survivors before cloning (#421, m-naoki-m and Bizuayeu).
+- Qwen3.8-27B and Qwen3.6: past the kept-state limit, a state its conversation moved past goes first (#190, nood-co1).
+- Flash Next on two ranks: both ranks stop a reply when its caller asks (#231, plotarmordev).
+- `logprobs` with thinking on cover the answer's tokens (#449, DakotaTexas).
+
+
 The first release of SparkFold: TensorFold 0.6.5 for NVIDIA DGX Spark (GB10), CUDA only, Qwen3.8 Flash Next from EXL3
 first. Versions name the TensorFold release a SparkFold release is based on and its SparkFold revision (package
 `0.6.5+spark.1`, tag `v0.6.5-spark.1`), so `tensorfold update` orders it after 0.6.5.

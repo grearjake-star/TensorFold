@@ -8,7 +8,7 @@ import uuid
 from typing import Any
 
 from tensorfold.server.stopping import StopPolicy
-from tensorfold.server.tools import parse_glm_tool_call_block
+from tensorfold.server.tools import call_name, parse_glm_tool_call_block
 from tensorfold.tool_parameters import decode_parameter, parameter_schemas
 
 _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
@@ -126,6 +126,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
             m = _TOOL_FUNCTION_BLOCK_RE.match(block)
             if m:
                 if max_calls is not None and _TOOL_PARAMETER_BLOCK_RE.sub("", m.group(2)).strip():
+                    residue.append(match.group(0))
                     continue
                 name = m.group(1).strip()
                 # typed parameters (array, object, number...) decode per the tool's schema, as the Mac server does
@@ -137,19 +138,20 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
                 glm = parse_glm_tool_call_block(block, tools, complete=max_calls is not None)
                 if glm is not None:
                     name, args = glm
-        if not name or str(name).lower() not in known:
-            if max_calls is None:
-                residue.append(match.group(0))
+        tool = call_name(name, known, args)
+        if tool is None:
+            residue.append(match.group(0))          # a malformed call stays text, in either mode
             continue
         if max_calls is not None:
             try:
                 if not isinstance(args, dict):
-                    continue
+                    raise TypeError(args)
                 json.dumps(args, allow_nan=False)
             except (ValueError, TypeError):
+                residue.append(match.group(0))
                 continue
         calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
-                      "function": {"name": known[str(name).lower()],
+                      "function": {"name": tool,
                                    "arguments": json.dumps(args, ensure_ascii=False, separators=(",", ":"))}})
     residue.append(text[cursor:])
     return "".join(residue).strip(), calls or None

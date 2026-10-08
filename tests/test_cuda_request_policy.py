@@ -6,7 +6,7 @@ import pytest
 
 from tensorfold.cuda import server
 from tests.test_cuda_admission import http_server, post
-from tests.test_request_policy import CALL, TOOLS, stream_calls
+from tests.test_request_policy import CALL, MALFORMED, TOOLS, UNOFFERED, reply_calls, reply_content, stream_calls
 
 
 class TextTokenizer:
@@ -169,3 +169,26 @@ def test_cuda_single_call_hides_incomplete_namespaced_envelopes(tmp_path, stream
         assert not message.get("tool_calls")
         content = message["content"]
     assert content == visible
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("parallel", [True, False])
+def test_cuda_sends_an_unoffered_call_under_its_own_name(tmp_path, stream, parallel):
+    def ask(content):
+        with http_server(app_for(tmp_path, "Launching. " + content)) as port:
+            return post(port, {"messages": [{"role": "user", "content": "Launch"}],
+                "tools": TOOLS, "stream": stream, "parallel_tool_calls": parallel}, True)
+    (status, body), (_, offered) = ask(UNOFFERED), ask(CALL.format(1))
+    assert status == 200 and '"finish_reason": "tool_calls"' in body.replace('":"', '": "')
+    assert reply_calls(body, stream) == [("launch", {"when": "now"})]
+    assert reply_content(body, stream) == reply_content(offered, stream)      # answered as an offered call is
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_cuda_single_call_keeps_a_malformed_call_as_text(tmp_path, stream):
+    app = app_for(tmp_path, "Launching. " + MALFORMED)
+    with http_server(app) as port:
+        status, body = post(port, {"messages": [{"role": "user", "content": "Launch"}],
+            "tools": TOOLS, "stream": stream, "parallel_tool_calls": False}, True)
+    assert status == 200 and reply_calls(body, stream) == []
+    assert reply_content(body, stream) == "Launching. " + MALFORMED

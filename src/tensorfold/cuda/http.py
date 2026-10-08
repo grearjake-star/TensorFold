@@ -20,6 +20,16 @@ if TYPE_CHECKING:
     from tensorfold.cuda.server import App
 
 
+
+def model_entry(app, model_id: str) -> dict:
+    """One /v1/models entry; the served context window as context_length and vLLM's max_model_len when known."""
+
+    entry = {"id": model_id, "object": "model", "owned_by": "tensorfold"}
+    window = getattr(app, "effective_context_window", None)
+    if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+        entry["context_length"] = entry["max_model_len"] = window
+    return entry
+
 def usage_of(result: dict[str, Any]) -> dict[str, Any]:
     """A reply's usage as the Mac server reports it, the prompt tokens found cached included."""
 
@@ -95,8 +105,7 @@ def make_handler(app: App):
             if route in ("/metrics", "/v1/metrics"):
                 return metrics.send(self, app)
             if self.path.rstrip("/") in ("/v1/models", "/models"):
-                self._json(200, {"object": "list", "data": [{"id": model_id, "object": "model", "owned_by": "tensorfold"}
-                                                            for model_id in app.model_ids]})
+                self._json(200, {"object": "list", "data": [model_entry(app, model_id) for model_id in app.model_ids]})
             elif self.path.rstrip("/") in ("/health", "/v1/health"):
                 self._json(200, {"status": "ok"} if getattr(getattr(app, "auth", None), "enabled", False)
                            else health.of(app).snapshot(app))

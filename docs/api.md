@@ -28,7 +28,7 @@ Prefer a restricted file over command-line keys, which can appear in the operati
 
 | Route | Behavior |
 | --- | --- |
-| `GET /v1/models` | Served model ID and any configured aliases (both servers) |
+| `GET /v1/models` | Served model ID and any configured aliases; each entry carries `context_length` and `max_model_len` (the served prompt-plus-reply window) when the engine knows it |
 | `GET /health` | Server health and available status information |
 | `GET /metrics`, `GET /v1/metrics` | Prometheus text: requests, KV occupancy, drafts and latency (both servers) |
 | `POST /v1/chat/completions` | Text chat, optional image input, tools and reasoning; streamed or non-streamed |
@@ -93,10 +93,14 @@ For decisions, `chat_template_kwargs` may be omitted, null, or an object contain
 `n` must be 1; multiple choices receive HTTP 400.
 
 CUDA Flash Next on one GPU supports `logprobs: true` and `top_logprobs` from 0 through 20 for nonstreamed text chat
-with thinking off, without tools, stop strings or structured output. Each visible token has its `token`, `bytes`,
-`logprob` and requested `top_logprobs` in `choices[0].logprobs.content`. Probabilities describe the raw target-model
-distribution at temperature 1, before temperature, top-k or top-p sampling filters, including when generation is
-greedy. Alternatives are tokenizer tokens and may include leading spaces; `bytes` preserves partial UTF-8 sequences.
+without tools, stop strings, structured output or a `thinking_budget`. Each visible token has its `token`, `bytes`,
+`logprob` and requested `top_logprobs` in `choices[0].logprobs.content`. With thinking on, the rows cover the answer
+only, as `content` does: none for the reasoning, `</think>` or the newlines after it, so the first row is the
+answer's first token. A reply cut inside its think block has no rows. vLLM, by contrast, returns rows for the
+reasoning tokens too.
+Probabilities describe the raw target-model distribution at temperature 1, before temperature, top-k or top-p
+sampling filters, including when generation is greedy. Alternatives are tokenizer tokens and may include leading
+spaces; `bytes` preserves partial UTF-8 sequences.
 Unsupported backends, engines and request modes return HTTP 400 when probabilities are requested.
 `ignore_eos: true` keeps user-supplied `stop` strings active, including when a stop string spans streamed chunks.
 Both backends reject a non-boolean `ignore_eos` or a malformed `stop` with HTTP 400 before a stream opens.
@@ -143,6 +147,11 @@ a background prompt's ~1 s prefill waited 0.57 s on Qwen3.6, against 0.70 s with
 (the 27B: 0.69-0.89 s against 2.98-3.66 s). Flash Next, and an engine serving one request at a time, finish a
 background prompt's prefill once it has started. Two-rank engines serving one request at a time
 only order the queue.
+
+`--name-priority ID=background` gives one served id (`--name` or an `--alias`) a default priority: a request that
+asks for it and sends no `priority` of its own is treated as `priority: "background"`. The request's own `priority`
+field always wins over the default. This lets one CUDA server answer to several ids at their usual priority while a
+background-only client (a batch extractor, say) gets one id that always yields, without sending the field itself.
 
 ## Messages and tools
 
@@ -293,9 +302,14 @@ drafts share it), `request_latency_seconds`, `time_to_first_token_seconds` and `
 finished request's decode time: the CUDA engine's own figure; its `_sum`
 over `generation_tokens_total` is the decode rate) and `request_time_per_output_token_seconds` (vLLM's TPOT: the
 server's clock from a reply's first generated token to its last, over its tokens less one, in buckets from 2.5 ms
-to 1 s; a one-token reply has no gap and adds no sample, where vLLM records 0), all under the `tensorfold:` prefix. Every reading is repeated under a vLLM-compatible name (`num_requests_running`, `num_requests_waiting`,
+to 1 s; a one-token reply has no gap and adds no sample, where vLLM records 0), all under the `tensorfold:` prefix. The figures `/health` also
+reports are there too: `generation_tokens_running` (the running replies' tokens so far; added to
+`generation_tokens_total` it counts tokens as they are generated), `prompt_tokens_cached_total` (prompt tokens read
+from a kept prompt state; vLLM's name too), `decode_rounds_total` (`generation_tokens_total` over it is the tokens a round),
+`request_prefill_seconds` (each finished request's prompt pass: the CUDA engine's own figure) and, where the engine has a limit to read, `requests_running_max`. Every reading is repeated under a
+vLLM-compatible name (`num_requests_running`, `num_requests_waiting`,
 `kv_cache_usage_perc`, `spec_decode_num_draft_tokens_total`, `spec_decode_num_accepted_tokens_total`,
-`e2e_request_latency_seconds`, `request_decode_time_seconds`) with identical values, so a dashboard copied from vLLM fills by swapping the
+`e2e_request_latency_seconds`, `request_decode_time_seconds`, `request_prefill_time_seconds`) with identical values, so a dashboard copied from vLLM fills by swapping the
 `tensorfold:` prefix for the metric name. `client_disconnections_total` (requests the client walked away from)
 and `preemptions_total` (background work that gave up a lane to a later request) are published where the
 server counts those events, and never at a fabricated zero.

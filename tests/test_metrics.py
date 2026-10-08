@@ -15,7 +15,8 @@ from tensorfold.server.http import make_handler
 NAMES = ("requests_running", "requests_waiting", "prompt_tokens_total", "generation_tokens_total",
          "kv_cache_usage_ratio", "mtp_drafted_total", "mtp_accepted_total",
          "request_latency_seconds", "time_to_first_token_seconds", "request_decode_seconds",
-         "request_time_per_output_token_seconds")
+         "request_time_per_output_token_seconds",
+         "generation_tokens_running", "prompt_tokens_cached_total", "decode_rounds_total", "request_prefill_seconds")
 
 
 def sample(body: str, name: str) -> str:
@@ -354,3 +355,78 @@ def test_the_mac_request_path_is_gone():
     assert not any(hasattr(metrics, name) or name in metrics.__all__ for name in gone)
     src = Path(metrics.__file__).resolve().parents[1]
     assert not any(f"metrics.{name}(" in p.read_text() for p in src.rglob("*.py") for name in gone)
+
+
+def test_cuda_metrics_carry_the_health_figures_it_lacked():
+    app = SimpleNamespace()
+    out: list[int] = []
+    with health.of(app).running(5, out) as request:
+        out.extend([7, 8])
+        during = metrics.render(app)
+        figures = health.of(app).snapshot(app)
+        assert sample(during, f"{metrics.PREFIX}generation_tokens_running") == "2"
+        assert int(sample(during, f"{metrics.PREFIX}generation_tokens_total")) + 2 == figures["completion_tokens_total"]
+        out.append(9)
+        request.stats = {"prefill_s": 0.25, "decode_s": 0.5, "rounds": 2, "cached": 3, "drafted": 2, "accepted": 1}
+    body = metrics.render(app)
+    figures = health.of(app).snapshot(app)
+    assert sample(body, f"{metrics.PREFIX}generation_tokens_running") == "0"
+    assert sample(body, f"{metrics.PREFIX}generation_tokens_total") == str(figures["completion_tokens_total"]) == "3"
+    assert sample(body, f"{metrics.PREFIX}prompt_tokens_cached_total") == str(figures["cached_tokens_total"]) == "3"
+    assert sample(body, f"{metrics.PREFIX}decode_rounds_total") == str(figures["rounds_total"]) == "2"
+    assert float(sample(body, f"{metrics.PREFIX}request_prefill_seconds_sum")) == figures["prefill_seconds_total"]
+    assert sample(body, f"{metrics.PREFIX}request_prefill_seconds_count") == "1"
+    assert bucket(body, "request_prefill_seconds", "0.1") == "0"
+    assert bucket(body, "request_prefill_seconds", "0.25") == "1"
+    with health.of(app).running(5, [1]) as request:
+        request.stats = {"decode_s": 0.1}
+    assert sample(metrics.render(app), f"{metrics.PREFIX}request_prefill_seconds_count") == "1", "no pass, no sample"
+
+
+def test_the_running_limit_is_read_where_the_engine_has_one():
+    assert f"{metrics.PREFIX}requests_running_max" not in metrics.render(SimpleNamespace())
+    mac = SimpleNamespace(max_batch_size=4)
+    assert sample(metrics.render(mac), f"{metrics.PREFIX}requests_running_max") == "4"
+    decoder = SimpleNamespace(streams={}, filling=(), live=lambda: 0)
+    cuda = SimpleNamespace(engine=SimpleNamespace(scheduler=SimpleNamespace(decoder=decoder, waiting=None, held=None,
+                                                                            max_streams=8)))
+    assert sample(metrics.render(cuda), f"{metrics.PREFIX}requests_running_max") == "8"
+
+
+def test_the_prefill_mirror_carries_the_same_readings():
+    app = SimpleNamespace()
+    metrics.note(app, prompt=10, generation=2, cached=6, rounds=2, prefill=0.3, latency=1.0, ttft=0.4)
+    metrics.note(app, prompt=5, generation=1, latency=0.5, ttft=0.2)
+    body = metrics.render(app)
+    assert sample(body, f"{metrics.PREFIX}prompt_tokens_cached_total") == "6"
+    for suffix in ("_sum", "_count"):
+        assert sample(body, f"{metrics.PREFIX}request_prefill_time_seconds{suffix}") == \
+            sample(body, f"{metrics.PREFIX}request_prefill_seconds{suffix}")
+    assert bucket(body, "request_prefill_time_seconds", "0.5") == bucket(body, "request_prefill_seconds", "0.5") == "1"
+
+
+def test_the_cuda_server_s_metrics_agree_with_its_health(tmp_path):
+    pytest.importorskip("jinja2")
+    from tests.test_cuda_server_disconnect import MESSAGES, WAIT, app_for, post, serving
+    from tests.test_cuda_server_health import StatsEngine, health_of
+
+    engine = StatsEngine(hold_at=2)
+    app = app_for(tmp_path, engine)
+    with serving(app) as port:
+        box: dict = {}
+        worker = threading.Thread(target=lambda: box.update(reply=post(port, {"messages": MESSAGES,
+                                                                              "max_tokens": 4})))
+        worker.start()
+        assert engine.held.wait(WAIT)
+        during, figures = get(port, "/metrics")[2], health_of(port)
+        assert sample(during, f"{metrics.PREFIX}generation_tokens_running") == "2"
+        assert figures["completion_tokens_total"] == 2
+        engine.release.set()
+        worker.join(WAIT)
+        assert box["reply"][0] == 200, box
+        done, figures = get(port, "/metrics")[2], health_of(port)
+    assert sample(done, f"{metrics.PREFIX}generation_tokens_running") == "0"
+    assert int(sample(done, f"{metrics.PREFIX}generation_tokens_total")) == figures["completion_tokens_total"] == 4
+    assert int(sample(done, f"{metrics.PREFIX}prompt_tokens_cached_total")) == figures["cached_tokens_total"] == 2
+    assert int(sample(done, f"{metrics.PREFIX}decode_rounds_total")) == figures["rounds_total"] == 4
+    assert float(sample(done, f"{metrics.PREFIX}request_prefill_seconds_sum")) == figures["prefill_seconds_total"]

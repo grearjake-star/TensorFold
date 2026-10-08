@@ -21,7 +21,7 @@ from tensorfold.server.probabilities import probability_options
 from tensorfold.server.messages import normalize_messages, validate_modalities
 from tensorfold.server.tool_policy import ToolCallPolicy
 from tensorfold.server.cancellation import RequestCancelled, socket_cancellation
-from tensorfold.server import metrics
+from tensorfold.server import descriptors, metrics
 from tensorfold.server.stacks import Rearming
 from tensorfold.server.request_body import read_body
 
@@ -41,6 +41,20 @@ class Server(ThreadingHTTPServer):
     """One thread a connection; the listen backlog takes a burst of clients connecting at once."""
 
     request_queue_size = 128
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        descriptors.raise_limit()
+        self.out_of_descriptors = False
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        try:
+            got = super().get_request()
+        except OSError as exc:
+            descriptors.refused(self, exc)
+            raise
+        self.out_of_descriptors = False
+        return got
 
 
 def redact_images(value: Any) -> Any:
@@ -361,6 +375,7 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                     try:
                         if tools:
                             streamed = [False]
+                            prose = [""]                  # the content sent so far
 
                             def on_prose(delta: str | dict[str, Any]) -> None:
                                 delta = tool_policy.delta(delta)
@@ -369,6 +384,7 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                                 if not streamed[0]:
                                     streamed[0] = True
                                     emit(stream_chunk({"role": "assistant"}))
+                                prose[0] += delta if isinstance(delta, str) else str(delta.get("content") or "")
                                 emit(stream_chunk(delta))
 
                             extra = (
@@ -391,6 +407,7 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                                 if not streamed[0]:
                                     streamed[0] = True
                                     emit(stream_chunk({"role": "assistant"}))
+                                prose[0] += tail
                                 emit(stream_chunk(tail))
                             tool_calls = reply.get("tool_calls")
                             if tool_calls and not reply.get("tool_calls_streamed"):
@@ -400,6 +417,11 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                                     emit(stream_chunk(delta))
                             elif reply.get("content") and not streamed[0]:
                                 emit(stream_chunk(str(reply["content"])))
+                            elif str(reply.get("content") or "").startswith(prose[0].strip()):
+                                # what the stream's filter held back and the reply keeps as text (a malformed call)
+                                rest = str(reply["content"])[len(prose[0].strip()):]
+                                if rest.strip():
+                                    emit(stream_chunk(rest))
                         else:
                             if is_chat_completion:
                                 emit(stream_chunk({"role": "assistant"}))

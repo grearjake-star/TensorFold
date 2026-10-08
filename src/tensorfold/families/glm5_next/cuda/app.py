@@ -9,6 +9,29 @@ from tensorfold.families.glm5_next.prompts import clear_thinking, thinking_off
 from tensorfold.server.errors import CONTEXT_LIMIT
 
 
+def request_policy(body: dict[str, Any]) -> str | None:
+    """A request's own draft policy: its ``tf_policy`` field, else the model id's ``@policy`` suffix; None for neither."""
+
+    model = str(body.get("model") or "")
+    return body.get("tf_policy") or (model.split("@", 1)[1] if "@" in model else None)
+
+
+def policy_problem(body: dict[str, Any], engine: Any) -> str | None:
+    """Why a request's own draft policy is malformed, so it is refused with a 400 before streaming; None if valid.
+
+    The engine's own parser decides (``GlmEngine.check_policy``); an engine without one takes the policy as it is."""
+
+    spec = request_policy(body)
+    check = getattr(engine, "check_policy", None)
+    if spec is None or check is None:
+        return None
+    try:
+        check(spec)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
 class ThinkingOffTemplate:
     """The checkpoint template as GLM-5.3's thinking-off template renders it (``prompts.thinking_off``), with earlier
     turns' reasoning kept unless the request's ``chat_template_kwargs.clear_thinking`` says otherwise
@@ -35,7 +58,7 @@ class GlmApp(App):
     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
 
-        problem = self._check_fields(body)
+        problem = self._check_fields(body) or policy_problem(body, self.engine)
         limit = getattr(self.engine, "limit", None)
         if problem or limit is None:
             return problem or super().check(body, prepared=prepared)
@@ -57,7 +80,6 @@ class GlmApp(App):
 
     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool], *,
             prepared: PreparedRequest | None = None, cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
-        model = str(body.get("model") or "")
-        self.engine.request.policy = body.get("tf_policy") or (model.split("@", 1)[1] if "@" in model else None)
+        self.engine.request.policy = request_policy(body)
         self.engine.request.stop_eos = not bool(body.get("ignore_eos", False))
         return super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)

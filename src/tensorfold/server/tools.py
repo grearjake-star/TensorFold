@@ -282,8 +282,29 @@ def _strip_json_fence(text: str) -> str:
     return match.group(1).strip()
 
 
+_CALL_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def call_name(raw_name: Any, known: dict[str, str], arguments: Any) -> str | None:
+    """The name a parsed call goes out under: the offered tool's; else its own, when it is a valid function name and its
+    arguments a finite JSON object (a tool the request did not offer is the client's to refuse, #256); else None."""
+
+    if not isinstance(raw_name, str):
+        return None
+    name = known.get(raw_name.strip().lower())
+    if name is not None:
+        return name
+    if _CALL_NAME_RE.fullmatch(raw_name.strip()) is None or not isinstance(arguments, dict):
+        return None
+    try:
+        json.dumps(arguments, allow_nan=False)
+    except (ValueError, TypeError):
+        return None
+    return raw_name.strip()
+
+
 def _openai_tool_call(raw_name: str, arguments: dict[str, Any], known: dict[str, str]) -> dict[str, Any]:
-    name = known.get(raw_name.lower())
+    name = call_name(raw_name, known, arguments)
     if name is None:
         raise ValueError(f"unknown tool '{raw_name}'")
     return {
@@ -375,10 +396,9 @@ def parse_tool_calls_from_content(
                 parsed = None if one is None else [one]
         except (ValueError, TypeError):
             parsed = None
-        if not parsed or any(name.lower() not in known for name, _ in parsed):
-            # A malformed or unoffered call stays text: the reply is content, never an error or a client retry loop.
-            if max_calls is None:
-                residue_parts.append(text[start:end])
+        if not parsed or any(call_name(name, known, arguments) is None for name, arguments in parsed):
+            # A malformed call stays text: the reply is content, never an error or a client retry loop.
+            residue_parts.append(text[start:end])
             continue
         for one in parsed:
             if max_calls is None or len(calls) < max_calls:

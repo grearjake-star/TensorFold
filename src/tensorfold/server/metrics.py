@@ -56,20 +56,28 @@ class Metrics:
         self.generation = 0
         self.drafted = 0
         self.accepted = 0
+        self.cached = 0
+        self.rounds = 0
         self.latency = Histogram()
         self.ttft = Histogram()
         self.decode = Histogram()
+        self.prefill = Histogram()
         self.http_requests: dict[tuple[str, int], int] = {}
         self.tpot = Histogram(TPOT_BUCKETS)
+        self.live: dict[int, int] = {}      # a running Mac request's generated tokens so far, by its HTTP thread
 
     def add(self, *, prompt: int, generation: int, drafted: int, accepted: int,
             latency: float | None, ttft: float | None, decode: float | None = None,
-            tpot: float | None = None) -> None:
+            tpot: float | None = None, cached: int = 0, rounds: int = 0, prefill: float | None = None) -> None:
         with self.lock:
             self.prompt += int(prompt)
             self.generation += int(generation)
             self.drafted += int(drafted)
             self.accepted += int(accepted)
+            self.cached += int(cached)
+            self.rounds += int(rounds)
+            if prefill is not None:
+                self.prefill.observe(prefill)
             if latency is not None:
                 self.latency.observe(latency)
             if ttft is not None:
@@ -92,13 +100,13 @@ def of(app: Any) -> Metrics:
 
 def note(app: Any, *, prompt: int = 0, generation: int = 0, drafted: int = 0, accepted: int = 0,
          latency: float | None = None, ttft: float | None = None, decode: float | None = None,
-         tpot: float | None = None) -> None:
+         tpot: float | None = None, cached: int = 0, rounds: int = 0, prefill: float | None = None) -> None:
     """Fold one finished request. A missing app is a no-op."""
 
     if app is None:
         return
     of(app).add(prompt=prompt, generation=generation, drafted=drafted, accepted=accepted,
-                latency=latency, ttft=ttft, decode=decode, tpot=tpot)
+                latency=latency, ttft=ttft, decode=decode, tpot=tpot, cached=cached, rounds=rounds, prefill=prefill)
 
 
 def http_request(app: Any, key: str, status: int) -> None:
@@ -125,10 +133,15 @@ def render(app: Any) -> str:
     with metrics.lock:
         prompt, generation = metrics.prompt, metrics.generation
         drafted, accepted = metrics.drafted, metrics.accepted
+        cached, rounds = metrics.cached, metrics.rounds
         latency, ttft, decode = metrics.latency.copy(), metrics.ttft.copy(), metrics.decode.copy()
+        prefill = metrics.prefill.copy()
         requests = dict(metrics.http_requests)
         per_token = metrics.tpot.copy()
+        streamed = sum(metrics.live.values())
     running, waiting = _requests(app)
+    streamed += _cuda_streamed(app)
+    most = _most(app)
     pools = _pools(app)
     lines: list[str] = []
     if requests:
@@ -143,6 +156,18 @@ def render(app: Any) -> str:
             [f"{PREFIX}prompt_tokens_total {prompt}"])
     _family(lines, "generation_tokens_total", "counter", "Generated tokens of finished requests.",
             [f"{PREFIX}generation_tokens_total {generation}"])
+    _family(lines, "generation_tokens_running", "gauge",
+            "Tokens the running requests have generated so far. Plus generation_tokens_total, it counts tokens "
+            "as they are generated.", [f"{PREFIX}generation_tokens_running {streamed}"])
+    _family(lines, "prompt_tokens_cached_total", "counter",
+            "Prompt tokens of finished requests read from a kept prompt state instead of prefilled (vLLM's name).",
+            [f"{PREFIX}prompt_tokens_cached_total {cached}"])
+    _family(lines, "decode_rounds_total", "counter",
+            "Decode rounds of finished requests. generation_tokens_total over it is the tokens a round.",
+            [f"{PREFIX}decode_rounds_total {rounds}"])
+    if most is not None:
+        _family(lines, "requests_running_max", "gauge", "Requests the engine runs together at most.",
+                [f"{PREFIX}requests_running_max {most}"])
     _family(lines, "kv_cache_usage_ratio", "gauge",
             "Tokens in a stream cache divided by that stream's context window.",
             [f'{PREFIX}kv_cache_usage_ratio{{pool="{pool}"}} {_num(ratio)}' for pool, ratio in pools])
@@ -158,6 +183,7 @@ def render(app: Any) -> str:
     _histogram(lines, "request_time_per_output_token_seconds",
                "A finished request's first to last generated token over the tokens less one (vLLM's TPOT).",
                per_token)
+    _histogram(lines, "request_prefill_seconds", "Seconds a finished request's prompt pass took.", prefill)
     # vLLM names, identical values: a vLLM dashboard needs only the "tensorfold:" prefix swapped.
     _family(lines, "num_requests_running", "gauge",
             "Requests in prefill or decode. A mirror of tensorfold:requests_running.",
@@ -177,6 +203,8 @@ def render(app: Any) -> str:
                "Seconds from arrival to the reply leaving, under vLLM's name.", latency)
     _histogram(lines, "request_decode_time_seconds",
                "Seconds a finished request spent decoding, under vLLM's name.", decode)
+    _histogram(lines, "request_prefill_time_seconds",
+               "Seconds a finished request's prompt pass took, under vLLM's name.", prefill)
     # per-request event counts; a family is left out where this server doesn't count the event, never a fake zero
     disconnects, preempted = _endings(app)
     if disconnects is not None:
@@ -250,6 +278,28 @@ def _requests(app: Any) -> tuple[int, int]:
         return running, 0
     parked = getattr(turns, "parked", None)
     return running, int(parked if parked is not None else getattr(turns, "waiting", 0) or 0)
+
+
+def _cuda_streamed(app: Any) -> int:
+    """The CUDA server's running replies' tokens so far, as its /health counts them."""
+
+    health = getattr(app, "health", None)
+    lock, live = getattr(health, "lock", None), getattr(health, "live", None)
+    if lock is None or not live:
+        return 0
+    with lock:
+        return sum(len(getattr(request, "out", None) or ()) for request in live)
+
+
+def _most(app: Any) -> int | None:
+    """The engine's limit on requests running together, or None where it has none to read."""
+
+    scheduler = getattr(getattr(app, "engine", None), "scheduler", None)
+    for owner, name in ((scheduler, "max_streams"), (app, "max_batch_size")):
+        n = _positive(getattr(owner, name, None) if owner is not None else None)
+        if n:
+            return n
+    return None
 
 
 def _endings(app: Any) -> tuple[int | None, int | None]:

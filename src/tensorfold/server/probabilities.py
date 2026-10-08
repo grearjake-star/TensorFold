@@ -56,6 +56,17 @@ class TokenBytes:
             self.cache[token_id] = value
         return self.cache[token_id]
 
+    def answer(self, rows, think_end):
+        """A thinking reply's answer rows: after its first ``think_end``, less the newlines its text drops."""
+
+        ids = [row["id"] for row in rows]
+        if think_end not in ids:
+            return []
+        rows = rows[ids.index(think_end) + 1:]
+        while rows and self.token(rows[0]["id"])["token"] and not self.token(rows[0]["id"])["token"].strip("\n"):
+            rows = rows[1:]
+        return rows
+
     def format(self, rows, ends):
         return {"content": [{**self.token(row["id"]), "logprob": row["logprob"],
                              "top_logprobs": [{**self.token(token), "logprob": value}

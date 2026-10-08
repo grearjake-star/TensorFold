@@ -363,6 +363,11 @@ class GlmEngine:
         self.kept_counts["hits" if best is not None else "misses"] += 1
         return best
 
+    def check_policy(self, spec: str) -> None:
+        """Raise ValueError for a request's draft policy this engine cannot parse (``app.policy_problem``: a 400)."""
+
+        encode_policy(spec)
+
     def _drop(self, snap, why: str | None = None) -> None:
         """Forget a kept snapshot and free its saved rows now, even while a caller still holds the object."""
         snap.rows, snap.nbytes, snap.drafter_rows = None, 0, None
@@ -396,35 +401,57 @@ class GlmEngine:
             torch.cuda.empty_cache()
 
     def _take_over(self, keep: list[int]) -> None:
-        """Save the rows of every kept snapshot the next prefill overwrites, dropping the oldest entries past the memory budget; both ranks decide alike."""
-        from .decode import row_bytes, save_rows
+        """Save the rows of every kept snapshot the next prefill overwrites, dropping the oldest entries past the memory budget; both ranks decide alike.
+
+        Decide first, copy after: which snapshots fit the budget is worked out from sizes alone, the rest are dropped
+        without a copy, and only the survivors are cloned. Cloning each in turn and dropping it for the next, larger
+        one grew torch's pool with every copy (reserved memory far past the budget)."""
+        from .decode import row_bytes, save_rows, snapshot_bytes
 
         live = self.live
-        dropped = False
+        order = list(self.cache)
+        alive = {id(c) for c in order}
+        saved: dict[int, int] = {}                   # a survivor's held bytes once its rows are saved
+        drops: list = []
+        over_budget = False
 
         def resumes(c) -> bool:
             return len(c.ids) <= len(keep) and keep[:len(c.ids)] == c.ids
 
-        for snap in list(self.cache):
+        def held() -> int:
+            return sum(saved[id(c)] if id(c) in saved else snapshot_bytes(c) for c in order if id(c) in alive)
+
+        def forget(c, why: str) -> None:
+            alive.discard(id(c))
+            saved.pop(id(c), None)
+            drops.append((c, why))
+
+        for snap in order:                           # the old save-one-by-one walk, with sizes standing in for copies
             n = len(snap.ids)
-            if snap not in self.cache or snap.rows is not None or resumes(snap):
+            if id(snap) not in alive or snap.rows is not None or resumes(snap):
                 continue
             if live[:n] != snap.ids:                  # its rows are already gone: nothing to resume from
-                self._drop(snap, "its rows were overwritten")
+                forget(snap, "its rows were overwritten")
                 continue
             need = row_bytes(self.e, snap)
-            while self._held_bytes() + need > self.cache_bytes:
-                old = next((c for c in self.cache if c is not snap and not resumes(c)), None)
+            while held() + need > self.cache_bytes:
+                old = next((c for c in order if id(c) in alive and c is not snap and not resumes(c)), None)
                 if old is None:
                     break
-                self._drop(old, self._over_budget())
-                dropped = True
-            if self._held_bytes() + need > self.cache_bytes:
-                self._drop(snap, self._over_budget())
-                dropped = True
+                forget(old, self._over_budget())
+                over_budget = True
+            if held() + need > self.cache_bytes:
+                forget(snap, self._over_budget())
+                over_budget = True
                 continue
-            save_rows(self.e, snap)
-        if dropped:
+            shed = sum(t.numel() * t.element_size() for t in snap.drafter_rows or [])   # save_rows clears these
+            saved[id(snap)] = snapshot_bytes(snap) - shed + need
+        for snap, why in drops:
+            self._drop(snap, why)
+        for snap in order:
+            if id(snap) in saved:
+                save_rows(self.e, snap)
+        if over_budget:
             import torch
 
             torch.cuda.empty_cache()             # give the freed rows back rather than keep them in torch's pool
@@ -440,12 +467,13 @@ class GlmEngine:
         try:
             return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft)
         finally:
-            self.e.constraint = self.e.window = None
+            self.e.constraint = self.e.window = self.e.vote = None
 
     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
                   on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool) -> dict[str, Any]:
         from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode
         from .drafter_choice import DrafterChoice, auto_decode
+        from .stop import StopVote
 
         auto, use_mtp, use_dflash = self._drafters(code)
         drafter = self.drafter if use_dflash else None
@@ -463,9 +491,11 @@ class GlmEngine:
                         keep_at=max(1, len(prompt) - 1) if draft else None, keep=self._remember)
         prefill_s = time.perf_counter() - t0
         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
+        on_tokens = StopVote(on_tokens)             # rank 0's stop reaches every rank on the next verify sample
         on_tokens([first])
         if max_tokens <= 1 or (stop_eos and first in self.eos):
             return stats
+        self.e.vote = on_tokens                     # on every rank, so every rank's gathers keep the same size
         policy = decode_policy(code)
         if policy is None:
             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
@@ -491,6 +521,8 @@ class GlmEngine:
         stats.update(decode_s=res.seconds, rounds=res.rounds, min_rows=1 + min(res.depths, default=0),
                      tokens_per_round=round((len(res.tokens) - 1) / max(res.rounds, 1), 3),
                      sha256=hashlib.sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])
+        if on_tokens.stop:
+            stats["stopped"] = True
         if res.arms:
             stats.update(drafters=res.arms, keeps=res.keeps)
         if policy is not None:                   # the drafts' counts, which /health, /metrics and the reply report

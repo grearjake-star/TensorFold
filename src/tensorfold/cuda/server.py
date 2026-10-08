@@ -75,7 +75,8 @@ class App:
                  sampling: dict[str, Any] | None = None, max_tokens: int = 4096,
                  context_window: int | None = None, reasoning_effort: str | None = None, thinking_budget: int = 0,
                  aliases: tuple[str, ...] | list[str] = (), vision_max_images: int | None = None,
-                 vision_image_tokens: int | None = None):
+                 vision_image_tokens: int | None = None,
+                 background_ids: tuple[str, ...] | frozenset[str] = ()):
         from tokenizers import Tokenizer
 
         self.engine = engine
@@ -85,6 +86,7 @@ class App:
                         **({} if vision_image_tokens is None else {"max_visual_tokens": vision_image_tokens}))
         self.served = served
         self.aliases = tuple(str(alias).strip() for alias in aliases if str(alias).strip())
+        self.background_ids = frozenset(background_ids)   # --name-priority ID=background: a default for this id
         self.model_dir = Path(model_dir)
         self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
         self.template = ChatTemplate(model_dir)
@@ -252,9 +254,10 @@ class App:
         spec = grammar.request_spec(body)
         top = probability_options(body, supported=bool(getattr(self.engine, "supports_logprobs", False)))
         if top is not None:
-            if not chat or body.get("stream") or thinking or tools or stop or spec is not None or budget:
-                raise RequestError("logprobs support nonstreamed text chat with thinking off, without tools, "
-                                   "stop strings or structured output")
+            unsplit = thinking and self.tok.token_to_id("</think>") is None    # no token to find the answer by
+            if not chat or body.get("stream") or unsplit or tools or stop or spec is not None or budget:
+                raise RequestError("logprobs support nonstreamed text chat without tools, stop strings, structured "
+                                   "output or a thinking budget")
             if not hasattr(self, "_probability_decoder"):
                 self._probability_decoder = TokenBytes(self.tok)
         compiled = (spec, self._grammars().compile(spec)) if spec is not None else None
@@ -444,7 +447,7 @@ class App:
         serving: list[Any] = [None]
 
         def on_tokens(new: list[int]) -> bool:
-            # True stops the engine after this round; engines that finish on both ranks keep calling and get True
+            # True stops the engine after this round (two-rank GLM: the next one); a running engine keeps getting True
             if stopped["client"] or stopped["stop"] or failed:
                 return True
             try:
@@ -499,8 +502,9 @@ class App:
         shaped = prepared.grammar is not None or prepared.think_budget > 0
         think_end = self.tok.token_to_id("</think>") if chat and thinking and shaped else None
         budget = self._think_budget(prepared, think_end)
-        # priority "background" (or a session-title request): after the others, as on the Mac
-        background = body.get("priority") == "background" or (chat and is_title_request(body.get("messages"), tools))
+        # background: the request's own priority, else --name-priority's default for its id; title requests always
+        by_name = "priority" not in body and self.reply_model(body) in getattr(self, "background_ids", ())
+        background = body.get("priority") == "background" or by_name or (chat and is_title_request(body.get("messages"), tools))
         concurrent = getattr(self.engine, "concurrent", False)
         turns = None if concurrent else self._turns()
         if concurrent and background and "background" in inspect.signature(self.engine.generate).parameters:
@@ -569,7 +573,7 @@ class App:
         text = stops.visible(raw_text)
         raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
-        content = policy.content(content) if tools else content
+        content = policy.parsed_content(content) if tools else content
         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
         if tail:
             final["content"] = tail
@@ -582,8 +586,12 @@ class App:
                    graphs=rounds.summary() if hasattr(rounds, "summary") else None)
         if body.get("return_token_ids"):              # the reply's ids in the "tensorfold" block, for exactness checks
             stats = {**(stats or {}), "token_ids": [int(t) for t in out]}
-        logprobs = (self._probability_decoder.format(probabilities.emitted(out), ends)
-                    if probabilities is not None else None)
+        logprobs = None
+        if probabilities is not None:               # a thinking reply's rows are its answer's, as ``content`` is
+            rows = probabilities.emitted(out)
+            if chat and thinking:
+                rows = self._probability_decoder.answer(rows, self.tok.token_to_id("</think>"))
+            logprobs = self._probability_decoder.format(rows, ends)
         # the calls already sent as deltas; the handler sends the rest (a call the streamer could not follow)
         streamed = calls_stream.index + 1 if calls_stream is not None and calls_stream.streamed else 0
         return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
