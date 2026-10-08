@@ -146,7 +146,7 @@ def test_cuda_health_folds_drafts_and_drops_running_when_the_request_ends():
     assert health.of(app).snapshot(app)["drafted_total"] == 4
 
 
-def test_decode_seconds_come_from_the_engine_on_cuda_and_from_the_first_token_on_the_mac():
+def test_decode_seconds_come_from_the_engine_on_cuda():
     app = SimpleNamespace()
     out: list[int] = []
     with health.of(app).running(5, out) as request:
@@ -162,18 +162,8 @@ def test_decode_seconds_come_from_the_engine_on_cuda_and_from_the_first_token_on
         request.stats = {}
     assert sample(metrics.render(app), f"{metrics.PREFIX}request_decode_seconds_count") == "1", "no token, no decode"
 
-    mac = SimpleNamespace()
-    started = time.perf_counter()
-    metrics.begin(mac, 6, started)
-    metrics.tokens(3, started)
-    metrics.finish_request()
-    body = metrics.render(mac)
-    assert sample(body, f"{metrics.PREFIX}request_decode_seconds_count") == "1"
-    assert 0 <= float(sample(body, f"{metrics.PREFIX}request_decode_seconds_sum")) <= float(
-        sample(body, f"{metrics.PREFIX}request_latency_seconds_sum"))
 
-
-def test_tpot_runs_from_the_first_returned_token_to_the_last_on_both_servers(monkeypatch):
+def test_tpot_runs_from_the_first_returned_token_to_the_last(monkeypatch):
     now = [0.0]
     monkeypatch.setattr(time, "perf_counter", lambda: now[0])
     name = "request_time_per_output_token_seconds"
@@ -199,40 +189,6 @@ def test_tpot_runs_from_the_first_returned_token_to_the_last_on_both_servers(mon
     with health.of(cuda).running(5, [11], arrived=2.0) as request:
         request.saw()
     assert sample(metrics.render(cuda), f"{metrics.PREFIX}{name}_count") == "1", "one token has no gap"
-
-    mac = SimpleNamespace()
-    metrics.begin(mac, 6, 0.0)
-    now[0] = 1.0
-    metrics.tokens(1, 1.0)
-    now[0] = 1.024
-    metrics.tokens(3, 1.0)
-    now[0] = 2.0
-    metrics.finish_request()
-    body = metrics.render(mac)
-    assert sample(body, f"{metrics.PREFIX}{name}_count") == "1"
-    assert sample(body, f"{metrics.PREFIX}{name}_sum") == "0.012"
-    assert sample(body, f"{metrics.PREFIX}request_decode_seconds_sum") == "1"
-    metrics.begin(mac, 6, 2.0)
-    metrics.tokens(1, 2.0)
-    metrics.finish_request()
-    assert sample(metrics.render(mac), f"{metrics.PREFIX}{name}_count") == "1", "one token has no gap"
-    assert bucket(metrics.render(mac), "request_decode_seconds", "1") == "2", "the request histograms keep their edges"
-
-
-def test_mac_finish_request_counts_once():
-    app = SimpleNamespace()
-    metrics.begin(app, 6, time.perf_counter())
-    metrics.tokens(3, time.perf_counter())
-    metrics.bind(SimpleNamespace(stream=SimpleNamespace(drafted=5, accepted=2)))
-    metrics.finish_request()
-    metrics.finish_request()
-    body = metrics.render(app)
-    assert sample(body, f"{metrics.PREFIX}prompt_tokens_total") == "6"
-    assert sample(body, f"{metrics.PREFIX}generation_tokens_total") == "3"
-    assert sample(body, f"{metrics.PREFIX}mtp_drafted_total") == "5"
-    assert sample(body, f"{metrics.PREFIX}mtp_accepted_total") == "2"
-    assert sample(body, f"{metrics.PREFIX}request_latency_seconds_count") == "1"
-    assert sample(body, f"{metrics.PREFIX}time_to_first_token_seconds_count") == "1"
 
 
 def test_a_live_request_is_running_and_the_next_one_is_waiting(tmp_path):
@@ -386,3 +342,15 @@ def test_both_http_layers_serve_the_mirrored_and_event_families(tmp_path):
         first.join(WAIT)
         second.join(WAIT)
         assert box["first"][0] == 200 and box["second"][0] == 200, box
+
+
+def test_the_mac_request_path_is_gone():
+    """The Mac app's thread-local request path (begin/bind/tokens/finish_request) had no caller once the Mac server
+    left; the CUDA server counts requests through cuda/health.py (note, tpot)."""
+
+    from pathlib import Path
+
+    gone = ("begin", "bind", "tokens", "finish_request")
+    assert not any(hasattr(metrics, name) or name in metrics.__all__ for name in gone)
+    src = Path(metrics.__file__).resolve().parents[1]
+    assert not any(f"metrics.{name}(" in p.read_text() for p in src.rglob("*.py") for name in gone)

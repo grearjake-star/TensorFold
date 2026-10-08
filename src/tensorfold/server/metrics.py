@@ -9,7 +9,6 @@ never emitted at a fabricated zero.
 from __future__ import annotations
 
 import threading
-import time
 from typing import Any
 
 
@@ -20,7 +19,6 @@ BUCKETS = (0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 3
 TPOT_BUCKETS = (0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3,
                 0.5, 1.0)
 _MADE = threading.Lock()
-_local = threading.local()
 
 
 class Histogram:
@@ -110,57 +108,6 @@ def http_request(app: Any, key: str, status: int) -> None:
     with counters.lock:
         pair = (key, int(status))
         counters.http_requests[pair] = counters.http_requests.get(pair, 0) + 1
-
-
-def begin(app: Any, prompt: int, started: float) -> None:
-    """The Mac request on this thread, from arrival, counted once when ``finish_request`` runs."""
-
-    _local.armed = True
-    _local.app = app
-    _local.prompt = int(prompt)
-    _local.generation = 0
-    _local.started = float(started)
-    _local.first = 0.0
-    _local.last = 0.0
-    _local.job = None
-
-
-def bind(job: Any) -> None:
-    """The job whose stream holds this request's draft counts (a rerun replaces a preempted one)."""
-
-    if getattr(_local, "armed", False):
-        _local.job = job
-
-
-def tokens(count: int, first: float) -> None:
-    """Generated tokens so far, the clock time of the first one, and now as the latest one's."""
-
-    if not getattr(_local, "armed", False):
-        return
-    _local.generation = int(count)
-    if first and not _local.first:
-        _local.first = float(first)
-    if count:
-        _local.last = time.perf_counter()
-
-
-def finish_request() -> None:
-    """Count the Mac request begun on this thread. Safe when none was begun."""
-
-    if not getattr(_local, "armed", False):
-        return
-    _local.armed = False
-    job = _local.job
-    stream = getattr(job, "stream", None) if job is not None else None
-    ended = time.perf_counter()
-    ttft = (_local.first - _local.started) if _local.first else None
-    # Decode runs from the first generated token to the end; a request that generated nothing has none.
-    decode = max(0.0, ended - _local.first) if _local.first else None
-    note(_local.app, prompt=_local.prompt, generation=_local.generation,
-         drafted=int(getattr(stream, "drafted", 0) or 0),
-         accepted=int(getattr(stream, "accepted", 0) or 0),
-         latency=max(0.0, ended - _local.started), ttft=ttft, decode=decode,
-         tpot=tpot(_local.first, _local.last, _local.generation))
 
 
 def tpot(first: float | None, last: float | None, generated: int) -> float | None:
@@ -396,5 +343,4 @@ def _edge(value: float) -> str:
     return f"{value:.4f}".rstrip("0").rstrip(".")
 
 
-__all__ = ["BUCKETS", "PREFIX", "TPOT_BUCKETS", "Histogram", "Metrics", "begin", "bind", "finish_request", "note",
-           "of", "render", "send", "tokens", "tpot"]
+__all__ = ["BUCKETS", "PREFIX", "TPOT_BUCKETS", "Histogram", "Metrics", "note", "of", "render", "send", "tpot"]
