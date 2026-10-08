@@ -53,6 +53,9 @@ class WarmStarts:
         self.saving = threading.Lock()                # one write at a time (the writer thread, or ``save``)
         self.dirty = False
         self.writer: threading.Thread | None = None
+        # id(kept ids) -> (those ids, their key or None when not a system block): a resumed kept state is noted
+        # again on every resume, on the decode thread; its scan, copy and digest are done once
+        self.known: dict[int, tuple[Sequence[int], int, list[int] | None, str | None]] = {}
         self.entries: list[dict] = self._load()      # most recently used first: {"ids", "last", "uses"}
 
     @classmethod
@@ -88,10 +91,18 @@ class WarmStarts:
     def note(self, ids: Sequence[int]) -> None:
         """A system block's state was kept or resumed: it becomes the most recently used (other prefixes: ignored)."""
 
-        if not self.system_only(ids):
+        hit = self.known.get(id(ids))
+        if hit is not None and hit[0] is ids and hit[1] == len(ids):
+            _, _, flat, key = hit
+        else:
+            flat = [int(t) for t in ids] if self.system_only(ids) else None
+            key = _key(flat) if flat is not None else None
+            if len(self.known) >= 4 * self.limit:              # kept states come and go: forget the oldest
+                self.known.pop(next(iter(self.known)))
+            self.known[id(ids)] = (ids, len(ids), flat, key)   # holds ``ids``, so its id is not reused meanwhile
+        if flat is None:
             return
-        ids = [int(t) for t in ids]
-        key = _key(ids)
+        ids = flat
         with self.lock:
             old = next((e for e in self.entries if e["key"] == key), None)
             entry = {"key": key, "ids": ids, "last": round(time.time()), "uses": (old["uses"] if old else 0) + 1}
