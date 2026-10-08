@@ -306,6 +306,10 @@ class FlashNextEngine:
     def _warm_starts(self, model_dir, vocab: int) -> None:
         """TF_WARM_STARTS: record kept system blocks; prefill the most recent again now, before the server takes traffic."""
 
+        if self.tp == 2 and self.rank != 0:
+            # rank 1 replays rank 0's replay admissions in follow(); its own would enter the plan collectives while
+            # rank 0 waits for rank 1's link connection (a hang), or admit every block twice
+            return
         from tensorfold.engine.exact_sampling import Sampling
 
         from .warm_starts import WarmStarts, replay, replay_count
