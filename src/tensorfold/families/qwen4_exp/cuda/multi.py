@@ -342,8 +342,10 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             except NoRoom:
                 if resume is None:
                     self.free.append(st)
-                else:
-                    self._remember(list(s.prompt[:s.cached]), st, resume["state"], resume["tail"])
+                else:                                # put back as it was: a checkpoint stays one (never counts
+                    ids = list(s.prompt[:s.cached])  # against keep); a start stays one through ``starts``
+                    self._remember(ids, st, resume["state"], resume["tail"],
+                                   checkpoint=tuple(ids) in (getattr(self, "checkpoints", None) or ()))
                 raise
         e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity, self.prefill_rows)
         mtp = s.draft and self.depth > 0 and self.mbuf is not None
