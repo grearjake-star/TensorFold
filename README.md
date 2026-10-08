@@ -267,8 +267,10 @@ model data; the startup estimate is not a measured maximum capacity.
 ## Updating
 
 This fork's `tensorfold update` checks the fork's releases on GitHub (grearjake-star/TensorFold), never upstream's, so it
-cannot replace this build with an upstream release. `--no-update-check` or `TENSORFOLD_NO_UPDATE_CHECK=1`
-disables startup checks. [CHANGELOG.md](CHANGELOG.md) lists every release of the fork, then upstream's history.
+cannot replace this build with an upstream release. SparkFold versions name the TensorFold release they are based
+on and a SparkFold revision: the package is `0.6.5+spark.1`, its release tag `v0.6.5-spark.1`, which update checks
+order after 0.6.5 and before a release on a later base. Before the fork has published a release, `tensorfold update`
+says so and changes nothing. `--no-update-check` or `TENSORFOLD_NO_UPDATE_CHECK=1` disables startup checks. [CHANGELOG.md](CHANGELOG.md) lists every release of the fork, then upstream's history.
 
 ## Development and license
 

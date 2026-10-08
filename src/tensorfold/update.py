@@ -32,15 +32,40 @@ def parse_version(text: str) -> tuple[int, ...]:
     return tuple(int(part) for part in match.group(1).split("."))
 
 
+SPARK = re.compile(r"v?(\d+(?:\.\d+)*)(?:[-+]spark\.(\d+))?")
+
+
+def version_key(text: str) -> tuple[tuple[int, ...], int]:
+    """The order of releases: the TensorFold version a release is based on, then its SparkFold revision. A release
+    tag is ``v0.6.5-spark.1`` and the package version ``0.6.5+spark.1`` (PEP 440 has no ``-spark``); both give
+    ((0, 6, 5), 1), after 0.6.5 itself ((0, 6, 5), 0) and before a release on a later base (v0.6.6-spark.1)."""
+
+    match = SPARK.match(text.strip())
+    if not match:
+        raise ValueError(f"not a version: {text!r}")
+    return tuple(int(part) for part in match.group(1).split(".")), int(match.group(2) or 0)
+
+
+def tag_of(version: str) -> str:
+    """The release tag of a package version: ``0.6.5+spark.1`` -> ``v0.6.5-spark.1``."""
+
+    return "v" + version.lstrip("v").replace("+spark.", "-spark.")
+
+
 def newer(latest: str, current: str = __version__) -> bool:
     try:
-        return parse_version(latest) > parse_version(current)
+        return version_key(latest) > version_key(current)
     except ValueError:
         return False
 
 
-def latest_release(timeout: float = 3.0, *, use_cache: bool = True) -> str | None:
-    """The newest release tag on GitHub (``v0.3.1``), from the day's cache when there is one; None offline."""
+class NoRelease(Exception):
+    """GitHub answered 404 for the latest release: the repository has published none (or is not public)."""
+
+
+def latest_release(timeout: float = 3.0, *, use_cache: bool = True, strict: bool = False) -> str | None:
+    """The newest release tag on GitHub (``v0.3.1``), from the day's cache when there is one; None offline.
+    ``strict``: raise ``NoRelease`` when GitHub says there is no release, rather than None as for offline."""
 
     if use_cache:
         try:
@@ -49,6 +74,7 @@ def latest_release(timeout: float = 3.0, *, use_cache: bool = True) -> str | Non
                 return str(cached["tag"])
         except (OSError, ValueError, KeyError, TypeError):
             pass
+    import urllib.error
     import urllib.request
 
     request = urllib.request.Request(RELEASES_API, headers={"Accept": "application/vnd.github+json",
@@ -56,6 +82,10 @@ def latest_release(timeout: float = 3.0, *, use_cache: bool = True) -> str | Non
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             tag = str(json.loads(response.read())["tag_name"])
+    except urllib.error.HTTPError as exc:
+        if strict and exc.code == 404:
+            raise NoRelease(RELEASES_API) from None
+        return None
     except Exception:                  # offline, rate-limited or blocked: no answer is fine
         return None
     try:
@@ -82,9 +112,9 @@ def whats_new(text: str, since: str, upto: str) -> str:
 
     lines, keep = [], False
     for line in text.splitlines():
-        heading = re.match(r"##\s+v?(\d+(?:\.\d+)+)", line)
+        heading = re.match(r"##\s+v?(\d+(?:\.\d+)+(?:[-+]spark\.\d+)?)", line)
         if heading:
-            keep = parse_version(since) < parse_version(heading.group(1)) <= parse_version(upto)
+            keep = version_key(since) < version_key(heading.group(1)) <= version_key(upto)
         elif line.startswith("# "):
             keep = False
         if keep:
@@ -139,13 +169,13 @@ def first_run_notice() -> str | None:
         seen = SEEN.read_text().strip()
     except OSError:
         seen = ""
-    if seen == __version__:
-        return None
+    if seen == __version__ or (seen and not newer(__version__, seen) and not newer(seen, __version__)):
+        return None                    # the same release (a tag's spelling, v0.6.5-spark.1, or the package's)
     _remember(__version__)
     if seen and not newer(__version__, seen):
         return None
     return (f"[tensorfold] this is TensorFold {__version__}; what's new: "
-            f"https://github.com/{REPO}/blob/v{__version__}/{CHANGELOG}")
+            f"https://github.com/{REPO}/blob/{tag_of(__version__)}/{CHANGELOG}")
 
 
 def check_in_background() -> threading.Thread | None:
@@ -191,7 +221,12 @@ def _run(command: list[str], **kwargs: Any) -> int:
 def update(*, check_only: bool = False, force: bool = False) -> int:
     """``tensorfold update``: install the newest release (or say this one is current)."""
 
-    tag = latest_release(timeout=10.0, use_cache=False)
+    try:
+        tag = latest_release(timeout=10.0, use_cache=False, strict=True)
+    except NoRelease:
+        print(f"[tensorfold] {REPO} has published no release yet (GitHub: no latest release at {RELEASES_API}); "
+              f"this is {__version__}. Nothing to install: update a clone with git pull", flush=True)
+        return 0
     if tag is None:
         print(f"[tensorfold] could not reach GitHub to look for releases ({RELEASES_API})", file=sys.stderr)
         return 1

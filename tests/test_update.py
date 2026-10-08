@@ -184,3 +184,40 @@ def test_the_first_run_of_a_version_points_at_its_notes_once(monkeypatch):
 def test_the_changelog_has_this_version():
     text = (Path(__file__).resolve().parents[1] / "CHANGELOG.md").read_text()
     assert re.search(rf"^## {re.escape(__version__)} ", text, re.M), f"CHANGELOG.md needs a ## {__version__} section"
+
+
+def test_sparkfold_releases_order_after_their_base():
+    assert update.version_key("v0.6.5-spark.1") == update.version_key("0.6.5+spark.1") == ((0, 6, 5), 1)
+    assert update.newer("v0.6.5-spark.1", "0.6.5") and not update.newer("v0.6.5-spark.1", "0.6.5+spark.1")
+    assert update.newer("v0.6.5-spark.2", "0.6.5+spark.1") and update.newer("v0.6.6-spark.1", "0.6.5+spark.9")
+    assert update.newer("v0.6.6", "0.6.5+spark.3") and not update.newer("v0.6.5", "0.6.5+spark.1")
+    assert update.tag_of("0.6.5+spark.1") == "v0.6.5-spark.1" and update.tag_of("0.6.5") == "v0.6.5"
+
+
+def test_whats_new_reads_sparkfold_sections():
+    text = "## 0.6.5+spark.2 (x)\n\n- two\n\n## 0.6.5+spark.1 (x)\n\n- one\n\n## 0.6.5 (x)\n\n- base\n"
+    notes = update.whats_new(text, "0.6.5+spark.1", "v0.6.5-spark.2")
+    assert "two" in notes and "one" not in notes and "base" not in notes
+    assert "one" in update.whats_new(text, "0.6.5", "v0.6.5-spark.1")
+
+
+def test_no_published_release_is_reported_as_such(monkeypatch, capsys):
+    import urllib.error
+
+    def urlopen(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    monkeypatch.setattr(update.subprocess, "call", _no_network)
+    assert update.latest_release(use_cache=False) is None                  # the background check stays silent
+    assert update.update() == 0
+    out = capsys.readouterr()
+    assert "has published no release yet" in out.out and "could not reach GitHub" not in out.err
+
+
+def test_the_first_run_link_names_the_release_tag(monkeypatch):
+    monkeypatch.delenv("TENSORFOLD_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr(update, "__version__", "0.6.5+spark.1")
+    assert "blob/v0.6.5-spark.1/CHANGELOG.md" in update.first_run_notice()
+    update.SEEN.write_text("0.6.5-spark.1")                                  # written by an update to that tag
+    assert update.first_run_notice() is None

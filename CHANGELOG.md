@@ -3,10 +3,11 @@
 SparkFold's releases, newest first. Upstream TensorFold's own history, through the 0.6.5 release this fork is based on,
 follows below.
 
-## SparkFold 0.1.0 (spark-exl3), 7 Oct 2026
+## 0.6.5+spark.1 (SparkFold, release tag v0.6.5-spark.1), unreleased
 
 The first release of SparkFold: TensorFold 0.6.5 for NVIDIA DGX Spark (GB10), CUDA only, Qwen3.8 Flash Next from EXL3
-first. The engine version stays 0.6.5.
+first. Versions name the TensorFold release a SparkFold release is based on and its SparkFold revision (package
+`0.6.5+spark.1`, tag `v0.6.5-spark.1`), so `tensorfold update` orders it after 0.6.5.
 
 **Added on top of 0.6.5** (each exact unless noted; details in the README, "What this fork adds"):
 - Kept prompt states per slot (`TF_KEEP`) with per-slot lone-stream CUDA graphs, and the graph-slot fixes from #337
@@ -36,7 +37,21 @@ flags), the Metal kernels, the macOS launchd control plane (`tensorfold service`
 the MLX-only families (DeepSeek-V4-Flash, Gemma 4, Ternary Bonsai 2), the Apple-only dependencies and the Apple-only
 docs. MLX affine checkpoints stay readable: the CUDA engines read that format.
 
-**Updates** check this fork's GitHub releases, not upstream's.
+**Fixed before the first release** (a code review of the fork):
+- Under `--tp 2 --parallel` with `TF_WARM_STARTS`, rank 1 replayed the recorded system blocks on its own and both
+  ranks hung at start-up; only rank 0 replays now (rank 1 follows its admissions).
+- Only the end of a shared system block is kept as a message-start state; a conversation's last assistant start
+  no longer gets the system block's eviction protection (which could let a fresh request take the system block's
+  slot).
+- An admission refused for memory puts a resumed system-block checkpoint back as a checkpoint.
+- Kept-state bookkeeping no longer copies and hashes long conversations' token ids on the decode thread (16 kept
+  100K-token conversations: 24 ms -> 1.5 ms an admission), and a resumed system block is recorded for warm starts
+  without rescanning it (1.3 ms -> 0.04 ms).
+- `TF_FRESH_SLACK` is checked when the server starts, and `TF_DRAFT_COST` accepts only a finite number 0 or more, or
+  `off` (`nan` turned the cost stop off silently, `inf` cut every chain to one draft).
+- The Mac app's leftover request-metrics path is gone.
+
+**Updates** check this fork's GitHub releases, not upstream's; with none published yet, `tensorfold update` says so.
 
 **Receipts:** see the README. SparkFold's own quick gate on 6431c1b (2026-10-07, one DGX Spark, EXL3 4.05): 14/14
 checks, 450 GPU tests passed, drafted == serial, c2/c4/c8 16/16 equal to solo, c8 145.2 tok/s aggregate, 24K arrival
