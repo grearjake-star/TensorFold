@@ -11,6 +11,27 @@ VERIFY_MS = (24.5, 28.4, 32.2, 35.0, 38.1, 42.0, 44.4, 46.2, 49.2, 51.8, 54.2, 5
 DRAFT_MS = 1.2
 
 
+def cost_setting(default: float, env=os.environ) -> float:
+    """``TF_DRAFT_COST``: the expected-time stop's tokens per ms (unset: ``default``; empty, "0" or "off": no cost
+    stop). A finite number 0 or more: "nan" would turn the stop off silently, "inf" would stop every chain at its
+    first draft, and both break the two ranks' settings check."""
+
+    raw = env.get("TF_DRAFT_COST")
+    if raw is None:
+        return float(default)
+    value = raw.strip().lower()
+    if value in ("", "off"):
+        return 0.0
+    try:
+        cost = float(value)
+    except ValueError:
+        cost = math.nan
+    if not math.isfinite(cost) or cost < 0:
+        raise ValueError(f"TF_DRAFT_COST: tokens per ms, a finite number 0 or more (0 or off: no cost stop), "
+                         f"not {raw!r}")
+    return cost
+
+
 def timing_table(env=os.environ) -> tuple[tuple[float, ...], float]:
     """The cost rule's verify-window table and draft-step ms: ``TF_VERIFY_MS`` (comma-separated ms of windows of 1, 2, ...
     rows, e.g. a checkpoint's own measurement) and ``TF_DRAFT_MS`` override the MLX defaults above. Speed only."""

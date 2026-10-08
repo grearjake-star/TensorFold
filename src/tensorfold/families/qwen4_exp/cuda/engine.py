@@ -106,12 +106,10 @@ class FlashNextEngine:
         self.tp, self.rank, self.depth, self.confidence = tp, rank, int(depth), float(confidence)
         self.streams, self.master, self.graphs_enabled = int(streams), master, bool(graphs)
         # the expected-time stop (decode.cost_bars, tokens per ms); TF_DRAFT_COST overrides it, 0 turns it off
-        self.cost = float(os.environ.get("TF_DRAFT_COST", COST) or 0)
-        from .draft_cost import timing_table
+        from .draft_cost import cost_setting, timing_table
 
+        self.cost = cost_setting(COST, os.environ)
         self.timing = timing_table(os.environ)            # TF_VERIFY_MS / TF_DRAFT_MS: the checkpoint's own table
-        if self.cost < 0:
-            raise ValueError(f"TF_DRAFT_COST: tokens per ms, 0 or more, not {self.cost}")
         self.kv_dtype = check_kv(kv_dtype)
         self.comm = None
         self.vision = None                   # the image tower (``QwenCudaVision``) with --vision
