@@ -42,11 +42,12 @@ docs. MLX affine checkpoints stay readable: the CUDA engines read that format.
   ranks hung at start-up; only rank 0 replays now (rank 1 follows its admissions).
 - Only the end of a shared system block is kept as a message-start state; a conversation's last assistant start
   no longer gets the system block's eviction protection (which could let a fresh request take the system block's
-  slot).
+  slot). On a full 8-slot pool of Hermes-shaped conversations, follow-ups of 60K-token conversations went from
+  30.7-34.0 s to 15.6-16.5 s, with the same replies.
 - An admission refused for memory puts a resumed system-block checkpoint back as a checkpoint.
 - Kept-state bookkeeping no longer copies and hashes long conversations' token ids on the decode thread (16 kept
-  100K-token conversations: 24 ms -> 1.5 ms an admission), and a resumed system block is recorded for warm starts
-  without rescanning it (1.3 ms -> 0.04 ms).
+  100K-token conversations: 24 ms -> 1.5 ms per kept-state update), and a resumed system block is recorded for warm
+  starts without rescanning it (1.3 ms -> 0.04 ms).
 - `TF_FRESH_SLACK` is checked when the server starts, and `TF_DRAFT_COST` accepts only a finite number 0 or more, or
   `off` (`nan` turned the cost stop off silently, `inf` cut every chain to one draft).
 - The Mac app's leftover request-metrics path is gone.
