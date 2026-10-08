@@ -38,7 +38,8 @@ def _checkpoints(owner) -> set:
 
 def _is_checkpoint(owner, entry) -> bool:
     cps = getattr(owner, "checkpoints", None)
-    return bool(cps) and tuple(entry[0]) in cps
+    # lengths first: a tuple of a long conversation's ids is built and hashed only when a checkpoint is as long
+    return bool(cps) and any(len(t) == len(entry[0]) for t in cps) and tuple(entry[0]) in cps
 
 
 def _touch(owner, entry) -> None:
@@ -194,13 +195,14 @@ def remember(owner, ids, st, snap, tail, start: bool = False, checkpoint: bool =
 
     starts = _starts(owner)
     cps = _checkpoints(owner)
+    key = tuple(ids)
     if checkpoint:
-        cps.add(tuple(ids))
+        cps.add(key)
         start = True
     else:
-        cps.discard(tuple(ids))
+        cps.discard(key)
     if start:
-        starts.add(tuple(ids))
+        starts.add(key)
         if not checkpoint:
             _note(owner, ids)
     gone = [k[1] for k in owner.kept if k[0] == ids]
@@ -211,7 +213,7 @@ def remember(owner, ids, st, snap, tail, start: bool = False, checkpoint: bool =
     for i in reversed(held[:max(0, len(held) - CHECKPOINTS)]):     # the oldest checkpoints past the limit
         gone.append(owner.kept.pop(i)[1])
     if cps:
-        owner.checkpoints = {t for t in cps if any(tuple(k[0]) == t for k in owner.kept)}
+        owner.checkpoints = {t for t in cps if any(len(k[0]) == len(t) and tuple(k[0]) == t for k in owner.kept)}
     if starts:
         lengths = {len(k[0]) for k in owner.kept}
         owner.starts = {t for t in starts if len(t) in lengths and any(len(k[0]) == len(t) and tuple(k[0]) == t
