@@ -58,6 +58,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
                  share: float = SHARE, points=None, graphs: bool = True, vision=None, workspace_bytes: int = 0,
                  cost: float = 0.0, timing=None, round_graphs: bool = False) -> None:
+        self.fresh_slack = prefixes.fresh_slack()      # TF_FRESH_SLACK: refused at start-up, not at an admission
         self.link = self.follower = None
         self.planning, self.pass_plan, self.mixed_plan = False, None, None
         self.pass_index, self.pass_width = 0, prefill_rows

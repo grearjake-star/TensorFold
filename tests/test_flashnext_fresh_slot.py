@@ -107,3 +107,21 @@ def test_a_bad_tf_fresh_slack_is_refused(monkeypatch):
     owner, *_ = long_conversations()
     with pytest.raises(ValueError, match="TF_FRESH_SLACK"):
         prefixes.slot_for(owner, list(range(70000, 70100)), True)
+
+
+def test_a_bad_tf_fresh_slack_is_refused_when_the_decoder_starts(monkeypatch):
+    """Read once at start-up like the other knobs: a bad value stops the server before it serves, not an admission."""
+
+    from tensorfold.families.qwen4_exp.cuda.multi import MultiDecoder
+
+    monkeypatch.setenv("TF_FRESH_SLACK", "lots")
+    with pytest.raises(ValueError, match="TF_FRESH_SLACK"):
+        MultiDecoder(object(), slots=2, capacity=64)
+
+
+def test_the_decoder_uses_the_value_read_at_start_up(monkeypatch):
+    owner, a, b, c = long_conversations()
+    owner.fresh_slack = None                             # read at start-up: the house rule
+    monkeypatch.setenv("TF_FRESH_SLACK", "lots")         # changed later: not read again
+    st, _, _ = prefixes.slot_for(owner, list(range(70000, 70100)), True)
+    assert st is b

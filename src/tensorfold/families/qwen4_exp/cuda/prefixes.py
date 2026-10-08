@@ -145,9 +145,10 @@ def slot_for(owner, prompt: list[int], reuse: bool):
     return owner.free.pop(), None, 0
 
 
-def _fresh_slack() -> int | None:
+def fresh_slack() -> int | None:
     """TF_FRESH_SLACK=<tokens> (opt-in, unset or "off": the house rule): a fresh request with no free slot does not
-    evict an idle slot whose longest kept chain is more than this many tokens beyond the cheapest idle slot's."""
+    evict an idle slot whose longest kept chain is more than this many tokens beyond the cheapest idle slot's.
+    The decoder reads it once at start-up (``owner.fresh_slack``), so a bad value is refused before serving."""
 
     import os
 
@@ -178,7 +179,7 @@ def _cheapest_idle(owner, busy):
         raise RuntimeError("no free stream slot")
     held = {id(k[1]) for k in owner.kept if _is_start(owner, k)}
     pool = [st for st in order if id(st) not in held] or order
-    slack = _fresh_slack()
+    slack = owner.fresh_slack if hasattr(owner, "fresh_slack") else fresh_slack()
     if slack is None:
         return pool[0]
     floor = min(longest[id(st)] for st in pool)
