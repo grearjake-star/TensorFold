@@ -93,13 +93,15 @@ def test_a_conversation_that_just_started_keeps_its_end_beside_older_short_ones(
 
 
 @pytest.mark.parametrize("value", ["", "off", "0"])
-def test_without_tf_fresh_slack_the_oldest_idle_slot_goes_as_in_the_house(monkeypatch, value):
-    """Default: the house rule, the oldest idle slot in kept order (a system block's slot last), even a long chain."""
+def test_without_tf_fresh_slack_a_cheap_idle_slot_goes_first(monkeypatch, value):
+    """Default (house, CACHEMISS): an idle slot whose longest chain is at most CHEAP_ROWS goes first, else the least
+    recently used (tests/test_flashnext_fresh_lru.py); a system block's slot last. Before: the oldest idle slot in kept
+    order, here the 20K-token conversation b while c kept 40 tokens."""
 
     monkeypatch.setenv("TF_FRESH_SLACK", value)
     owner, a, b, c = long_conversations()
     st, _, _ = prefixes.slot_for(owner, list(range(70000, 70100)), True)
-    assert st is b and {k[3] for k in owner.kept} == {"system", "one", "short"}
+    assert st is c and {k[3] for k in owner.kept} == {"system", "one", "two"}
 
 
 def test_a_bad_tf_fresh_slack_is_refused(monkeypatch):
@@ -121,6 +123,7 @@ def test_a_bad_tf_fresh_slack_is_refused_when_the_decoder_starts(monkeypatch):
 
 def test_the_decoder_uses_the_value_read_at_start_up(monkeypatch):
     owner, a, b, c = long_conversations()
+    owner.kept[-1] = entry(list(range(90000, 93000)), c, "short")      # not cheap: the least recently used goes
     owner.fresh_slack = None                             # read at start-up: the house rule
     monkeypatch.setenv("TF_FRESH_SLACK", "lots")         # changed later: not read again
     st, _, _ = prefixes.slot_for(owner, list(range(70000, 70100)), True)

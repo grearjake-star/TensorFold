@@ -162,27 +162,37 @@ def fresh_slack() -> int | None:
         raise ValueError(f"TF_FRESH_SLACK={value!r}: a token count, or off") from None
 
 
-def _cheapest_idle(owner, busy):
-    """A fresh request's slot when none is free: the oldest idle slot (``kept`` order), a slot keeping a message-start
-    state (a shared system block) last. With ``TF_FRESH_SLACK`` set (#315: an unrelated task arriving between two long
-    conversations' turns), only idle slots whose longest kept chain is within that many tokens of the cheapest idle
-    slot's are eligible, so a long conversation is not evicted while a much cheaper idle slot exists."""
+CHEAP_ROWS = 2048       # an idle slot whose longest kept chain is this short costs at most one prompt pass to lose
 
-    longest, order = {}, []
-    for k in owner.kept:
+
+def _cheapest_idle(owner, busy):
+    """A fresh request's slot when none is free, a slot keeping a message-start state (a shared system block) last:
+    an idle slot whose longest kept chain is at most CHEAP_ROWS tokens if there is one (a title or helper request's end,
+    a probe), else the least recently used idle slot, by its NEWEST kept entry (its last request). Ordering slots by
+    their oldest entry instead made a conversation that started long ago the first victim however recently it ran:
+    on a full pool Hermes' short helper requests between an agent's turns evicted 84-94K-token conversations
+    (2026-10-08 20:00-20:03, TTFT 37-55 s) while a 275-token title's slot sat idle. Slot choice only: kept states,
+    resumes and replies are unchanged.
+    With ``TF_FRESH_SLACK`` set (#315), only idle slots whose longest kept chain is within that many tokens of the
+    cheapest idle slot's are eligible, the oldest of those (``kept`` order) going first, as before."""
+
+    longest, newest, order = {}, {}, []
+    for i, k in enumerate(owner.kept):
         key = id(k[1])
         if key in busy:
             continue
         if key not in longest:
             order.append(k[1])
         longest[key] = max(longest.get(key, 0), len(k[0]))
+        newest[key] = i
     if not order:
         raise RuntimeError("no free stream slot")
     held = {id(k[1]) for k in owner.kept if _is_start(owner, k)}
     pool = [st for st in order if id(st) not in held] or order
     slack = owner.fresh_slack if hasattr(owner, "fresh_slack") else fresh_slack()
     if slack is None:
-        return pool[0]
+        pool = [st for st in pool if longest[id(st)] <= CHEAP_ROWS] or pool
+        return min(pool, key=lambda st: newest[id(st)])
     floor = min(longest[id(st)] for st in pool)
     return next(st for st in pool if longest[id(st)] <= floor + slack)
 
