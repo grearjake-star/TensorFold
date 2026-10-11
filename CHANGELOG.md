@@ -3,7 +3,25 @@
 SparkFold's releases, newest first. Upstream TensorFold's own history, through the 0.6.5 release this fork is based on,
 follows below.
 
-## 0.6.5+spark.1 (SparkFold, release tag v0.6.5-spark.1), unreleased
+## 0.6.5+spark.2 (SparkFold, release tag v0.6.5-spark.2)
+
+### Flash Next: long follow-ups keep their cache on a full pool
+A fresh request on a full pool now takes a cheap idle slot (at most 2048 kept rows), otherwise the least recently
+used idle slot by its newest entry. A start-holding slot still goes last, and `TF_FRESH_SLACK` keeps its opt-in rule.
+Before, idle slots were ranked by their *oldest* kept entry. An agent conversation keeps its first prompt for life,
+so its slot looked oldest however recently it ran, and short helper requests (titles, tool summaries) sent between
+an agent's steps took it.
+- Receipt, a real household evening (synthetic ids, same arrival pattern): 54% of re-processed prompt tokens were
+  evictions. Replaying the pattern through the slot code with the fix loses no conversation, and re-processed tokens
+  fall from 377K to 173K.
+- In serving: an 84-94K-token follow-up that took 37-55 s to first token after an eviction now resumes from its cache.
+- Slot choice only. Kept states, resumes, kernels and reply tokens are unchanged. Gate 14/14.
+- `tests/test_flashnext_fresh_lru.py` replays the arrival pattern; it fails on the previous release.
+
+### Fixed
+- The 0.6.5+spark.1 heading no longer says "unreleased".
+
+## 0.6.5+spark.1 (SparkFold, release tag v0.6.5-spark.1, 8 Oct 2026)
 
 ### Upstream harvest (from spark-next)
 
