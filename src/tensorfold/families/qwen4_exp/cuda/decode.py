@@ -408,6 +408,27 @@ def ngram_ahead(e: Engine, prompt: Sequence[int], start: int) -> None:
     _ahead_submit(run)
 
 
+NGRAM_FIRST = __import__("os").environ.get("TF_NGRAM_FIRST", "1") != "0"
+
+
+def ngram_first_rows(w, st, prompt: Sequence[int], a: int, b: int) -> int:
+    """A prompt's FIRST pass (rows [a, b)): ask for its n-gram table pages now, in one bulk MADV_WILLNEED, before
+    the pass gathers them. The read-ahead helpers cover only later passes, so the first pass faulted its rows in one
+    by one (PREFILL-PROF 2026-10-11: 1.1-3.8 s of stage on a cold prompt vs 30-60 ms after). The kernel reads the
+    pages in parallel; every gather returns the same bytes. Returns the rows asked for (0: off or nothing to read)."""
+
+    p = _ahead_ple(w) if NGRAM_FIRST else None
+    if p is None or b <= a:
+        return 0
+    n = p.ngram.n
+    if a >= n - 1:
+        h = np.asarray(prompt[a - (n - 1):a], dtype=np.int64)
+    else:
+        h = st.ple_history
+    p.table.willneed(p.ngram.ids(h, np.asarray(prompt[a:b], dtype=np.int64)))
+    return b - a
+
+
 def ngram_rows_ahead(w, prompt: Sequence[int], a: int, b: int) -> bool:
     """--parallel's prompt passes: ask for rows [a, b)'s n-gram table pages (MADV_WILLNEED, in the background) while
     the GPU runs the pass before them; False when nothing reads ahead. ``a`` >= the n-gram history (n - 1 rows), so
@@ -436,6 +457,7 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
     start, last = prefill_begin(e, prompt, mtp=mtp, resume=resume), None
     if vision is not None:
         image_rows.attach(e.st, vision, len(prompt))
+    ngram_first_rows(e.w, e.st, prompt, start, min(len(prompt), start + e.prefill_rows))
     ngram_ahead(e, prompt, start)
     if keep_at is not None and not start <= keep_at <= len(prompt):
         raise ValueError(f"keep_at {keep_at} is outside the prefilled range [{start}, {len(prompt)}]")

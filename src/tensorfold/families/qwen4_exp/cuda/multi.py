@@ -18,7 +18,7 @@ from tensorfold.cuda.streams import Stream, accept
 from tensorfold.engine.exact_sampling import MARGIN, choose_rows
 from tensorfold.engine.grammar import GrammarError
 
-from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _gathered_fits, cost_bars, choose_gathered_streams,
+from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, ngram_first_rows, _gathered_fits, cost_bars, choose_gathered_streams,
                      entry_end, prefill_begin, tp_sample_rows)
 from . import attn_multi, decode_ahead, gdn_multi, heads, image_rows, prefixes
 from .draft_cost import joint_bars, joint_settings
@@ -351,6 +351,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         mtp = s.draft and self.depth > 0 and self.mbuf is not None
         try:
             begin = prefill_begin(e, s.prompt, mtp=mtp, resume=resume)
+            ngram_first_rows(self.w, st, s.prompt, begin, min(len(s.prompt), begin + self.prefill_rows))
             image_rows.begin(e, s, self.vision)
         except Exception:
             self._drop_kept(st)
