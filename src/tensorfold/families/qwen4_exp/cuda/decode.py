@@ -446,7 +446,13 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         if keep_at is not None and start < keep_at < end and end in stops:
             end = keep_at
         point = keep_at if keep_at is not None and start < keep_at <= end else end if end in stops else None
+        if PASS_LOG:
+            torch.cuda.synchronize(); t0 = time.perf_counter()
         last = prefill_chunk(e, prompt, start, mtp=mtp, keep_at=point, end=end)
+        if PASS_LOG:
+            torch.cuda.synchronize()
+            print(f"[tf-pass] solo start={start} rows={end - start} keep={point is not None} "
+                  f"total_ms={1e3 * (time.perf_counter() - t0):.1f}", flush=True)
         if point is not None:
             if point == keep_at:
                 saved = e.kept
@@ -467,6 +473,7 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
     return first
 
 
+PASS_LOG = __import__("os").environ.get("TF_PASS_LOG", "") == "1"   # prof: one synced timing line a chunk
 WARM_TAIL = 18      # a partial chunk after a full one: neither its rows nor the MTP head's 17 divide by 16
 
 

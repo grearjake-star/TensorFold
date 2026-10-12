@@ -23,6 +23,7 @@ PASS_MIN = env_int("TF_PASS_MIN", 512, 1)            # house: env-tunable (R-PRE
 FIRST_PASS = env_int("TF_FIRST_PASS", 256, 1)  # a round's first pass beside decoding streams, before a
 #                                                                  row's time is known
 FILL_GUARD = 8
+PASS_LOG = __import__("os").environ.get("TF_PASS_LOG", "") == "1"   # prof: one synced timing line a pass
 AHEAD_ROWS = 4096                # n-gram pages asked for this many prompt rows past each pass (two idle passes)
 
 
@@ -105,13 +106,24 @@ class PromptPasses:
             self.pass_index += 1
         t0 = time.perf_counter()
         try:
+            if PASS_LOG:
+                torch.cuda.synchronize(); t0 = time.perf_counter()
             segs = stage(self.w, self.pbuf, [(s.st, s.prompt[a:a + n]) for s, a, n in pieces])
             self._read_ahead(pieces)
+            if PASS_LOG:
+                torch.cuda.synchronize(); t1 = time.perf_counter()
             ends, cuts = self._end_rows(pieces, segs), self._cuts(pieces, segs)
             logits = compute(self.w, segs, self.pbuf, logits=bool(ends), ends=ends, cuts=cuts)
             heads = logits[:len(ends)].clone() if ends else None
             candidates = self._prompt_candidates(len(ends))
+            if PASS_LOG:
+                torch.cuda.synchronize(); t2 = time.perf_counter()
             lasts = self._absorb(pieces, segs, cuts)
+            if PASS_LOG:
+                torch.cuda.synchronize(); t3 = time.perf_counter()
+                print(f"[tf-pass] multi rows={sum(n for _, _, n in pieces)} pieces={[(s.sid, a, n) for s, a, n in pieces]} "
+                      f"stage_ms={1e3 * (t1 - t0):.1f} compute_ms={1e3 * (t2 - t1):.1f} absorb_ms={1e3 * (t3 - t2):.1f} "
+                      f"total_ms={1e3 * (t3 - t0):.1f} cuts={len(cuts)} ends={len(ends)}", flush=True)
         except Exception as exc:                         # noqa: BLE001  (these requests fail, the others go on)
             return self._failed(pieces, exc)
         if not self.converged and pieces:
