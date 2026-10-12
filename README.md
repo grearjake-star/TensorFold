@@ -66,6 +66,32 @@ ran 120 s rather than their 300 s, one run per cell, on a server that was also i
 different and cheaper model. We lead at 1, 2 and 4 streams, are even at 8 on mixed and JSON, and trail on long prose at
 8 streams (-24%). They scale to 16 seats; this build serves 8.
 
+**Against other single-Spark engines for Flash Next, 2026-10-12.** SparkFold numbers are v0.6.5-spark.2's gate
+(793b334, all 10 experts, exact decoding, `--parallel 8 --context 262144`, vision on). Every other row is that project's
+own published figure, linked, except veloGB10, which we ran side by side on the same pack. Methods differ (prompts, reply
+lengths, sampling), so read the rows as bands, not a leaderboard to the decimal.
+
+| Engine, checkpoint | Experts | Decode, 1 stream | Aggregate, 8 streams | Prefill | Vision |
+| --- | --- | --- | --- | --- | --- |
+| **SparkFold v0.6.5-spark.2**, EXL3 4.05 | **10 of 10** | **60.4** (prose ~6K: 59.9; code: 80.0) | 144.3 | 6K 3.06 s (~1,770 tok/s); 64K ~2,090 tok/s; 128K 69.6 s | yes |
+| [veloGB10](https://github.com/sf-stav/veloGB10) v0.7.2, same EXL3 4.05 pack (our side-by-side, 2026-10-05) | 10 of 10 | 47.2 | 89.8 | 6K 3.4-3.6 s | - |
+| TensorFold's Zig engine with EXL3 ([kinetick-labs](https://github.com/kinetick-labs/TensorFold), branch `perf/zig-exl3-draft-telemetry`, recipe `docs/recipes/qwen3.8-flash-next-zig.md`) | 10 of 10 | 42.7 (chat), 50.4 (code) | not published (2 streams) | 770-780 tok/s (14.4K prompt) | no |
+| NVFP4 on TensorFold ([tournierjc](https://github.com/tournierjc/TensorFold-Single-DGX-Spark)) | 10 of 10 | 27.2 (prose), 54.6 (code) | not published | 1,181 tok/s (2.3K), ~1,680 tok/s (20K) | yes |
+| TensorFold's Zig engine with INT4-AutoRound ([MiaAI-Lab](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold)) | **5 of 10** | 64.4 | **200.9** | **~2,400-2,640 tok/s** (4K-128K) | yes |
+| vLLM ([My LLM Box](https://myllmbox.com) v5.2, board above) | **5 of 10** | 64.7 (mixed) | 225.1 (mixed) | not published | - |
+
+How to read it:
+- At full quality (all 10 experts, exact decoding) SparkFold is the fastest single-Spark Flash Next setup we know of: more
+  than 25% ahead of the next full-expert engine at one stream and over 50% ahead at eight (veloGB10, measured the same
+  day on the same pack: 60.3 vs 47.2 and 137.7 vs 89.8).
+- The two setups with higher numbers on some rows run half the model's experts per token. MiaAI-Lab's README puts that
+  at about 10% lower general capability, and My LLM Box's own scores drop HumanEval 95.7 -> 93.3 and MMLU-Pro 84.9 -> 82.9.
+  MiaAI-Lab also defaults to a lossy FP8 KV cache (98.8% top-1 agreement with bf16).
+- Their prefill lead (~2,500 vs ~1,800-2,100 tok/s) comes mostly from the cheaper model, not a faster kernel on the same work:
+  half the experts per token is roughly half the expert math, and the experts are most of a prompt pass.
+- Not compared here: two-Spark setups, c=16 (this build serves 8 seats), and engines with no published single-Spark
+  Flash Next numbers.
+
 **Settings used** (environment, on top of the flags above): `TF_NGRAM_LOCK=27`, `TF_SOLO_ROWS=65536`, `TF_KEEP=16`,
 `TF_FIRST_PASS=1024`, `TF_PASS_MIN=1024`, `TF_WARM_REPLAY=4`, `TF_JOINT_PRICE=1`, `TENSORFOLD_PREFILL_ROWS=4096`,
 `TF_EXL3_MOE_WINDOW=4096`, `TF_EXL3_HC_FP8=1`, a measured `TF_VERIFY_MS`/`TF_DRAFT_MS` table, and a trained MTP draft head
