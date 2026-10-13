@@ -209,13 +209,23 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         """Free the oldest idle kept prompt end (never ``keep``); False when none is left."""
 
         busy = self._busy()
-        # TF_PIN_BASE: slots keeping the pinned base (prefixes.pinned) go only after every other idle slot; without
-        # it, the oldest idle slot of any kind
-        held = {id(k[1]) for k in self.kept if prefixes.pinned(self, k)} if getattr(self, "pin_base", False) else None
-        for last in ((False, True) if held else (None,)):
+        # TF_PIN_BASE: slots keeping the pinned family (prefixes.pinned) go only after every other idle slot, and the
+        # slot keeping its checkpoint (the base a fresh session resumes from) after those; without it, the oldest idle
+        # slot of any kind
+        held: dict[int, int] = {}
+        if getattr(self, "pin_base", False):
+            for k in self.kept:
+                if prefixes.pinned(self, k):
+                    held[id(k[1])] = max(held.get(id(k[1]), 1), 2 if prefixes._is_checkpoint(self, k) else 1)
+        for tier in ((0, 1, 2) if held else (None,)):
             for ids, st, _, _ in self.kept:
-                if st is keep or st is protect or id(st) in busy or (last is not None and (id(st) in held) != last):
+                if st is keep or st is protect or id(st) in busy or (tier is not None and held.get(id(st), 0) != tier):
                     continue
+                if not getattr(self, "planning", False):  # rare (memory pressure): one line, so a window can see it
+                    rows = max(len(k[0]) for k in self.kept if k[1] is st)
+                    print(f"[tensorfold] memory: freed an idle kept slot ({rows} tokens"
+                          f"{', pinned ' + ('base' if tier == 2 else 'family') if tier else ''}) for a growing cache",
+                          flush=True)
                 self._drop_kept(st)
                 self._shrink(st, release=True)
                 if all(f is not st for f in self.free):

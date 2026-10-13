@@ -293,6 +293,15 @@ class Pin(Recorder):
         self.assertEqual([k[1] for k in owner.kept], [base, base])         # the conversation went first
         self.assertTrue(MultiDecoder._evict_kept(owner, grower))           # then the base, rather than fail
         self.assertEqual(owner.kept, [])
+        owner = Owner(self.family())
+        base = self.base_slot(owner)                          # oldest, and it keeps the family's checkpoint
+        sibling = Slot("sibling")                             # a newer session of the family: its block end only
+        prefixes.remember(owner, block(2), sibling, {"pos": len(block(2)), "mtp_len": len(block(2)) - 1}, None,
+                          start=True)
+        prefixes.remember(owner, [5] * 30000, conv, {"pos": 30000, "mtp_len": 29999}, None)
+        MultiDecoder._evict_kept(owner, grower)
+        MultiDecoder._evict_kept(owner, grower)
+        self.assertEqual({k[1] for k in owner.kept}, {base})               # the conversation, then the sibling
         owner = Owner(self.family(), pin=False)
         base = self.base_slot(owner)
         prefixes.remember(owner, [5] * 30000, conv, {"pos": 30000, "mtp_len": 29999}, None)
