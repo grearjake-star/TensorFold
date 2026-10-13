@@ -333,14 +333,15 @@ class FlashNextEngine:
             return
         n = replay_count()
         self.multi.warm_starts = warm
-        # TF_PIN_BASE=1 (H2; default off): the most used system block's family is pinned (prefixes.pinned), its
-        # checkpoint falls inside the head its sessions share (WarmStarts.stable), and it is always replayed, last
+        # TF_PIN_BASE=1 (H2; default off): the most used family of system blocks (WarmStarts.family_members) is pinned
+        # (prefixes.pinned), its checkpoint falls inside the head its sessions share (WarmStarts.stable), and its base
+        # is always replayed, last
         pin = os.environ.get("TF_PIN_BASE", "").strip() == "1" and self.tp == 1
         self.multi.pin_base = pin
+        shared = warm.pin_base() if pin else None
         if pin:
             self.points.stable = warm.stable
         greedy = Sampling(seed=0, temperature=0.0)
-        shared = (getattr(warm, "_stable", None) or (None,))[0] if pin else None
         print(f"[tensorfold] warm starts: recording system blocks (mode 0600); {min(n, len(warm.entries))} of "
               f"{len(warm.entries)} recorded to prefill again"
               + (f"; pinned base on (shared head {shared} tokens)" if pin else ""), flush=True)

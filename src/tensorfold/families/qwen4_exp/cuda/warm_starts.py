@@ -11,10 +11,16 @@ chat resumes from it as a second chat does. Nothing is restored from disk: a new
 it; a recorded block whose tokenizer changed is ignored.
 
 TF_PIN_BASE (H2): one client's base prompt (Hermes: tools, then a system text whose memory and environment lines at
-its end change from session to session) is recorded as a family of blocks that share a long head. ``stable`` gives
-the family's shared length, so the system-block checkpoint falls inside it rather than past it (a checkpoint at the
-last granule before a 17,136-token block's end, 16,384, is useless to a session whose block differs from token
-14,604 on); the most used block never leaves the file and is always replayed, last (the newest kept state).
+its end change from session to session) is recorded as a family of blocks that share a long head. The recorded
+blocks fall into clusters (blocks sharing at least FAMILY tokens; sharing a prefix that long is an equivalence, so a
+cluster is the blocks with the same first FAMILY tokens); the pinned family is the cluster of two or more blocks
+whose members were used most in total (one client's single block resumed often does not outrank a family whose
+every session has a block of its own). ``stable`` gives the family's shared length (its members' common prefix), so
+the system-block checkpoint falls inside it rather than past it (a checkpoint at the last granule before a
+17,136-token block's end, 16,384, is useless to a session whose block differs from token 14,604 on). The family's
+most used member (the base) and the member that sets the shared length never leave the file, and the base is always
+replayed, last (the newest kept state). Cost on the decode thread: a ranking over the file's few entries per note;
+the prefix compare (numpy) runs once per pair of recorded blocks.
 """
 
 from __future__ import annotations
@@ -55,7 +61,7 @@ def _common(a: Sequence[int], b: Sequence[int]) -> int:
 
 
 def _top(entries: list[dict]) -> dict | None:
-    """The most used block (ties: the most recent): the one a pinned base is made from."""
+    """The most used block (ties: the most recent)."""
 
     return max(entries, key=lambda e: (e["uses"], e["last"]), default=None)
 
@@ -80,8 +86,22 @@ class WarmStarts:
         # again on every resume, on the decode thread; its scan, copy and digest are done once
         self.known: dict[int, tuple[Sequence[int], int, list[int] | None, str | None]] = {}
         self.entries: list[dict] = self._load()      # most recently used first: {"ids", "last", "uses"}
-        self._stable: tuple[int, list[int]] | None = None      # (shared length, the top block's head) or None
-        self._refresh()
+        # TF_PIN_BASE (``pin``, set by the engine): the pinned family, kept current by ``_refresh``
+        self.pin = False
+        self._clusters: dict[str, str | None] = {}            # entry key -> its cluster (its first FAMILY tokens)
+        self._pairs: dict[tuple[str, str], int] = {}          # (key, key) -> the tokens the two blocks share
+        self._members: frozenset[str] = frozenset()           # the pinned family's members, as last measured
+        self._stable: tuple[int, "object"] | None = None      # (shared length, its head as int64 array) or None
+        self._base: dict | None = None                        # the family's most used member
+        self._setter: str | None = None                       # the member whose head with the base is the shortest
+
+    def pin_base(self) -> int | None:
+        """Turn the pinned family on (TF_PIN_BASE) and return its shared length (None: no family recorded yet)."""
+
+        with self.lock:
+            self.pin = True
+            self._refresh()
+            return self._stable[0] if self._stable else None
 
     @classmethod
     def from_env(cls, model_dir: str | Path, vocab: int) -> "WarmStarts | None":
@@ -131,56 +151,116 @@ class WarmStarts:
         with self.lock:
             old = next((e for e in self.entries if e["key"] == key), None)
             entry = {"key": key, "ids": ids, "last": round(time.time()), "uses": (old["uses"] if old else 0) + 1}
-            before = _top(self.entries)
             rest = [e for e in self.entries if e["key"] != key]
-            kept = rest[:self.limit - 1]
-            if before is not None and self.limit > 1 and before["key"] != key and all(e is not before for e in kept) \
-                    and before["uses"] > entry["uses"]:
-                kept = kept[:-1] + [before]               # the most used block stays: it is the pinned base
-            self.entries = [entry] + kept
-            if old is None or (before or {}).get("key") != _top(self.entries)["key"]:
-                self._refresh()                           # a new block or a new top: the shared length again
+            room = self.limit - 1
+            if self.pin and self._base is not None:
+                # the pinned base and the member that sets its shared length stay: without a second member the
+                # family (and where its sessions differ) would be forgotten
+                held = [k for k in (self._base["key"], self._setter) if k is not None and k != key][:max(0, room)]
+                others = [e for e in rest if e["key"] not in held][:max(0, room - len(held))]
+                rest = [e for e in rest if e["key"] in held or any(e is o for o in others)]
+            self.entries = [entry] + rest[:max(0, room)]
+            if self.pin:
+                self._refresh()                           # a ranking of a few entries; numpy once per new pair
             self.dirty = True
             if self.writer is None:
                 self.writer = threading.Thread(target=self._write_loop, name="tf-warm-starts", daemon=True)
                 self.writer.start()
             self.wake.notify()
 
-    def _refresh(self) -> None:
-        """The top block's family length: the shortest head it shares with another recorded block of at least
-        FAMILY tokens (None while no other block shares one: nothing says yet where its sessions differ)."""
+    def _cluster(self, e: dict) -> str | None:
+        """The entry's cluster: a digest of its first FAMILY tokens (None: a block shorter than that)."""
 
-        top = _top(self.entries)
-        shared = [] if top is None else [n for e in self.entries if e is not top
-                                         if (n := _common(top["ids"], e["ids"])) >= FAMILY]
-        self._stable = (min(shared), list(top["ids"][:min(shared)])) if shared else None
+        c = self._clusters.get(e["key"], False)
+        if c is False:
+            c = _key(e["ids"][:FAMILY]) if len(e["ids"]) >= FAMILY else None
+            if len(self._clusters) >= 4 * self.limit:       # blocks come and go: forget the oldest
+                self._clusters.pop(next(iter(self._clusters)))
+            self._clusters[e["key"]] = c
+        return c
+
+    def family_members(self) -> list[dict]:
+        """The pinned family: the cluster of two or more recorded blocks used most in total (ties: the most recently
+        used), its most used member first ([] while no two recorded blocks share FAMILY tokens)."""
+
+        groups: dict[str, list[dict]] = {}
+        for e in self.entries:
+            c = self._cluster(e)
+            if c is not None:
+                groups.setdefault(c, []).append(e)
+        best = max((g for g in groups.values() if len(g) >= 2),
+                   key=lambda g: (sum(e["uses"] for e in g), max(e["last"] for e in g)), default=None)
+        if best is None:
+            return []
+        base = _top(best)
+        return [base] + [e for e in best if e is not base]
+
+    def _refresh(self) -> None:
+        """The pinned family, its base and its shared length (the members' common prefix: sharing a prefix is an
+        ultrametric, so it is the shortest head any member shares with the base). Each pair's compare runs once."""
+
+        import numpy as np
+
+        members = self.family_members()
+        self._base = members[0] if members else None
+        keys = frozenset(e["key"] for e in members)
+        if not members:
+            self._members, self._stable, self._setter = keys, None, None
+            return
+        base = members[0]
+        lengths = []
+        for e in members[1:]:
+            pair = (base["key"], e["key"]) if base["key"] < e["key"] else (e["key"], base["key"])
+            n = self._pairs.get(pair)
+            if n is None:
+                n = self._pairs[pair] = _common(base["ids"], e["ids"])
+            lengths.append((n, e["key"]))
+        if len(self._pairs) > 4 * self.limit * self.limit:       # pairs of blocks no longer recorded
+            live = {e["key"] for e in self.entries}
+            self._pairs = {k: v for k, v in self._pairs.items() if k[0] in live and k[1] in live}
+        n, self._setter = min(lengths)
+        if keys != self._members or self._stable is None or self._stable[0] != n:
+            self._stable = (n, np.asarray(base["ids"][:n], dtype=np.int64))
+        self._members = keys
+
+    def shared_head(self) -> int | None:
+        """The pinned family's shared length (None: none)."""
+
+        got = self._stable
+        return got[0] if got else None
 
     def stable(self, ids: Sequence[int]) -> int | None:
         """How many of this prompt's tokens are the pinned family's shared head (None: not that family, or none yet)."""
+
+        import numpy as np
 
         got = self._stable
         if got is None:
             return None
         n, head = got
-        return n if len(ids) > n and list(ids[:n]) == head else None
+        return n if len(ids) > n and np.array_equal(np.asarray(ids[:n], dtype=np.int64), head) else None
 
     def family(self, ids: Sequence[int]) -> bool:
         """A kept state of the pinned family: at least FAMILY tokens, all of them its shared head or past it."""
+
+        import numpy as np
 
         got = self._stable
         if got is None or len(ids) < FAMILY:
             return False
         n, head = got
         m = min(len(ids), n)
-        return list(ids[:m]) == head[:m]
+        return bool(np.array_equal(np.asarray(ids[:m], dtype=np.int64), head[:m]))
 
     def replays(self, n: int, pin: bool = False) -> list[list[int]]:
         """The ``n`` most recently used blocks as prompts, least recent first (the most recent is kept newest).
-        ``pin``: the most used block is among them, and last (the newest kept state)."""
+        ``pin``: the pinned family's base (the most used block when there is no family) is among them, and last (the
+        newest kept state)."""
 
         with self.lock:
             chosen = self.entries[:max(0, n)]
-            top = _top(self.entries)
+            members = self.family_members() if pin else []
+            top = members[0] if members else _top(self.entries)
         order = list(reversed(chosen))
         if pin and top is not None and n > 0:
             order = [e for e in order if e is not top][-(n - 1):] if n > 1 else []

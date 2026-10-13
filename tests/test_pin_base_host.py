@@ -1,7 +1,8 @@
-"""Host tests (no GPU) for TF_PIN_BASE (H2): the most used system block's family (Hermes' base prompt, whose memory
-and environment lines at its end change from session to session) gets its checkpoint inside the head its sessions
-share, stays in the warm-start file and is replayed last, is copied out of on a resume, and is freed last under
-memory pressure."""
+"""Host tests (no GPU) for TF_PIN_BASE (H2): the most used family of system blocks (a cluster of recorded blocks
+sharing at least FAMILY tokens, ranked by its members' total uses: Hermes' base prompt, whose memory and environment
+lines at its end change from session to session) gets its checkpoint inside the head its sessions share, its base
+stays in the warm-start file and is replayed last, is copied out of on a resume, and is freed last under memory
+pressure."""
 
 import os
 import sys
@@ -43,11 +44,19 @@ class Recorder(unittest.TestCase):
                 pass
         self.tmp.cleanup()
 
-    def make(self, limit=ws.LIMIT):
+    def make(self, limit=ws.LIMIT, pin=True):
         w = ws.WarmStarts(Path(self.tmp.name) / "w.json", head=HEAD, opener=OPENER, user=TAIL, fingerprint="t",
                           vocab=250000, limit=limit)
+        if pin:
+            w.pin_base()
         self.made.append(w)
         return w
+
+
+def other(seed: int, n: int = 2300) -> list[int]:
+    """Another client's system block (its own head)."""
+
+    return HEAD + [20000 + seed * 101 + i % 700 for i in range(n)]
 
 
 class StableHead(Recorder):
@@ -99,12 +108,81 @@ class StableHead(Recorder):
         w.note(block(1))
         w.note(block(2))
         calls = []
-        real = w._refresh
-        w._refresh = lambda: (calls.append(1), real())
-        ids = block(1)
-        for _ in range(20):
-            w.note(ids)                                      # a resumed start is noted on every resume
-        self.assertLessEqual(len(calls), 1)                  # at most once, when it became the top
+        real = ws._common
+        ws._common = lambda a, b: (calls.append(1), real(a, b))[1]
+        try:
+            ids = block(1)
+            for _ in range(20):
+                w.note(ids)                                  # a resumed start is noted on every resume
+        finally:
+            ws._common = real
+        self.assertEqual(calls, [])                          # the pair was compared once, when the family formed
+        self.assertEqual(w.stable(chat(block(3))), SHARED)
+
+    def test_another_clients_block_used_more_often_still_pins_hermes(self):
+        w = self.make()
+        ledger = other(1)
+        for _ in range(6):
+            w.note(ledger)                                   # one block, resumed often (H2-PIN: it outranked Hermes)
+        w.note(block(1))
+        w.note(block(2))                                     # two Hermes sessions, one use each
+        self.assertEqual(w.shared_head(), SHARED)
+        self.assertEqual(w.stable(chat(block(7))), SHARED)
+        self.assertIsNone(w.stable(chat(ledger)))
+        self.assertIn(w.replays(4, pin=True)[-1], (block(1) + TAIL, block(2) + TAIL))   # Hermes' base, last
+        self.assertEqual(len(w.replays(4, pin=True)), 3)
+        for _ in range(10):
+            w.note(ledger)
+        self.assertEqual(w.shared_head(), SHARED)            # still Hermes: a lone block has no family
+
+    def test_a_three_member_cluster_against_a_two_member_one(self):
+        w = self.make(limit=8)
+        early = block(3, shared=12000)                       # a session whose memory section starts earlier
+        for ids in (block(1), block(2), early):
+            w.note(ids)                                      # Hermes: three members, 3 uses
+        cash = [other(5, 9000), other(5, 9000)[:8000] + [5] * 900]
+        w.note(cash[0])
+        w.note(cash[1])                                      # another family: two members, 2 uses
+        w.note(other(9))
+        w.note(other(9))
+        w.note(other(9))                                     # and a lone block, 3 uses
+        self.assertEqual(w.shared_head(), 12000)             # the three's common prefix, not one pair's 14,604
+        self.assertEqual(w.stable(chat(block(4))), 12000)
+        self.assertIsNone(w.stable(chat(cash[0])))
+        points = snapshot_points((OPENER,), (OPENER, ASSISTANT), 2048)
+        points.stable = w.stable
+        self.assertEqual(points.checkpoint(chat(block(4))), 10240)
+        for _ in range(3):
+            w.note(cash[1])                                  # the other family now has 5 uses: it is pinned instead
+        self.assertEqual(w.shared_head(), 8000)
+        self.assertIsNone(w.stable(chat(block(4))))
+        self.assertEqual(w.replays(8, pin=True)[-1], cash[1] + TAIL)            # its most used member, last
+
+    def test_the_base_and_the_member_that_sets_the_head_stay_in_the_file(self):
+        w = self.make(limit=4)
+        base, early = block(1), block(3, shared=12000)
+        for _ in range(4):
+            w.note(base)
+        w.note(block(2))
+        w.note(early)
+        self.assertEqual(w.shared_head(), 12000)
+        for seed in range(10, 16):                           # six other clients' blocks, each newer
+            w.note(other(seed))
+        keys = [e["key"] for e in w.entries]
+        self.assertEqual(len(keys), 4)
+        self.assertIn(ws._key(base), keys)
+        self.assertIn(ws._key(early), keys)
+        self.assertEqual(w.shared_head(), 12000)
+        self.assertEqual(w.replays(4, pin=True)[-1], base + TAIL)
+
+    def test_without_the_pin_the_file_keeps_the_most_recent(self):
+        w = self.make(limit=3, pin=False)
+        for _ in range(4):
+            w.note(block(1))
+        w.note(block(2))
+        for seed in range(10, 12):
+            w.note(other(seed))
+        self.assertEqual([e["ids"] for e in w.entries], [other(11), other(10), block(2)])   # the house rule
 
 
 class Checkpoint(Recorder):
