@@ -65,6 +65,10 @@ def snapshot_points(openers: Sequence[int], assistant: Sequence[int],
         if len(starts) < 2:
             return None
         at = (int(starts[1]) - MIN_GAP) // granule * granule
+        stable = getattr(points, "stable", None)          # TF_PIN_BASE: the pinned family's shared head, if this is it
+        shared = stable(ids) if stable is not None else None
+        if shared is not None and shared // granule * granule < at:
+            at = shared // granule * granule              # inside the head its sessions share, not past it
         return at if at >= granule else None
 
     def points(ids: Sequence[int]) -> list[int]:

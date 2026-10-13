@@ -9,6 +9,12 @@ blocks as a request of its own: the block plus a user turn's opening, one greedy
 ordinary prefill, so the state it keeps is the one a first chat would have kept (exact by construction), and a later
 chat resumes from it as a second chat does. Nothing is restored from disk: a new build, settings or weights recompute
 it; a recorded block whose tokenizer changed is ignored.
+
+TF_PIN_BASE (H2): one client's base prompt (Hermes: tools, then a system text whose memory and environment lines at
+its end change from session to session) is recorded as a family of blocks that share a long head. ``stable`` gives
+the family's shared length, so the system-block checkpoint falls inside it rather than past it (a checkpoint at the
+last granule before a 17,136-token block's end, 16,384, is useless to a session whose block differs from token
+14,604 on); the most used block never leaves the file and is always replayed, last (the newest kept state).
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ FILE_ENV, REPLAY_ENV = "TF_WARM_STARTS", "TF_WARM_REPLAY"
 LIMIT = 4                        # system blocks the file remembers (most recently used first)
 REPLAY = 2                       # system blocks a start prefills again (each keeps one slot's rows, as a chat would)
 VERSION = 1
+FAMILY = 4096                    # two recorded blocks sharing at least this many tokens: one client's base prompt
 
 
 def _digest(path: Path) -> str:
@@ -35,6 +42,22 @@ def _digest(path: Path) -> str:
         for block in iter(lambda: f.read(1 << 20), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def _common(a: Sequence[int], b: Sequence[int]) -> int:
+    """How many leading tokens two blocks share."""
+
+    import numpy as np
+
+    m = min(len(a), len(b))
+    diff = np.flatnonzero(np.asarray(a[:m], dtype=np.int64) != np.asarray(b[:m], dtype=np.int64))
+    return int(diff[0]) if len(diff) else m
+
+
+def _top(entries: list[dict]) -> dict | None:
+    """The most used block (ties: the most recent): the one a pinned base is made from."""
+
+    return max(entries, key=lambda e: (e["uses"], e["last"]), default=None)
 
 
 def _key(ids: Sequence[int]) -> str:
@@ -57,6 +80,8 @@ class WarmStarts:
         # again on every resume, on the decode thread; its scan, copy and digest are done once
         self.known: dict[int, tuple[Sequence[int], int, list[int] | None, str | None]] = {}
         self.entries: list[dict] = self._load()      # most recently used first: {"ids", "last", "uses"}
+        self._stable: tuple[int, list[int]] | None = None      # (shared length, the top block's head) or None
+        self._refresh()
 
     @classmethod
     def from_env(cls, model_dir: str | Path, vocab: int) -> "WarmStarts | None":
@@ -106,19 +131,61 @@ class WarmStarts:
         with self.lock:
             old = next((e for e in self.entries if e["key"] == key), None)
             entry = {"key": key, "ids": ids, "last": round(time.time()), "uses": (old["uses"] if old else 0) + 1}
-            self.entries = [entry] + [e for e in self.entries if e["key"] != key][:self.limit - 1]
+            before = _top(self.entries)
+            rest = [e for e in self.entries if e["key"] != key]
+            kept = rest[:self.limit - 1]
+            if before is not None and self.limit > 1 and before["key"] != key and all(e is not before for e in kept) \
+                    and before["uses"] > entry["uses"]:
+                kept = kept[:-1] + [before]               # the most used block stays: it is the pinned base
+            self.entries = [entry] + kept
+            if old is None or (before or {}).get("key") != _top(self.entries)["key"]:
+                self._refresh()                           # a new block or a new top: the shared length again
             self.dirty = True
             if self.writer is None:
                 self.writer = threading.Thread(target=self._write_loop, name="tf-warm-starts", daemon=True)
                 self.writer.start()
             self.wake.notify()
 
-    def replays(self, n: int) -> list[list[int]]:
-        """The ``n`` most recently used blocks as prompts, least recent first (the most recent is kept newest)."""
+    def _refresh(self) -> None:
+        """The top block's family length: the shortest head it shares with another recorded block of at least
+        FAMILY tokens (None while no other block shares one: nothing says yet where its sessions differ)."""
+
+        top = _top(self.entries)
+        shared = [] if top is None else [n for e in self.entries if e is not top
+                                         if (n := _common(top["ids"], e["ids"])) >= FAMILY]
+        self._stable = (min(shared), list(top["ids"][:min(shared)])) if shared else None
+
+    def stable(self, ids: Sequence[int]) -> int | None:
+        """How many of this prompt's tokens are the pinned family's shared head (None: not that family, or none yet)."""
+
+        got = self._stable
+        if got is None:
+            return None
+        n, head = got
+        return n if len(ids) > n and list(ids[:n]) == head else None
+
+    def family(self, ids: Sequence[int]) -> bool:
+        """A kept state of the pinned family: at least FAMILY tokens, all of them its shared head or past it."""
+
+        got = self._stable
+        if got is None or len(ids) < FAMILY:
+            return False
+        n, head = got
+        m = min(len(ids), n)
+        return list(ids[:m]) == head[:m]
+
+    def replays(self, n: int, pin: bool = False) -> list[list[int]]:
+        """The ``n`` most recently used blocks as prompts, least recent first (the most recent is kept newest).
+        ``pin``: the most used block is among them, and last (the newest kept state)."""
 
         with self.lock:
             chosen = self.entries[:max(0, n)]
-        return [e["ids"] + self.user for e in reversed(chosen)]
+            top = _top(self.entries)
+        order = list(reversed(chosen))
+        if pin and top is not None and n > 0:
+            order = [e for e in order if e is not top][-(n - 1):] if n > 1 else []
+            order.append(top)
+        return [e["ids"] + self.user for e in order]
 
     def _load(self) -> list[dict]:
         try:
@@ -194,13 +261,13 @@ def replay_count() -> int:
     return int(value)
 
 
-def replay(warm: WarmStarts, submit: Callable[[list[int]], object], n: int) -> int:
+def replay(warm: WarmStarts, submit: Callable[[list[int]], object], n: int, pin: bool = False) -> int:
     """Prefill the recorded blocks one after another and return how many were kept; logs lengths only.
 
     Run before the server takes traffic: a block prefilled alone is cut into the same passes as a cold first chat on
     an idle server. Beside another prompt its passes would be cut differently and its state need not match that."""
 
-    prompts = warm.replays(n)
+    prompts = warm.replays(n, pin) if pin else warm.replays(n)
     t0, done = time.perf_counter(), []
     for prompt in prompts:
         try:

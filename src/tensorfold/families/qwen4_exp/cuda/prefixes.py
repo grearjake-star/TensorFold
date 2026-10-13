@@ -42,6 +42,16 @@ def _is_checkpoint(owner, entry) -> bool:
     return bool(cps) and any(len(t) == len(entry[0]) for t in cps) and tuple(entry[0]) in cps
 
 
+def pinned(owner, entry) -> bool:
+    """TF_PIN_BASE (``owner.pin_base``): a kept start or checkpoint of the most used system block's family (Hermes'
+    base prompt: ``WarmStarts.family``), which a resume copies out of and memory pressure frees last."""
+
+    if not getattr(owner, "pin_base", False) or not _is_start(owner, entry):
+        return False
+    warm = getattr(owner, "warm_starts", None)
+    return warm is not None and warm.family(entry[0])
+
+
 def _touch(owner, entry) -> None:
     """A resumed message-start state becomes the newest, so a shared system block outlives the conversations
     that fork from it. Prompt ends keep their place: a resend must not age the ends nobody has resent yet."""
@@ -108,7 +118,10 @@ def slot_for(owner, prompt: list[int], reuse: bool):
 
     busy = owner._busy()
     best = _best(owner.kept, prompt) if reuse else None
-    fork = best is not None and (id(best[1]) in busy or _longer(owner.kept, best))
+    # TF_PIN_BASE: a resume from the pinned base copies it out when a slot is spare, so the base slot stays the
+    # base (a conversation grown in place would take it with it when its slot goes)
+    fork = best is not None and (id(best[1]) in busy or _longer(owner.kept, best)
+                                 or pinned(owner, best))
     if fork:
         spare, before = (owner.free.pop(), None) if owner.free else (None, None)
         if spare is None and (victim := _claim(owner, best, busy)) is not None:

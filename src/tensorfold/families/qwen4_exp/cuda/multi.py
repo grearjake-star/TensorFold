@@ -209,8 +209,13 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         """Free the oldest idle kept prompt end (never ``keep``); False when none is left."""
 
         busy = self._busy()
-        for ids, st, _, _ in self.kept:
-            if st is not keep and st is not protect and id(st) not in busy:
+        # TF_PIN_BASE: slots keeping the pinned base (prefixes.pinned) go only after every other idle slot; without
+        # it, the oldest idle slot of any kind
+        held = {id(k[1]) for k in self.kept if prefixes.pinned(self, k)} if getattr(self, "pin_base", False) else None
+        for last in ((False, True) if held else (None,)):
+            for ids, st, _, _ in self.kept:
+                if st is keep or st is protect or id(st) in busy or (last is not None and (id(st) in held) != last):
+                    continue
                 self._drop_kept(st)
                 self._shrink(st, release=True)
                 if all(f is not st for f in self.free):

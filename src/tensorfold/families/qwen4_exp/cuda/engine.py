@@ -333,11 +333,20 @@ class FlashNextEngine:
             return
         n = replay_count()
         self.multi.warm_starts = warm
+        # TF_PIN_BASE=1 (H2; default off): the most used system block's family is pinned (prefixes.pinned), its
+        # checkpoint falls inside the head its sessions share (WarmStarts.stable), and it is always replayed, last
+        pin = os.environ.get("TF_PIN_BASE", "").strip() == "1" and self.tp == 1
+        self.multi.pin_base = pin
+        if pin:
+            self.points.stable = warm.stable
         greedy = Sampling(seed=0, temperature=0.0)
+        shared = (getattr(warm, "_stable", None) or (None,))[0] if pin else None
         print(f"[tensorfold] warm starts: recording system blocks (mode 0600); {min(n, len(warm.entries))} of "
-              f"{len(warm.entries)} recorded to prefill again", flush=True)
+              f"{len(warm.entries)} recorded to prefill again"
+              + (f"; pinned base on (shared head {shared} tokens)" if pin else ""), flush=True)
         # alone, before serving: a replay cut into other passes beside a live prompt could keep a different state
-        self.warm_replay = replay(warm, lambda prompt: self.scheduler.submit(prompt, 1, greedy, True, lambda new: None), n)
+        submit = lambda prompt: self.scheduler.submit(prompt, 1, greedy, True, lambda new: None)  # noqa: E731
+        self.warm_replay = replay(warm, submit, n, pin) if pin else replay(warm, submit, n)
 
     def _same_settings(self, torch, ids) -> None:
         """Both ranks must decode with the same rule, context, draft vocabulary and KV cache, or they would fall out of step: refuse to start otherwise."""
