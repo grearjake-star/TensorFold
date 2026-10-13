@@ -333,10 +333,10 @@ class FlashNextEngine:
             return
         n = replay_count()
         self.multi.warm_starts = warm
-        # TF_PIN_BASE=1 (H2; default off): the most used family of system blocks (WarmStarts.family_members) is pinned
+        # TF_PIN_BASE (H2; default on since H2b, 0 turns it off): the most used family of system blocks (WarmStarts.family_members) is pinned
         # (prefixes.pinned), its checkpoint falls inside the head its sessions share (WarmStarts.stable), and its base
         # is always replayed, last
-        pin = os.environ.get("TF_PIN_BASE", "").strip() == "1" and self.tp == 1
+        pin = os.environ.get("TF_PIN_BASE", "1").strip() != "0" and self.tp == 1
         self.multi.pin_base = pin
         shared = warm.pin_base() if pin else None
         if pin:

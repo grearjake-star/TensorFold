@@ -20,6 +20,7 @@ class FakeWarm:
 
 
 def make(monkeypatch, tp, rank):
+    monkeypatch.setenv("TF_PIN_BASE", "0")        # the replay rule across ranks; the pin has its own tests
     monkeypatch.setattr(ws.WarmStarts, "from_env", classmethod(lambda cls, model_dir, vocab: FakeWarm()))
     e = object.__new__(engine_mod.FlashNextEngine)
     e.tp, e.rank, e.warm_replay = tp, rank, None
