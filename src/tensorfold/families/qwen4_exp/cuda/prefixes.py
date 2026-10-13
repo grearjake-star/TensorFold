@@ -66,7 +66,7 @@ def _note(owner, ids) -> None:
     """TF_WARM_STARTS: a kept or resumed message-start state's system block is recorded for the next start."""
 
     warm = getattr(owner, "warm_starts", None)
-    if warm is not None:
+    if warm is not None and not getattr(owner, "quiet_notes", False):   # TF_PIN_REWARM's replay is not a use
         warm.note(ids)
 
 

@@ -20,7 +20,7 @@ from tensorfold.engine.grammar import GrammarError
 
 from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, ngram_first_rows, _gathered_fits, cost_bars, choose_gathered_streams,
                      entry_end, prefill_begin, tp_sample_rows)
-from . import attn_multi, decode_ahead, gdn_multi, heads, image_rows, prefixes
+from . import attn_multi, decode_ahead, gdn_multi, heads, image_rows, prefixes, rewarm
 from .draft_cost import joint_bars, joint_settings
 from .multi_graphs import RoundGraphs, bucket, fold
 from .forward import commit, compute, compute_mixed, converges, stage
@@ -115,6 +115,20 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         self.draft_host = w.draft_ids.cpu().numpy() if w.draft_ids is not None else None
         self.kept: list[tuple[list[int], State, dict, torch.Tensor | None]] = []   # (ids, slot, snapshot, tail)
         self.keep = keep
+        # TF_PIN_REWARM (H2c, rewarm.py; the engine sets it with TF_PIN_BASE): the evicted base prefilled again while
+        # idle; ``quiet_notes``: its block is not noted as a use; ``no_evict``: its admission evicts nothing
+        self.rewarm = None
+        self.quiet_notes = self.no_evict = False
+
+    def idle_wait(self) -> float | None:
+        """Seconds the idle scheduler waits for a request before ``idle_work`` (None: until one arrives)."""
+
+        return None if getattr(self, "rewarm", None) is None else self.rewarm.wait()
+
+    def idle_work(self) -> bool:
+        """The scheduler has been idle ``idle_wait`` seconds: re-warm the pinned base if it is missing (rewarm.check)."""
+
+        return getattr(self, "rewarm", None) is not None and rewarm.check(self)
 
     def _busy(self) -> set[int]:
         return {id(s.st) for s in [*self.streams.values(), *self.filling]}
@@ -208,6 +222,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
     def _evict_kept(self, keep: State, *, protect: State | None = None) -> bool:
         """Free the oldest idle kept prompt end (never ``keep``); False when none is left."""
 
+        if getattr(self, "no_evict", False):    # TF_PIN_REWARM's admission: it only uses room the gate has
+            return False
         busy = self._busy()
         # TF_PIN_BASE: slots keeping the pinned family (prefixes.pinned) go only after every other idle slot, and the
         # slot keeping its checkpoint (the base a fresh session resumes from) after those; without it, the oldest idle
@@ -340,6 +356,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         if room < 1:
             raise ValueError(f"a prompt of {len(s.prompt)} tokens leaves no room in the {self.capacity}-token context")
         s.count = max(1, min(s.count, room))
+        # TF_PIN_REWARM: another request takes a re-warm in progress out first (between passes) and arms the next
+        again = getattr(self, "rewarm", None) is not None and rewarm.before_admit(self, s)
         if any(x.waiting for x in self.streams.values()):
             raise NoRoom("streams already wait for memory; a new request waits until one finishes")
         if self.w.comm is not None and any(x is not None for x in (s.constraint, s.vision, s.probabilities)):
@@ -348,11 +366,12 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         if self.w.comm is not None:
             st, resume, s.cached = self._prepare_admission(s, told)
         else:
-            st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and s.vision is None)
+            # a re-warm prefills from its first token, as the start-up replay did (nothing kept is resumed)
+            st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and s.vision is None and not again)
         if self.w.comm is None:
             try:
                 if not self._grow(st, len(s.prompt) + self.depth + 2,
-                                  alone=not self.streams and not self.filling):
+                                  alone=not self.streams and not self.filling and not again):
                     raise NoRoom(f"a {len(s.prompt)}-token prompt waits for memory until a live stream finishes")
             except NoRoom:
                 if resume is None:
@@ -703,12 +722,16 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             if not any(k[1] is s.st for k in self.kept) and all(f is not s.st for f in self.free):
                 self._shrink(s.st)
                 self.free.append(s.st)
+            if getattr(self, "rewarm", None) is not None and s is self.rewarm.stream:
+                rewarm.finished(self, s)
 
     def drop(self) -> list[Stream]:
         if self.link is not None:
             self.link.send(["drop"])
         live = [s for s in self.streams.values() if not s.done] + self.filling
         self.filling, self.fills = [], {}
+        if getattr(self, "rewarm", None) is not None and self.rewarm.stream is not None:
+            self.rewarm.stream, self.quiet_notes = None, False
         for s in live:
             self.streams.pop(s.sid, None)
             self.held.pop(s.sid, None)

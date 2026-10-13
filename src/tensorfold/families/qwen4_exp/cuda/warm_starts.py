@@ -252,6 +252,14 @@ class WarmStarts:
         m = min(len(ids), n)
         return bool(np.array_equal(np.asarray(ids[:m], dtype=np.int64), head[:m]))
 
+    def base_replay(self) -> list[int] | None:
+        """TF_PIN_REWARM: the pinned family's base as a replay prompt (its block, then a user turn's opening), as
+        ``replays(.., pin=True)`` replays it last; None while no family is pinned."""
+
+        with self.lock:
+            members = self.family_members() if self.pin else []
+            return members[0]["ids"] + self.user if members else None
+
     def replays(self, n: int, pin: bool = False) -> list[list[int]]:
         """The ``n`` most recently used blocks as prompts, least recent first (the most recent is kept newest).
         ``pin``: the pinned family's base (the most used block when there is no family) is among them, and last (the

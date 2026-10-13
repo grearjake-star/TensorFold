@@ -348,6 +348,16 @@ class FlashNextEngine:
         # alone, before serving: a replay cut into other passes beside a live prompt could keep a different state
         submit = lambda prompt: self.scheduler.submit(prompt, 1, greedy, True, lambda new: None)  # noqa: E731
         self.warm_replay = replay(warm, submit, n, pin) if pin else replay(warm, submit, n)
+        # TF_PIN_REWARM (H2c; on with TF_PIN_BASE, 0 turns only this off): once memory pressure evicted the base, the
+        # idle scheduler prefills it again, alone, as this replay did (rewarm.py); a request never waits behind it
+        # longer than the prompt pass in flight
+        from . import rewarm
+
+        if pin and rewarm.enabled():
+            idle = rewarm.idle_seconds()
+            self.multi.rewarm = rewarm.Rewarm(warm, greedy, idle)
+            print(f"[tensorfold] pin re-warm: on (an evicted base is prefilled again after {idle:g}s idle, when a free "
+                  f"slot fits the memory gate)", flush=True)
 
     def _same_settings(self, torch, ids) -> None:
         """Both ranks must decode with the same rule, context, draft vocabulary and KV cache, or they would fall out of step: refuse to start otherwise."""

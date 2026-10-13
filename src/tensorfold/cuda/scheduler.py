@@ -167,9 +167,24 @@ class Scheduler:
         while True:
             self._yield()
             idle = not self.decoder.live() and self.held is None
-            first = self.waiting.get() if idle else None                              # idle: wait for a request
-            if idle and first is None:
-                return                                                                # close()
+            first = None
+            if idle:                                                                  # idle: wait for a request
+                wait = getattr(self.decoder, "idle_wait", None)
+                seconds = wait() if wait is not None else None
+                try:
+                    first = self.waiting.get() if seconds is None else self.waiting.get(timeout=seconds)
+                except queue.Empty:
+                    # idle that long: the decoder's own low-priority work (Flash Next: TF_PIN_REWARM), admitted alone
+                    try:
+                        started = self.decoder.idle_work()
+                    except Exception as exc:         # noqa: BLE001  (optional work: the requests go on)
+                        print(f"[tensorfold] idle work failed ({type(exc).__name__}: {exc})", flush=True)
+                        started = False
+                    if not started:
+                        continue
+                else:
+                    if first is None:
+                        return                                                        # close()
             done = self._admit(first)
             try:
                 done += self.decoder.round()

@@ -32,7 +32,10 @@ class PromptPasses:
         """Prompt passes over the filling prompts, oldest first, packed to the pass's rows."""
 
         ended: list[Stream] = []
+        rw = getattr(self, "rewarm", None)
         while self.filling:
+            if rw is not None and rw.stream is not None and self._waiting_request():
+                break                                    # TF_PIN_REWARM: a request is queued, the re-warm gives way
             ended += self._pass()
             if any(not x.done and not x.waiting for x in self.streams.values()) or self._waiting_request():
                 break
